@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  # The codec is testable with no Postgres at all. Keeping this job free of pgrx is
+  # what lets conformance work proceed independently of the extension build, so do
+  # not "simplify" it by merging it into the docker job.
+  codec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Generator unit tests
+        run: cargo test -p kafgres-codec-gen
+
+      - name: Codec conformance suite
+        run: cargo test -p kafgres-codec
+
+      # Generated code is checked in so a schema bump shows up as a reviewable diff.
+      # This is what stops the checked-in copy drifting from the schemas it claims to
+      # come from, and it is the only argument for a build.rs instead.
+      - name: Generated code is up to date
+        run: |
+          cargo run -q -p kafgres-codec-gen
+          if ! git diff --exit-code -- codec/src/generated; then
+            echo "::error::codec/src/generated is stale. Run 'cargo run -p kafgres-codec-gen' and commit the result."
+            exit 1
+          fi
+
+      - name: Lints
+        run: |
+          cargo fmt --check -p kafgres-codec-gen
+          cargo clippy --all-targets -p kafgres-codec-gen -- -D warnings
+          cargo clippy --all-targets -p kafgres-codec -- -D warnings
+
+  # Cheap, and it catches a boundary violation on the commit that introduces it
+  # rather than when the two storage engines disagree.
+  boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: LogStore boundary
+        run: ./scripts/check-boundary.sh
+
+  # `cargo check` skips the pgrx/Postgres link step and passes on code that cannot
+  # load. Only a real package build proves the extension is loadable.
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker compose build
+
+      - name: Build client tooling
+        run: docker build -t kafgres-clients tests/clients
+
+      # Not checked in, and the TLS suite skips rather than fails without them, so
+      # without this step the mTLS coverage silently disappears from CI and the run
+      # still goes green.
+      - name: Test certificates
+        run: bash tests/tls/generate.sh
+
+      - name: Extension loads and the worker starts
+        run: |
+          docker compose up -d
+          for i in $(seq 1 60); do
+            if docker compose exec -T postgres pg_isready -U postgres >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          docker compose exec -T postgres psql -U postgres -tAc \
+            "SELECT extversion FROM pg_extension WHERE extname='kafgres'" | grep -q 0.1.0
+          docker compose exec -T postgres psql -U postgres -tAc \
+            "SELECT count(*) FROM pg_stat_activity WHERE backend_type='kafgres_broker'" | grep -q '^1$'
+
+      # The failover tests need a real physical standby and assert the container
+      # exists rather than skipping, because a failover suite that quietly does not
+      # run is worse than none. The standby shares the primary's image, which
+      # `docker compose build` has already produced; see the comment on the service.
+      - name: Failover rig
+        run: |
+          docker compose --profile failover up -d standby
+          for i in $(seq 1 60); do
+            if docker compose exec -T standby pg_isready -U postgres >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          # The loop exits 0 after sixty failures. Without this the step goes green on a
+          # standby that never came up, and the failure surfaces later as a confusing
+          # test error instead of here as "the rig did not start".
+          docker compose exec -T standby pg_isready -U postgres
+
+      # The acceptance criteria are client behaviours, never a code state. This job
+      # is what actually gates a change.
+      - name: Integration tests
+        run: |
+          python3 -m pip install --quiet -r requirements.txt
+          python3 -m pytest tests/integration/ -v
+
+      # Same job as the integration tests
+      # rather than its own, because the pgrx image build dominates CI cost and a
+      # separate job pays for it twice; the step name is what makes a failure legible.
+      - name: Reference broker
+        run: |
+          docker compose --profile conformance up -d kafka
+          for i in $(seq 1 60); do
+            if docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+                 --bootstrap-server 127.0.0.1:9292 --list >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+
+      # `tests/conformance/` decides at collection time whether the reference is
+      # reachable and skips the diff half if not. Assert it is, so an unreachable
+      # broker reads as a failure here instead of as sixteen quiet skips.
+      - name: Conformance suite
+        run: |
+          docker run --rm --network host apache/kafka:4.3.1 \
+            /opt/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:9292 --list
+          python3 -m pytest tests/conformance/ -v
+
+      # Everything above ran on the table engine; this runs the same conformance suite
+      # against the segment engine, plus the crash rig.
+      #
+      # Without this the segment-engine coverage is nil: `test_crash_recovery.py` skips
+      # itself unless the engine is `segment`, so on a table-engine run it contributes
+      # a silent skip and the job still goes green, the same trap as the TLS certificates.
+      - name: Segment engine conformance suite and crash recovery
+        run: |
+          docker compose exec -T postgres psql -U postgres \
+            -c "ALTER SYSTEM SET kafgres.storage_engine='segment'"
+          docker compose up -d --force-recreate postgres
+          for i in $(seq 1 60); do
+            if docker compose exec -T postgres psql -U postgres -tAc \
+                 "SELECT count(*) FROM pg_stat_activity \
+                   WHERE backend_type='kafgres_broker'" 2>/dev/null | grep -q '^1$'; then
+              break
+            fi
+            sleep 2
+          done
+          # Assert rather than trust the loop, which exits 0 after sixty failures.
+          test "$(docker compose exec -T postgres psql -U postgres -tAc \
+                    'SHOW kafgres.storage_engine' | tr -d '[:space:]')" = segment
+          python3 -m pytest tests/conformance/ tests/integration/test_crash_recovery.py -v
+          # Nothing may have fallen back to the table engine.
+          test "$(docker compose exec -T postgres psql -U postgres -tAc \
+                    'SELECT count(*) FROM kafgres_log' | tr -d '[:space:]')" = 0
+
+      - name: Worker logs
+        if: always()
+        run: docker compose logs postgres | grep -i kafgres || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile failover --profile conformance down -v

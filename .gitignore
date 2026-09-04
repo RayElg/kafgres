@@ -1,0 +1,32 @@
+target/
+# Lockfiles are committed: the codec pin and the pgrx pin both matter.
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Internal implementation notes. Written for the people working on the code, not
+# for users; they stay on disk but are not published.
+/docs-impl/
+/CLAUDE.md
+/.claude/
+
+# Test certificates: regenerate with tests/tls/generate.sh. A repository with a private
+# key in it teaches the wrong habit, and these expire.
+tests/tls/*.crt
+tests/tls/*.key
+tests/tls/*.csr
+tests/tls/*.ext
+tests/tls/*.srl
+
+# Benchmark output. Numbers belong to the machine that produced them, and committing
+# them invites comparing runs from different hardware.
+tools/benchmark/results/
+
+# Benchmark harnesses stay local for now.
+/scripts/bench/
+/tools/benchmark/
+/bench-fio/
+
+# Same for the harness output at the repository root.
+/bench-results/

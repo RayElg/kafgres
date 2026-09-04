@@ -1,0 +1,66 @@
+# Its own workspace on purpose. The root workspace holds codec + codec-gen, whose
+# tests must run with no Postgres and no pgrx toolchain, and keeping the extension out
+# of that workspace preserves the independence.
+[workspace]
+
+[package]
+name = "kafgres"
+version = "0.1.0"
+edition = "2021"
+license = "Elastic-2.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "pgrx_embed_kafgres"
+path = "./src/bin/pgrx_embed.rs"
+
+[features]
+default = ["pg16"]
+pg13 = ["pgrx/pg13", "pgrx-tests/pg13"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg_test = []
+
+[dependencies]
+pgrx = "=0.16.1"
+kafgres-codec = { path = "../codec" }
+# SCRAM-SHA-256 against pg_authid. Same crates as the sibling's password_auth.rs, and
+# `ring` is already what rustls uses, so the TLS transport adds no new crypto stack.
+ring = "0.17"
+base64 = "0.22.1"
+# Constant-time comparison. `ring::constant_time` is deprecated and its own docs say it
+# makes "no promises regarding side channels" — not what to compare a credential with.
+subtle = "2"
+# TLS. `default-features = false` with the ring backend on purpose: the default pulls
+# aws-lc-rs, which needs cmake and a C toolchain at build time — inside the pgrx build
+# that is a new way for the extension to stop linking. ring is already here for SCRAM.
+# Same configuration the sibling ships, which is the evidence that it links under pgrx.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+# `O_RDWR`/`O_CREAT` for the segment engine's VFD opens. pgrx already links libc; taking
+# the constants from it rather than hardcoding 2 and 0o100 keeps this portable, and these
+# flags differ across platforms in ways that fail at runtime rather than at build time.
+libc = "0.2"
+# Subject DN for the mTLS principal. rustls hands back DER and deliberately does not
+# parse it; this is pure Rust with no C dependency.
+x509-parser = "0.16"
+
+[dev-dependencies]
+pgrx-tests = "=0.16.1"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+strip = "none"

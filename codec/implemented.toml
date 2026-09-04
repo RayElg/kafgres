@@ -1,0 +1,190 @@
+# APIs kafgres implements, and at which versions.
+#
+# The generator reads this, validates each range against the schema, applies the
+# Produce-min-0 and unstable-latest rules, and emits both the dispatch table and the
+# ApiVersions payload from it. One source, so advertised and implemented cannot drift.
+#
+# Adding a line here without writing the handler is the "hang, not an error" failure
+# mode: the client negotiates the version, sends the frame, and waits forever for a
+# response nobody produces.
+
+[apis]
+
+# ApiVersions and Metadata.
+ApiVersions = "0-4"
+Metadata = "0-13"
+
+# Produce is additionally floored to min 0 in the advertised table, which the
+# generator does for us: librdkafka needs to see 0 (KAFKA-18659) even though the
+# schema's own baseline is 3.
+Produce = "3-13"
+Fetch = "4-18"
+# 1-6 rather than the schema's full 1-11: v7 introduces the MAX_TIMESTAMP sentinel and
+# v9 LATEST_TIERED_OFFSET, neither of which we implement. Advertising them would invite a
+# query we can only answer wrongly.
+ListOffsets = "1-6"
+
+# Consumer groups.
+FindCoordinator = "0-6"
+JoinGroup = "0-9"
+Heartbeat = "0-4"
+LeaveGroup = "0-5"
+SyncGroup = "0-5"
+OffsetCommit = "2-10"
+OffsetFetch = "1-10"
+
+# Served from the start rather than with the rest of the admin tier:
+# `kafka-consumer-groups.sh --describe` needs both of these.
+DescribeGroups = "0-6"
+ListGroups = "0-5"
+
+# The idempotent producer. The generator caps the advertised max at 5: v6 is
+# latestVersionUnstable at 4.3.1 (the KIP-939 two-phase-commit fields).
+InitProducerId = "0-6"
+
+# Admin tooling. What `kafka-topics.sh`, `kafka-configs.sh` and
+# `kafka-consumer-groups.sh` need to work against this broker unmodified.
+CreateTopics = "2-7"
+DeleteTopics = "1-6"
+CreatePartitions = "0-3"
+DeleteRecords = "0-2"
+DescribeConfigs = "1-4"
+IncrementalAlterConfigs = "0-1"
+DeleteGroups = "0-2"
+DescribeCluster = "0-2"
+
+# SASL. SaslHandshake is never flexible at any version, which is deliberate
+# upstream: it is negotiated before the client knows anything about the broker.
+#
+# Both versions, and both are implemented. The handshake version is not a body encoding,
+# it is a framing switch for everything after it (KIP-152): v1 wraps subsequent SASL
+# tokens in SaslAuthenticate requests, v0 sends them as bare length-prefixed blobs with
+# no Kafka request header at all.
+#
+# Advertising 0 without implementing it is a hang: the broker would confirm the
+# mechanism and then fail to parse the first raw token. Advertising only 1 is worse than it sounds:
+# librdkafka reads the presence of v0 as "this broker does SASL at all" and refuses with
+# "SASL Handshake not supported by broker" even though it would have used v1. Measured.
+SaslHandshake = "0-1"
+SaslAuthenticate = "0-2"
+
+# Failover correctness. Without it a consumer whose position is past a promoted
+# replica's log end reads divergent data with no error. v0/v1 are gone from the
+# 4.x schema.
+OffsetForLeaderEpoch = "2-4"
+
+# Kafka's own transactions. Capped below the version where the request shape
+# changes to a batch of transactions per call, so what the dispatcher handles and
+# what is advertised cannot drift: one source in this file enforces that.
+AddPartitionsToTxn = "0-3"
+AddOffsetsToTxn = "0-3"
+EndTxn = "0-3"
+TxnOffsetCommit = "0-3"
+
+# `kafka-consumer-groups.sh --delete-offsets` drives this. v0 is the only version the
+# 4.x schema defines, and it is not flexible.
+OffsetDelete = "0"
+
+# `kafka-acls.sh`. The rules live in `kafgres_acls`; these are the RPCs that let an
+# operator manage them with the tool they already use. v0 is gone from the 4.x schema.
+DescribeAcls = "1-3"
+CreateAcls = "1-3"
+DeleteAcls = "1-3"
+
+# Client conformance. The data was always there, but a UI that asks for it and is told
+# "broker is too old" shows every topic size as unknown, which reads as a broken broker
+# rather than a missing API. Redpanda Console calls this on every refresh.
+#
+# 1-5 is the schema's full range and matches what the 4.3.1 reference advertises. v0 does
+# not exist in the 4.x schema.
+DescribeLogDirs = "1-5"
+
+# The pre-KIP-339 config write, which replaces rather than merges. Deprecated upstream but
+# not gone, and a client built against an older library has no other spelling: to it a
+# broker without this cannot change a topic config at all. 0-2 matches the reference.
+AlterConfigs = "0-2"
+
+# Answers "none", and the answer is true rather than stubbed: one broker has no partition
+# moving between brokers. Implemented because clients *probe* it: a UI asks before
+# drawing a page, and an unknown API degrades a view that had nothing to do with it. The
+# write side (45 AlterPartitionReassignments) stays absent on purpose: accepting a
+# request to move a partition and then not moving it would be the lie.
+ListPartitionReassignments = "0"
+# `kafka-leader-election.sh` and the same action in a console. One broker means the
+# preferred replica is always already the leader, so the honest answer is "nothing needed
+# doing", which is what the 4.3.1 reference returns for a single-replica partition, and
+# unlike a reassignment there is no dishonest half: election really is idempotent here.
+# 1-2, not the schema's full 0-2. `ElectLeadersResponse.ErrorCode` is `1+`, so at v0 a
+# top-level failure (an authorization denial, most importantly) has nowhere to go and the
+# client reads an empty successful response as "nothing needed doing". Advertising a version
+# we can only answer correctly when nothing goes wrong is the hang-not-an-error rule applied
+# to a code rather than to a handler.
+ElectLeaders = "1-2"
+DescribeClientQuotas = "0-1"
+# Absent until quota enforcement existed: storing a quota nothing applied would be a
+# limit an operator could not see being ignored. Set one, read it back, watch a client
+# exceed it forever. `producer_byte_rate` and `consumer_byte_rate` are enforced; the other two keys are
+# refused rather than stored, because this broker has no request-thread pool to ration and no
+# controller to mutate.
+AlterClientQuotas = "0-1"
+
+# Read-only views over state kafgres already keeps: the idempotent-producer window and
+# open transactions. Diagnostic rather than functional: a transaction that
+# never completes holds the LSO back, so consumers stop advancing with no error anywhere,
+# and without these an operator cannot see which transactional id is responsible.
+# A console's users page, and `kafka-configs.sh --entity-type users --describe`. The
+# identities are Postgres roles (`sasl.rs` authenticates against `pg_authid`), so this
+# reports what is really there rather than a second copy of it. `51
+# AlterUserScramCredentials` stays absent: creating Postgres roles from a wire request is a
+# privilege escalation with an RPC as its front door, and accepting one without creating
+# anything is the lie the config registry exists to prevent.
+DescribeUserScramCredentials = "0"
+# Credentials are Postgres roles, and a SCRAM verifier maps onto one exactly: the
+# client sends the salted password, so `kafka-configs.sh` and `ALTER ROLE` manage the same
+# credential rather than two separate worlds.
+AlterUserScramCredentials = "0"
+
+# The KIP-848 consumer group protocol. One RPC replaces JoinGroup, SyncGroup and
+# Heartbeat, and the *broker* computes the assignment rather than an elected member. A client
+# with `group.protocol=consumer` reads the presence of 68 as "this cluster supports it", so
+# advertising it without the reconciliation working is not a degraded experience: it is
+# two consumers holding one partition.
+#
+# v0 only. v1 adds `SubscribedTopicRegex`, which needs the broker to resolve a pattern against
+# the topic list on every heartbeat and to re-resolve it when topics appear; advertising v1
+# without that would silently subscribe a regex consumer to nothing.
+ConsumerGroupHeartbeat = "0"
+ConsumerGroupDescribe = "0"
+
+# The escape hatch for a hanging transaction. `DescribeProducers` and
+# `DescribeTransactions` already let an operator find one; without this they could not act on
+# it, so the workflow dead-ended halfway. Requires CLUSTER_ACTION, as upstream does.
+#
+# v1 is the baseline: Kafka 4.0 removed v0. v2 adds `TransactionVersion` (KIP-1228), which
+# selects between the legacy and TV2 marker formats; this broker writes one format, so
+# advertising v2 would accept a field it silently ignores.
+WriteTxnMarkers = "1"
+
+# Metadata's topic half, paginated. Kafka 4.x clients prefer it for describing
+# topics because `Metadata` returns every partition of every topic named in one response,
+# which on a large cluster is a response nobody can bound. Clients fall back to Metadata
+# when it is absent, which is why this was deferrable and is not free: the fallback is the
+# unbounded call.
+DescribeTopicPartitions = "0"
+
+# KIP-932 share groups, Kafka's queue semantics. Every member of a share group
+# may read the same partition, and the broker tracks the state of individual *records*
+# rather than one offset per partition: acquired, accepted, released, rejected. That is the
+# one delivery model Kafka historically could not express, and the reason it is four RPCs
+# rather than one is that acknowledgement is its own round trip.
+#
+# The share-coordinator state APIs (ReadShareGroupState and friends) stay absent: they are
+# how a broker talks to the share coordinator, and here they are the same process.
+ShareGroupHeartbeat = "1"
+ShareGroupDescribe = "1"
+ShareFetch = "1"
+ShareAcknowledge = "1"
+
+DescribeProducers = "0"
+DescribeTransactions = "0"
+ListTransactions = "0"

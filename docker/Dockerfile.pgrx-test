@@ -1,0 +1,23 @@
+FROM kafgres-builder
+# The builder installs postgresql-server-dev-16 — headers and pg_config, no server. That
+# is right for building the extension and not enough to *run* it, which `cargo pgrx test`
+# does: it runs initdb and starts a real instance. Added here rather than in the builder so
+# the shipped image does not carry a second Postgres.
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends postgresql-16 \
+ && rm -rf /var/lib/apt/lists/*
+# initdb refuses to run as root, so the tests need a non-root user that can also write
+# where `cargo pgrx install` puts the extension. uid 1000 matches the bind-mounted checkout.
+# The pgrx home is copied rather than re-initialised: it records where pg_config lives,
+# which does not depend on the user.
+RUN useradd -u 1000 -m tester \
+ && chown -R 1000 /usr/local/cargo \
+ && cp -r /root/.pgrx /home/tester/.pgrx \
+ && chown -R 1000 /home/tester/.pgrx \
+ && mkdir -p /usr/share/postgresql/16/extension \
+ && chown -R 1000 /usr/lib/postgresql/16/lib /usr/share/postgresql/16/extension
+# Mount point for the build cache. Owned by the test user at image build time on
+# purpose: Docker seeds a *new* named volume from the image's directory, ownership
+# included, so the volume comes out writable without a chown step at run time.
+RUN mkdir -p /cache && chown 1000 /cache
+USER tester
