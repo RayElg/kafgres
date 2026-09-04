@@ -237,6 +237,25 @@ def test_i2_stored_bytes_are_the_bytes_the_producer_sent(topic):
     assert struct.unpack_from(">q", raw, 0)[0] == 0, "baseOffset was not stamped"
     assert struct.unpack_from(">i", raw, 12)[0] == 0, "partitionLeaderEpoch was not stamped"
 
+@engine_a_storage
+def test_table_engine_rows_land_in_kafgres_log(topic):
+    """The in-suite proof that the table engine really stored what produce sent.
+
+    This used to be a CI assertion after the suites (`SELECT count(*) FROM
+    kafgres_log != 0`), which failed vacuously: every test drops its own topic in
+    teardown and a drop removes the rows, so a fully green run ends with an empty
+    table. Here the count is scoped to this test's topic and runs before teardown,
+    so a produce that silently went to the segment engine fails right here.
+    """
+    make(topic)
+    assert kcat("-t", topic, "-P", stdin="stored\n").returncode == 0
+
+    count = sql(
+        f"""SELECT count(*) FROM kafgres_log
+             WHERE topic_id = (SELECT topic_id FROM kafgres_topics WHERE name = '{topic}')"""
+    )
+    assert count != "0", "produce stored nothing in kafgres_log"
+
 def test_i8_a_huge_fetch_request_is_capped(topic):
     """The client's byte budget is a request, not an instruction: fetch.max.bytes
     defaults to 50MB and a client may raise it, and honouring that inside a Postgres

@@ -124,16 +124,27 @@ jobs:
             /opt/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:9292 --list
           python3 -m pytest tests/conformance/ -v
 
-      # Everything above ran on the table engine; this runs the same conformance suite
-      # against the segment engine, plus the crash rig.
+      # Everything above ran on the segment engine — the GUC default — so the crash
+      # rig already ran with the integration suite. This runs both suites again on
+      # the table engine, which has no other coverage in CI and carries the engine-A
+      # only tests: the byte-verbatim I2 checks, the idempotent-producer dedup counts
+      # and the phase 6 failover suite, whose tests skip themselves unless the
+      # primary is on `table`, so this step is the only thing that makes the standby
+      # started above earn its build.
       #
-      # Without this the segment-engine coverage is nil: `test_crash_recovery.py` skips
-      # itself unless the engine is `segment`, so on a table-engine run it contributes
-      # a silent skip and the job still goes green, the same trap as the TLS certificates.
-      - name: Segment engine conformance suite and crash recovery
+      # The segment pass left a log in $PGDATA/kafgres, and a base backup would copy
+      # it — a standby promoted later would then hold a log under *both* engines and
+      # refuse to start its broker. Wipe it first, the same dance as
+      # test_engine_switch.wipe_both_logs: the mismatch guard off so the broker starts
+      # while its files vanish, both GUCs, then recreate so the postmaster GUC applies.
+      - name: Table engine integration and conformance suite
         run: |
           docker compose exec -T postgres psql -U postgres \
-            -c "ALTER SYSTEM SET kafgres.storage_engine='segment'"
+            -c "ALTER SYSTEM SET kafgres.allow_engine_mismatch=on"
+          docker compose exec -T postgres bash -c 'rm -rf "$PGDATA"/kafgres/*'
+          docker compose exec -T postgres psql -U postgres \
+            -c "ALTER SYSTEM SET kafgres.storage_engine='table'" \
+            -c "ALTER SYSTEM SET kafgres.allow_engine_mismatch=off"
           docker compose up -d --force-recreate postgres
           for i in $(seq 1 60); do
             if docker compose exec -T postgres psql -U postgres -tAc \
@@ -143,13 +154,14 @@ jobs:
             fi
             sleep 2
           done
-          # Assert rather than trust the loop, which exits 0 after sixty failures.
+          # Assert rather than trust the loop, which exits 0 after sixty failures —
+          # and which a broker that refused to start over a stranded log also exits.
+          docker compose exec -T postgres psql -U postgres -tAc \
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE backend_type='kafgres_broker'" | grep -q '^1$'
           test "$(docker compose exec -T postgres psql -U postgres -tAc \
-                    'SHOW kafgres.storage_engine' | tr -d '[:space:]')" = segment
-          python3 -m pytest tests/conformance/ tests/integration/test_crash_recovery.py -v
-          # Nothing may have fallen back to the table engine.
-          test "$(docker compose exec -T postgres psql -U postgres -tAc \
-                    'SELECT count(*) FROM kafgres_log' | tr -d '[:space:]')" = 0
+                    'SHOW kafgres.storage_engine' | tr -d '[:space:]')" = table
+          python3 -m pytest tests/integration/ tests/conformance/ -v
 
       - name: Worker logs
         if: always()
