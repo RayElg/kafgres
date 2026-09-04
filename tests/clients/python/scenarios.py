@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """kafka-python scenario runner for the conformance suite.
 
 Pure Python, its own version negotiation, and — unlike librdkafka and Sarama — it
