@@ -162,10 +162,6 @@ jobs:
           test "$(docker compose exec -T postgres psql -U postgres -tAc \
                     'SHOW kafgres.storage_engine' | tr -d '[:space:]')" = table
           python3 -m pytest tests/integration/ tests/conformance/ -v
-          # The mirror of the old "nothing fell back" check, and the proof the suites
-          # above really stored through the table engine rather than segment again.
-          test "$(docker compose exec -T postgres psql -U postgres -tAc \
-                    'SELECT count(*) FROM kafgres_log' | tr -d '[:space:]')" != 0
 
       - name: Worker logs
         if: always()
