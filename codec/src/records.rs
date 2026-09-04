@@ -1201,7 +1201,10 @@ mod build_tests {
 mod record_decoder_tests {
     use super::*;
 
-    fn batch(records: &[(Option<&[u8]>, Option<&[u8]>)]) -> RecordBatch {
+    /// `(key, value)` byte-slice pairs — the shape decoder tests build batches from.
+    type RawPairs<'a> = [(Option<&'a [u8]>, Option<&'a [u8]>)];
+
+    fn batch(records: &RawPairs<'_>) -> RecordBatch {
         let built: Vec<NewRecord> = records
             .iter()
             .map(|(k, v)| NewRecord {
@@ -1267,7 +1270,7 @@ mod record_decoder_tests {
     // Hostile input: every length here is attacker-supplied, and a panic is a crashed
 
     fn corrupt(
-        records: &[(Option<&[u8]>, Option<&[u8]>)],
+        records: &RawPairs<'_>,
         f: impl Fn(&mut Vec<u8>),
     ) -> RecordBatch {
         let mut bytes = batch(records).as_bytes().to_vec();

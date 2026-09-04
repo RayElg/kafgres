@@ -213,8 +213,11 @@ mod tests {
     use super::*;
     use crate::records::{build_batch, NewRecord};
 
+    /// (base offset, (key, value) records) — the shape tests build a log from.
+    type LogInput = Vec<(i64, Vec<(&'static str, Option<&'static str>)>)>;
+
     /// Batches as they would sit in a log, each stamped with its assigned base offset.
-    fn log(batches: Vec<(i64, Vec<(&str, Option<&str>)>)>) -> Vec<RecordBatch> {
+    fn log(batches: LogInput) -> Vec<RecordBatch> {
         batches
             .into_iter()
             .map(|(base, records)| {
@@ -392,7 +395,7 @@ mod tests {
             },
         ];
         let batch = RecordBatch::new(crate::records::build_batch(&built)).unwrap();
-        let s = survivors(&[batch.clone()]).unwrap();
+        let s = survivors(std::slice::from_ref(&batch)).unwrap();
         assert!(s.keeps(0), "a null-keyed record was dropped by compaction");
         assert!(s.keeps(1));
     }
