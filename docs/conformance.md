@@ -94,8 +94,7 @@ advertised and what is implemented cannot drift.
 - **`ListOffsets` tops out at v6** (Kafka serves 1 to 11). Version 7 introduces a
   `MAX_TIMESTAMP` sentinel and version 9 `LATEST_TIERED_OFFSET`, neither of which is
   implemented, and advertising them would invite a query the broker can only answer
-  wrongly. Clients negotiate down; this is the only API where the advertised range is
-  narrower than Kafka's.
+  wrongly. Clients negotiate down.
 
 ### Configuration reporting
 
