@@ -214,6 +214,7 @@ fn schema_table_matches_the_vendored_pin() {
 }
 
 /// Advertising an API with no handler is the "hang, not an error" failure mode: the
+/// client waits forever, so the advertised set must equal the served set.
 #[test]
 fn advertised_set_is_exactly_the_implemented_handlers() {
     let mut keys: Vec<i16> = ADVERTISED.iter().map(|a| a.api_key).collect();
@@ -222,20 +223,12 @@ fn advertised_set_is_exactly_the_implemented_handlers() {
         keys,
         vec![
             0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-            27, 28, 29, 30, 31, 32, 33, 35, 36, 37, 42, 43, 44, 46, 47, 48, 49, 50, 51, 60,
-            61, 65, 66, 68, 69, 75, 76, 77, 78, 79,
+            27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+            49, 50, 51, 55, 57, 60, 61, 64, 65, 66, 68, 69, 74, 75, 76, 77, 78, 79, 80, 81, 83, 84,
+            85, 86, 87, 88, 89, 90, 91, 92,
         ],
-        "phase 5 adds the admin tier: 19 CreateTopics, 20 DeleteTopics, 21 DeleteRecords, \
-         32 DescribeConfigs, 37 CreatePartitions, 42 DeleteGroups, 44 IncrementalAlterConfigs, \
-         60 DescribeCluster, SASL's 17 and 36, and phase 6's 23 OffsetForLeaderEpoch. Phase 9 \
-         adds the transaction tier — 24, 25, 26, 28 — plus 47 OffsetDelete and the ACL tier \
-         29/30/31. The client-conformance tier adds 33 AlterConfigs, 35 DescribeLogDirs, \
-         46 ListPartitionReassignments, 48 DescribeClientQuotas, 61 DescribeProducers, \
-         65 DescribeTransactions and 66 ListTransactions — every one of them answering a \
-         question the broker could already answer and was telling clients it could not. \
-         Phase 11 adds KIP-848's 68/69, and phase 12 adds 27 WriteTxnMarkers: the other \
-         end of 61 and 65, which let an operator *find* a hanging transaction and gave \
-         them no way to act on it"
+        "every key here has a handler. The telemetry keys 71 and 72 are unadvertised, \
+         matching a stock broker with no metrics reporter"
     );
 
     // Produce advertises below its schema baseline of 3 on purpose (KAFKA-18659).
