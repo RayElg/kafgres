@@ -1,0 +1,290 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'          # e.g. 0.1.0, 1.2.3
+      - '[0-9]+.[0-9]+.[0-9]+-*'        # e.g. 0.1.0-rc1
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run build and test without creating a release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write     # needed to create releases
+
+jobs:
+  # ─── Stage 1: Build tarball + runtime image ────────────────────────────
+  build:
+    name: Build PG 16 / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      TARBALL: kafgres-pg16-${{ matrix.arch }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The runtime image is the primary deliverable: `docker compose build` in the
+      # repo is the only gate that proves the extension actually compiles and links,
+      # since cargo check skips the pgrx/Postgres link step.
+      - name: Build runtime image
+        run: docker buildx build --load -f docker/Dockerfile -t kafgres-postgres:${{ matrix.arch }} .
+
+      # The pgrx package output only exists in the builder stage; the runtime stage
+      # carries the installed copy. The builder build is served from cache, so this
+      # does not pay for the compile twice.
+      - name: Build extension tarball
+        run: |
+          set -euo pipefail
+          docker buildx build --load -f docker/Dockerfile --target builder -t kafgres-builder:${{ matrix.arch }} .
+          CID=$(docker create kafgres-builder:${{ matrix.arch }})
+          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+          rm -rf staging dist
+          mkdir -p "staging/${TARBALL}" dist
+          docker cp "${CID}:/app/dist/." staging/root
+          mv staging/root/usr/lib/postgresql/16/lib        "staging/${TARBALL}/lib"
+          mv staging/root/usr/share/postgresql/16/extension "staging/${TARBALL}/extension"
+          tar -czf "dist/${TARBALL}.tar.gz" -C staging "${TARBALL}"
+          ls -lh dist/
+
+      - name: Package runtime image
+        run: |
+          set -euo pipefail
+          docker save kafgres-postgres:${{ matrix.arch }} | gzip \
+            > dist/kafgres-postgres-pg16-${{ matrix.arch }}-image.tar.gz
+          ls -lh dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kafgres-pg16-${{ matrix.arch }}
+          path: dist/
+          retention-days: 5
+
+  # ─── Stage 2: Test the built image ─────────────────────────────────────
+  smoke:
+    name: Test PG 16 / ${{ matrix.arch }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: kafgres-pg16-${{ matrix.arch }}
+          path: dist/
+
+      - name: Load runtime image
+        run: |
+          set -euo pipefail
+          docker load -i dist/kafgres-postgres-pg16-${{ matrix.arch }}-image.tar.gz
+          docker tag kafgres-postgres:${{ matrix.arch }} kafgres-postgres
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build client tooling
+        run: docker build -t kafgres-clients tests/clients
+
+      # Not checked in; the TLS suite skips itself without them.
+      - name: Test certificates
+        run: bash tests/tls/generate.sh
+
+      # The repo compose file builds from source; a release run must exercise the
+      # image that ships, so this replaces it with one pinned to the loaded image.
+      # The failover rig mirrors the repo compose: a physical standby sharing the
+      # primary's image, promoted by the same entrypoint.
+      - name: Generate docker-compose.yml
+        run: |
+          cat > docker-compose.yml << 'EOF'
+          services:
+            postgres:
+              image: kafgres-postgres
+              ports:
+                - "127.0.0.1:5432:5432"
+                - "127.0.0.1:9092:9092"
+              environment:
+                POSTGRES_PASSWORD: postgres
+              volumes:
+                - ./tests/tls:/tls:ro
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U postgres"]
+                interval: 5s
+                timeout: 5s
+                retries: 10
+            standby:
+              image: kafgres-postgres
+              profiles: ["failover"]
+              depends_on:
+                postgres:
+                  condition: service_healthy
+              entrypoint: ["/usr/local/bin/standby-entrypoint.sh"]
+              environment:
+                PRIMARY_HOST: postgres
+                POSTGRES_PASSWORD: postgres
+              ports:
+                - "127.0.0.1:5433:5432"
+                - "127.0.0.1:9192:9192"
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U postgres"]
+                interval: 5s
+                timeout: 5s
+                retries: 20
+          EOF
+
+      - name: Start services
+        run: docker compose --profile failover up -d --wait
+
+      - name: Extension is loaded and the broker is running
+        run: |
+          set -euo pipefail
+          docker compose exec -T postgres psql -U postgres -tAc \
+            "SELECT extversion FROM pg_extension WHERE extname='kafgres'" | grep -q .
+          docker compose exec -T postgres psql -U postgres -tAc \
+            "SELECT count(*) FROM pg_stat_activity WHERE backend_type='kafgres_broker'" \
+            | grep -q '^1$'
+          timeout 60 bash -c 'until nc -z 127.0.0.1 9092; do sleep 1; done'
+          echo "✓ Kafka port 9092 is accepting connections"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: python3 -m pip install --quiet -r requirements.txt
+
+      - name: Integration tests against the shipped image
+        timeout-minutes: 30
+        run: python3 -m pytest tests/integration/ -v
+
+      - name: Worker logs
+        if: failure()
+        run: docker compose logs postgres | grep -i kafgres || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile failover down -v || true
+
+  # ─── Stage 3: Create GitHub Release ────────────────────────────────────
+  release:
+    name: Create Release
+    if: github.event_name == 'push' && !inputs.dry_run
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts/
+          merge-multiple: false
+
+      - name: Collect files
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+          find release-artifacts -name '*.tar.gz' -exec cp {} release-files/ \;
+          echo "## Release files:"
+          ls -lh release-files/
+
+      - name: Generate release notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          cat > release-notes.md << 'NOTES'
+          ## kafgres $TAG
+
+          ### Installation (extension tarball)
+
+          1. Download the tarball for your architecture
+          2. Extract it:
+             ```bash
+             tar xzf kafgres-pg16-amd64.tar.gz
+             ```
+          3. Copy the files into your PostgreSQL installation:
+             ```bash
+             cp kafgres-pg16-amd64/lib/*        $(pg_config --pkglibdir)/
+             cp kafgres-pg16-amd64/extension/*  $(pg_config --sharedir)/extension/
+             ```
+          4. Add to `postgresql.conf`:
+             ```
+             shared_preload_libraries = 'kafgres'
+             wal_level = logical
+             kafgres.advertised_host = '<host reachable by Kafka clients>'
+             ```
+
+             Some PostgreSQL builds (observed on 16.15 and newer minors) only allow
+             logical decoding output plugins listed in this GUC:
+
+             ```
+             output_plugin_libraries = 'pgoutput, test_decoding, kafgres'
+             ```
+
+             If the broker logs `library "kafgres" may not be used as an output
+             plugin`, add that line and run `SELECT pg_reload_conf();` (no restart
+             needed).
+          5. Restart PostgreSQL and create the extension:
+             ```sql
+             CREATE EXTENSION kafgres;
+             ```
+
+          ### Installation (Docker image)
+
+          ```bash
+          docker load -i kafgres-postgres-pg16-amd64-image.tar.gz
+          docker run -e POSTGRES_PASSWORD=postgres \
+            -p 5432:5432 -p 9092:9092 kafgres-postgres
+          ```
+
+          The image ships the configuration above and creates the extension on
+          first start.
+
+          ### Included artifacts
+
+          | File | PostgreSQL | Architecture |
+          |------|-----------|--------------|
+          | `kafgres-pg16-amd64.tar.gz` | 16.x | x86_64 |
+          | `kafgres-pg16-arm64.tar.gz` | 16.x | aarch64 |
+          | `kafgres-postgres-pg16-amd64-image.tar.gz` | 16.x | x86_64 |
+          | `kafgres-postgres-pg16-arm64-image.tar.gz` | 16.x | aarch64 |
+
+          All artifacts have been tested via CI before release.
+          NOTES
+          sed -i "s/\$TAG/${TAG}/g" release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: kafgres ${{ github.ref_name }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: release-files/*.tar.gz
+          fail_on_unmatched_files: true
