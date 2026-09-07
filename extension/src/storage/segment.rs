@@ -1369,6 +1369,107 @@ impl LogStore for SegmentStore {
         })
     }
 
+    fn max_timestamp_offset(
+        &self,
+        topic: TopicId,
+        partition: i32,
+    ) -> StoreResult<Option<(i64, i64)>> {
+        // The time index is ordered by batch position, not by timestamp value, and the
+        // greatest timestamp can sit in any batch, so walk headers and read only the winner.
+        let bases_on_disk = Self::segment_bases(topic, partition)?;
+        Self::with_slot(topic, partition, |st, _hints| {
+            let mut bases = bases_on_disk;
+            bases.sort_unstable();
+
+            // Pass one: find the winning batch from headers alone, without reading bodies.
+            struct Winner {
+                max_ts: i64,
+                seg_base: i64,
+                pos: u64,
+                len: u64,
+            }
+            let mut best: Option<Winner> = None;
+
+            for base in bases {
+                let path = data_path(&segment_path(topic, partition, base, "log"));
+                let vfd = match Vfd::open(&path, false) {
+                    Ok(v) => v,
+                    Err(_) => continue, // reclaimed while we looked
+                };
+                let data_end = if base == st.active_base {
+                    st.active_bytes
+                } else {
+                    vfd.size()?
+                };
+                let mut header = [0u8; records::RECORD_BATCH_OVERHEAD];
+                let mut pos = 0u64;
+                while pos + header.len() as u64 <= data_end {
+                    if vfd.read_at(&mut header, pos)? != header.len() {
+                        break;
+                    }
+                    let length = i32::from_be_bytes(
+                        header[records::LENGTH_OFFSET..records::LENGTH_OFFSET + 4]
+                            .try_into()
+                            .expect("4 bytes"),
+                    );
+                    if length <= 0 {
+                        break;
+                    }
+                    let total = records::LENGTH_OFFSET as u64 + 4 + length as u64;
+                    // `total` is read from the file and pass two allocates a buffer of
+                    // exactly this size. A torn page yields a garbled length and a garbled
+                    // max timestamp together, so requiring the batch to fit the committed
+                    // region bounds the allocation the way the other read paths here do.
+                    if pos + total > data_end {
+                        break;
+                    }
+                    let max_ts = i64::from_be_bytes(
+                        header[records::MAX_TIMESTAMP_OFFSET..records::MAX_TIMESTAMP_OFFSET + 8]
+                            .try_into()
+                            .expect("8 bytes"),
+                    );
+                    // Strictly greater: a tie keeps the earlier batch, matching Kafka.
+                    let better = match &best {
+                        Some(w) => max_ts > w.max_ts,
+                        None => true,
+                    };
+                    if better {
+                        best = Some(Winner {
+                            max_ts,
+                            seg_base: base,
+                            pos,
+                            len: total,
+                        });
+                    }
+                    pos += total;
+                }
+            }
+
+            // Pass two: read just that batch and find which record carried the timestamp.
+            let Some(w) = best else { return Ok(None) };
+            let path = data_path(&segment_path(topic, partition, w.seg_base, "log"));
+
+            // Pass one proved the partition is not empty, so `Ok(None)` here would report
+            // an empty log. Only an unlinked file is benign: the winner was reclaimed
+            // between the passes. Every other error propagates as KAFKA_STORAGE_ERROR.
+            let vfd = match Vfd::open(&path, false) {
+                Ok(v) => v,
+                Err(_) if !path.exists() => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let mut body = vec![0u8; w.len as usize];
+            if vfd.read_at(&mut body, w.pos)? != body.len() {
+                return Err(StoreError::Io(format!(
+                    "short read of the max-timestamp batch at {}+{} in {}",
+                    w.pos,
+                    w.len,
+                    path.display()
+                )));
+            }
+            Ok(super::offset_of_max_timestamp(kafgres_codec::bytes::Bytes::from(body)))
+        })
+    }
+
     fn high_watermark(&self, topic: TopicId, partition: i32) -> StoreResult<i64> {
         Self::with_slot(topic, partition, |st, _| Ok(st.next_offset))
     }

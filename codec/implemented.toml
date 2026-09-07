@@ -19,10 +19,13 @@ Metadata = "0-13"
 # schema's own baseline is 3.
 Produce = "3-13"
 Fetch = "4-18"
-# 1-6 rather than the schema's full 1-11: v7 introduces the MAX_TIMESTAMP sentinel and
-# v9 LATEST_TIERED_OFFSET, neither of which we implement. Advertising them would invite a
-# query we can only answer wrongly.
-ListOffsets = "1-6"
+# The schema's full range. v7 adds MAX_TIMESTAMP (KIP-734), which `max_timestamp_offset`
+# answers by finding the record that carried the greatest timestamp rather than the batch
+# it sits in. v8-v11 are tiered-storage sentinels, and this broker has no remote tier: the
+# log is entirely local, so EARLIEST_LOCAL is the log start, and LATEST_TIERED and
+# EARLIEST_PENDING_UPLOAD have no offset to report. Each answer was checked against the
+# 4.3.1 reference with remote storage disabled, which is the same configuration.
+ListOffsets = "1-11"
 
 # Consumer groups.
 FindCoordinator = "0-6"
@@ -76,10 +79,31 @@ OffsetForLeaderEpoch = "2-4"
 # Kafka's own transactions. Capped below the version where the request shape
 # changes to a batch of transactions per call, so what the dispatcher handles and
 # what is advertised cannot drift: one source in this file enforces that.
-AddPartitionsToTxn = "0-3"
-AddOffsetsToTxn = "0-3"
-EndTxn = "0-3"
-TxnOffsetCommit = "0-3"
+# v4+ of AddPartitionsToTxn is the batched, VerifyOnly shape the schema reserves for
+# broker-to-broker traffic; this cluster has no peer to send it, so it is served and
+# refused rather than answered for the first transaction in the batch. The other three
+# gain only a new error code at v4 (TRANSACTION_ABORTABLE, KIP-890) over an identical
+# wire shape, so serving those versions changes nothing a client sees.
+#
+# EndTxn stops at 4 deliberately: v5 is KIP-890 part two, where the broker bumps the
+# producer epoch on every transaction and returns it. The response fields are ignorable
+# and would encode as -1, which a client is entitled to read as an epoch it may use.
+AddPartitionsToTxn = "0-5"
+AddOffsetsToTxn = "0-4"
+# v5 rotates the producer epoch as part of ending the transaction (KIP-890 part two)
+# and hands the new pair back, so the next transaction needs no InitProducerId round
+# trip. Only at v5: a v4 client keeps the epoch it has and would be fenced by its own
+# next request if the broker moved it underneath.
+EndTxn = "0-5"
+# 0-4, not 0-5, for the same reason EndTxn stops at 4: the schema defines v5 as the
+# transaction-V2 shape, where TxnOffsetCommit also performs the AddOffsetsToTxn side
+# effect. This handler stages offsets and never marks the transaction ongoing, so a
+# v5 caller that skipped AddOffsetsToTxn would have its EndTxn answered
+# INVALID_PRODUCER_EPOCH and its staged offsets folded into a later transaction.
+# v5 also performs the AddOffsetsToTxn side effect, because a transaction-V2 client no
+# longer sends that call — if the broker does not mark the transaction ongoing here,
+# nothing does, and EndTxn answers INVALID_PRODUCER_EPOCH to a healthy producer.
+TxnOffsetCommit = "0-5"
 
 # `kafka-consumer-groups.sh --delete-offsets` drives this. v0 is the only version the
 # 4.x schema defines, and it is not flexible.
@@ -154,7 +178,9 @@ AlterUserScramCredentials = "0"
 # the topic list on every heartbeat and to re-resolve it when topics appear; advertising v1
 # without that would silently subscribe a regex consumer to nothing.
 ConsumerGroupHeartbeat = "0"
-ConsumerGroupDescribe = "0"
+# v1 adds the KIP-1099 MemberType field. Everything this RPC describes arrived over
+# ConsumerGroupHeartbeat, so every member is a consumer-protocol member.
+ConsumerGroupDescribe = "0-1"
 
 # The escape hatch for a hanging transaction. `DescribeProducers` and
 # `DescribeTransactions` already let an operator find one; without this they could not act on
@@ -182,9 +208,65 @@ DescribeTopicPartitions = "0"
 # how a broker talks to the share coordinator, and here they are the same process.
 ShareGroupHeartbeat = "1"
 ShareGroupDescribe = "1"
-ShareFetch = "1"
-ShareAcknowledge = "1"
+# v2 adds KIP-1206 ShareAcquireMode and KIP-1222 renew acknowledgements. Acquisition
+# here never exceeds MaxRecords, which satisfies record-limit exactly and satisfies
+# batch-optimized by declining a permission it does not need.
+ShareFetch = "1-2"
+# v2 carries KIP-1222 renew acknowledgements, which extend a record lock instead of
+# completing it. The Renew type is refused below v2, where it has no meaning.
+ShareAcknowledge = "1-2"
 
 DescribeProducers = "0"
 DescribeTransactions = "0"
-ListTransactions = "0"
+# v1 adds DurationFilter and v2 TransactionalIdPattern (KIP-1152), both applied in
+# SQL so a filtered listing never materialises every open transaction first.
+ListTransactions = "0-2"
+
+# APIs a single embedded broker can only answer one way, served so that a client's
+# version probe sees a current broker rather than a pre-1.0 one. franz-go — which
+# Redpanda Console, kcat and the Go ecosystem all use — guesses the cluster version from
+# the *set* of keys advertised, not their version ranges, so one absent key from Kafka 1.0
+# reads the whole cluster as "between v0.11.0 and v1.0" however current the rest is.
+#
+# Every one of these returns what Kafka itself returns when the feature is unconfigured or
+# the request cannot apply, never a fabricated success. See handlers/singleton.rs.
+AlterReplicaLogDirs = "1-2"
+CreateDelegationToken = "1-3"
+RenewDelegationToken = "1-2"
+ExpireDelegationToken = "1-2"
+DescribeDelegationToken = "1-3"
+AlterPartitionReassignments = "0-1"
+UpdateFeatures = "0-2"
+UnregisterBroker = "0"
+# v1 only, deliberately. v0 of this key is the old ListClientMetricsResources and lists
+# *client metrics* resources; kafgres has none, since KIP-714 telemetry is not served. v1
+# is the KIP-1142 shape that asks for configuration resources, which is the question we
+# can answer. Advertising v0 would answer a different question, and its per-resource
+# ResourceType field does not exist there, so the type would not even encode.
+ListConfigResources = "1"
+AddRaftVoter = "0-1"
+RemoveRaftVoter = "0"
+
+# Protocols with no counterpart here, served so the version probe sees the key. Each
+# answers with the reason rather than a fabricated success. See handlers/absent_peers.rs.
+#
+# 83-87 are the share-coordinator persister RPCs: how one broker reaches the share
+# coordinator, which on kafgres is this same process, so the caller is a peer that does
+# not exist. 55 describes a Raft quorum this broker does not have. 88/89 drive the
+# streams rebalance protocol it does not serve.
+DescribeQuorum = "0-2"
+InitializeShareGroupState = "0"
+ReadShareGroupState = "0"
+WriteShareGroupState = "0-1"
+DeleteShareGroupState = "0"
+ReadShareGroupStateSummary = "0-1"
+StreamsGroupHeartbeat = "0"
+StreamsGroupDescribe = "0"
+
+# The share-group half of `kafka-share-groups.sh`, answered from `kafgres_share_offsets`
+# — the same table ShareFetch reads a group's starting position from, so a reset here
+# really does move where the next acquire begins. Unlike the persister RPCs above, these
+# three are what an operator runs rather than what one broker sends another.
+DescribeShareGroupOffsets = "0-1"
+AlterShareGroupOffsets = "0"
+DeleteShareGroupOffsets = "0"

@@ -186,7 +186,7 @@ pub fn offset_fetch(
             });
             groups.push(OffsetFetchResponseGroup {
                 group_id: g.group_id.clone(),
-                topics: fetch_topics_v8(&g.group_id, requested)?,
+                topics: fetch_topics_v8(&g.group_id, requested, req.require_stable)?,
                 error_code: ErrorCode::None.code(),
                 unknown_tagged_fields: Vec::new(),
             });
@@ -207,7 +207,7 @@ pub fn offset_fetch(
     });
     Ok(OffsetFetchResponse {
         throttle_time_ms: 0,
-        topics: fetch_topics(&req.group_id, requested)?,
+        topics: fetch_topics(&req.group_id, requested, req.require_stable)?,
         error_code: ErrorCode::None.code(),
         groups: Vec::new(),
         unknown_tagged_fields: Vec::new(),
@@ -267,9 +267,36 @@ fn committed_for_topic(group_id: &str, topic_id: u32) -> Result<Committed, spi::
     })
 }
 
+/// Partitions whose committed offset for this group is staged in an unfinished
+/// transaction. `RequireStable` (v7+) asks to wait rather than read an offset
+/// that `EndTxn` may still retract.
+fn unstable_for_topic(
+    group_id: &str,
+    topic_id: u32,
+) -> Result<std::collections::HashSet<i32>, spi::Error> {
+    Spi::connect(|client| {
+        let rows = client.select(
+            "SELECT o.partition
+               FROM kafgres_txn_offsets o
+               JOIN kafgres_txns t USING (producer_id)
+              WHERE o.group_id = $1 AND o.topic_id = $2::oid AND t.state = 'ongoing'",
+            None,
+            &[group_id.into(), (topic_id as i32).into()],
+        )?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            if let Some(p) = row.get::<i32>(1)? {
+                out.insert(p);
+            }
+        }
+        Ok(out)
+    })
+}
+
 fn fetch_topics(
     group_id: &str,
     requested: Option<Vec<(String, Vec<i32>)>>,
+    require_stable: bool,
 ) -> Result<Vec<OffsetFetchResponseTopic>, HandlerError> {
     let wanted: Vec<(String, u32, Vec<i32>)> = match requested {
         Some(list) => resolve_requested(list)?,
@@ -287,8 +314,24 @@ fn fetch_topics(
     let mut out = Vec::with_capacity(wanted.len());
     for (name, topic_id, partitions) in wanted {
         let committed = committed_for_topic(group_id, topic_id)?;
+        let unstable = if require_stable {
+            unstable_for_topic(group_id, topic_id)?
+        } else {
+            std::collections::HashSet::new()
+        };
         let mut ps = Vec::with_capacity(partitions.len());
         for p in partitions {
+            if unstable.contains(&p) {
+                ps.push(OffsetFetchResponsePartition {
+                    partition_index: p,
+                    committed_offset: NO_OFFSET,
+                    committed_leader_epoch: -1,
+                    metadata: Some(String::new()),
+                    error_code: ErrorCode::UnstableOffsetCommit.code(),
+                    unknown_tagged_fields: Vec::new(),
+                });
+                continue;
+            }
             // `Some("")`, never `None`: Sarama's decoder rejects the null and the session dies.
             let (offset, epoch, metadata) = committed
                 .get(&p)
@@ -315,11 +358,12 @@ fn fetch_topics(
 fn fetch_topics_v8(
     group_id: &str,
     requested: Option<Vec<(String, Uuid, Vec<i32>)>>,
+    require_stable: bool,
 ) -> Result<Vec<OffsetFetchResponseTopics>, HandlerError> {
     let simplified = requested
         .as_ref()
         .map(|list| list.iter().map(|(n, _, p)| (n.clone(), p.clone())).collect());
-    let topics = fetch_topics(group_id, simplified)?;
+    let topics = fetch_topics(group_id, simplified, require_stable)?;
 
     let mut out = Vec::with_capacity(topics.len());
     for t in topics {

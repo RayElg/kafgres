@@ -69,7 +69,16 @@ pub fn describe_groups(
             // The tool uses a non-empty value here to decide the group is live.
             protocol_data: g.protocol_name.clone().unwrap_or_default(),
             members: described_members(group_id)?,
-            authorized_operations: AUTHORIZED_OPERATIONS_UNSET,
+            // v3+, and only when asked; unset means the broker did not check.
+            authorized_operations: if req.include_authorized_operations {
+                crate::acl::authorized_operations(
+                    authz,
+                    crate::acl::ResourceType::Group,
+                    group_id,
+                )
+            } else {
+                AUTHORIZED_OPERATIONS_UNSET
+            },
             unknown_tagged_fields: Vec::new(),
         });
     }

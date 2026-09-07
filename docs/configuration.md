@@ -63,6 +63,7 @@ restart does.
 | Setting | Reload | Default | Description |
 |---|---|---|---|
 | `kafgres.max_request_bytes` | reload | `32 MiB` | Largest inbound request frame, as Kafka's `socket.request.max.bytes`. A bounded number of connections may exceed the 8 MiB free tier at a time. |
+| `kafgres.transaction_version` | reload | `2` | Kafka's `transaction.version` feature level, reported in `ApiVersions` and matching what a stock 4.x cluster finalizes. At `2`, `EndTxn` v5 hands the producer a fresh epoch with the result, so its next transaction needs no `InitProducerId` (KIP-890). Set `1` to keep the pre-KIP-890 behaviour. |
 | `kafgres.producer_id_expiration_ms` | reload | `86400000` (24 h) | Drop idempotent-producer state idle this long; `0` disables expiration. |
 | `kafgres.max_producer_ids` | reload | `10000` | Ceiling on retained producer ids; the least recently used are dropped first, `0` disables. |
 | `kafgres.share_record_lock_duration_ms` | reload | `30000` | How long a share-group consumer holds an acquired record before it is offered again. |

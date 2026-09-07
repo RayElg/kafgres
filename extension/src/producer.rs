@@ -71,6 +71,57 @@ pub fn init_producer_id(transactional_id: Option<&str>) -> Result<(i64, i16), sp
     Ok((id, 0))
 }
 
+/// KIP-890 part two: bump the epoch as part of ending a transaction and return the new
+/// pair. At the epoch ceiling the transactional id moves to a fresh producer id.
+pub fn bump_epoch_for_next_txn(producer_id: i64, committed: bool) -> Result<(i64, i16), spi::Error> {
+    // One below `i16::MAX`: `producer_epoch` is a `smallint` and the other bump sites
+    // (`fence`, the expiry sweep, `init_producer_id`) add 1 unguarded, so parking a
+    // producer at 32767 would make every later fence or sweep fail with an overflow.
+    const EPOCH_CEILING: i32 = i16::MAX as i32 - 1;
+
+    // The retired epoch is recorded so a retried EndTxn is seen as a retry, not a zombie.
+    let bumped: Option<i32> = Spi::get_one_with_args(
+        "WITH up AS (
+             UPDATE kafgres_producers
+                SET retired_epoch = producer_epoch,
+                    retired_committed = $3,
+                    producer_epoch = producer_epoch + 1,
+                    last_ts = now()
+              WHERE producer_id = $1 AND producer_epoch < $2
+          RETURNING producer_epoch)
+         SELECT (SELECT producer_epoch FROM up)",
+        &[producer_id.into(), EPOCH_CEILING.into(), committed.into()],
+    )?;
+    if let Some(e) = bumped {
+        return Ok((producer_id, e as i16));
+    }
+
+    // Here the epoch hit the ceiling or the row is gone: move the transactional id to a
+    // fresh producer id at epoch 0. No row returns epoch -1 (caller already fenced).
+    let moved: Option<String> = Spi::get_one_with_args(
+        "WITH old AS (
+             DELETE FROM kafgres_producers WHERE producer_id = $1
+          RETURNING transactional_id, producer_epoch),
+         fresh AS (
+             INSERT INTO kafgres_producers
+                    (producer_id, producer_epoch, transactional_id,
+                     retired_epoch, retired_committed)
+             SELECT nextval('kafgres_producer_id_seq'), 0, transactional_id,
+                    producer_epoch, $2
+               FROM old
+          RETURNING producer_id, producer_epoch)
+         SELECT (SELECT producer_id || '|' || producer_epoch FROM fresh)",
+        &[producer_id.into(), committed.into()],
+    )?;
+    let Some(s) = moved else {
+        return Ok((producer_id, -1));
+    };
+    let mut it = s.split('|');
+    let id = it.next().and_then(|x| x.parse().ok()).unwrap_or(producer_id);
+    let epoch = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    Ok((id, epoch))
+}
+
 struct Retained {
     epoch: i16,
     first_seq: i32,

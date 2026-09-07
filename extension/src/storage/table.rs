@@ -485,6 +485,32 @@ impl LogStore for TableStore {
         .map_err(spi_err)
     }
 
+    fn max_timestamp_offset(
+        &self,
+        topic: TopicId,
+        partition: i32,
+    ) -> StoreResult<Option<(i64, i64)>> {
+        // Ties on max_timestamp go to the earlier batch, matching Kafka's own tracking.
+        let blob = Spi::connect(|client| {
+            let rows = client.select(
+                "SELECT batch FROM kafgres_log
+                  WHERE topic_id = $1::oid AND partition = $2
+                  ORDER BY max_timestamp DESC, base_offset ASC
+                  LIMIT 1",
+                None,
+                &[(topic as i32).into(), partition.into()],
+            )?;
+            let mut found: Option<Vec<u8>> = None;
+            for row in rows {
+                found = row.get::<Vec<u8>>(1)?;
+            }
+            Ok::<_, spi::Error>(found)
+        })
+        .map_err(spi_err)?;
+
+        Ok(blob.and_then(|b| super::offset_of_max_timestamp(kafgres_codec::bytes::Bytes::from(b))))
+    }
+
     fn high_watermark(&self, topic: TopicId, partition: i32) -> StoreResult<i64> {
         Spi::get_one_with_args::<i64>(
             "SELECT (SELECT next_offset FROM kafgres_partitions

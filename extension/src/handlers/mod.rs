@@ -1,3 +1,4 @@
+pub mod absent_peers;
 pub mod acls;
 pub mod admin;
 pub mod api_versions;
@@ -16,6 +17,8 @@ pub mod metadata;
 pub mod offsets;
 pub mod produce;
 pub mod share_group;
+pub mod share_offsets;
+pub mod singleton;
 pub mod topics;
 pub mod txn;
 
