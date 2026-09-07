@@ -25,6 +25,9 @@ pub const SESSION_TIMEOUT_MS: i64 = 45_000;
 
 const ASSIGNOR: &str = "uniform";
 
+/// KIP-1099 `MemberType`: -1 unknown, 0 classic, +1 consumer protocol.
+const MEMBER_TYPE_CONSUMER: i8 = 1;
+
 const MAX_SUBSCRIBED_TOPICS: usize = 5_000;
 const MAX_OWNED_PARTITIONS: usize = 50_000;
 /// Kafka's `group.consumer.max.size`; over it, `GROUP_MAX_SIZE_REACHED`.
@@ -789,6 +792,10 @@ pub fn describe(
                 // What the member reports holding, not what it was granted: `--describe`
                 assignment: to_assignment(&m.owned, &uuids),
                 target_assignment: to_assignment(&m.target, &uuids),
+                // KIP-1099 v1+. Every member described here arrived through
+                // ConsumerGroupHeartbeat, so always consumer, never the -1 that
+                // means unknown (classic members go through DescribeGroups).
+                member_type: MEMBER_TYPE_CONSUMER,
                 ..Default::default()
             });
         }

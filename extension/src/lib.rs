@@ -29,6 +29,7 @@ mod init110;
 mod init120;
 mod init130;
 mod init140;
+mod init150;
 pub mod quota;
 pub mod meta;
 pub mod produce_sql;
@@ -66,6 +67,7 @@ static REPLICATE_FROM: GucSetting<Option<CString>> = GucSetting::<Option<CString
 static ALLOW_TXN_PRODUCE: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 static MAX_REQUEST_BYTES: GucSetting<i32> = GucSetting::<i32>::new(32 * 1024 * 1024);
+static TRANSACTION_VERSION: GucSetting<i32> = GucSetting::<i32>::new(2);
 
 static ALLOW_ENGINE_MISMATCH: GucSetting<bool> = GucSetting::<bool>::new(false);
 
@@ -239,6 +241,13 @@ pub fn max_request_bytes() -> usize {
     MAX_REQUEST_BYTES.get().max(0) as usize
 }
 
+/// Kafka's `transaction.version` finalized feature level. KIP-890's EndTxn v5 epoch
+/// rotation is gated on this level, not on the EndTxn version: 2 (the default) enables
+/// it, 1 keeps the pre-KIP-890 behaviour.
+pub fn transaction_version() -> i32 {
+    TRANSACTION_VERSION.get()
+}
+
 pub fn allow_engine_mismatch() -> bool {
     ALLOW_ENGINE_MISMATCH.get()
 }
@@ -355,6 +364,16 @@ pub extern "C-unwind" fn _PG_init() {
         c"host:port of the leader to pull log from on a standby (segment engine only); empty disables",
         c"",
         &REPLICATE_FROM,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"kafgres.transaction_version",
+        c"Kafka transaction.version feature level: 2 enables KIP-890 epoch rotation at EndTxn v5",
+        c"2 matches what a stock Kafka 4.x cluster finalizes; set 1 to keep the pre-KIP-890 behaviour",
+        &TRANSACTION_VERSION,
+        1,
+        2,
         GucContext::Sighup,
         GucFlags::default(),
     );
@@ -774,6 +793,7 @@ pub(crate) fn ensure_tables_exist() {
     init120::init_120();
     init130::init_130();
     init140::init_140();
+    init150::init_150();
 }
 
 #[pg_extern]

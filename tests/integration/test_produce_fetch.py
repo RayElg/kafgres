@@ -239,13 +239,8 @@ def test_i2_stored_bytes_are_the_bytes_the_producer_sent(topic):
 
 @engine_a_storage
 def test_table_engine_rows_land_in_kafgres_log(topic):
-    """The in-suite proof that the table engine really stored what produce sent.
-
-    This used to be a CI assertion after the suites (`SELECT count(*) FROM
-    kafgres_log != 0`), which failed vacuously: every test drops its own topic in
-    teardown and a drop removes the rows, so a fully green run ends with an empty
-    table. Here the count is scoped to this test's topic and runs before teardown,
-    so a produce that silently went to the segment engine fails right here.
+    """Rows for this test's topic must exist in kafgres_log before teardown drops
+    them, so a produce that silently went to the segment engine fails right here.
     """
     make(topic)
     assert kcat("-t", topic, "-P", stdin="stored\n").returncode == 0

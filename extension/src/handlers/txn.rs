@@ -32,6 +32,22 @@ pub(super) fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// Why this producer's epoch is unusable, or `None` if it is fine. An epoch behind the
+/// current one means a newer instance took over (`PRODUCER_FENCED`); a producer id with
+/// no row is `INVALID_PRODUCER_EPOCH`.
+fn epoch_verdict(producer_id: i64, epoch: i16) -> Result<Option<ErrorCode>, HandlerError> {
+    let current: Option<i32> = Spi::get_one_with_args(
+        "SELECT (SELECT producer_epoch FROM kafgres_producers WHERE producer_id = $1)",
+        &[producer_id.into()],
+    )
+    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    Ok(match current {
+        Some(c) if (epoch as i32) < c => Some(ErrorCode::ProducerFenced),
+        Some(_) => None,
+        None => Some(ErrorCode::InvalidProducerEpoch),
+    })
+}
+
 /// Reject a producer whose epoch is behind the one we have fenced to — a zombie instance of
 fn fenced(producer_id: i64, epoch: i16) -> Result<bool, HandlerError> {
     let current: Option<i32> = Spi::get_one_with_args(
@@ -49,18 +65,20 @@ pub fn handle_add_partitions(
     req: &AddPartitionsToTxnRequest,
     version: i16,
 ) -> Result<AddPartitionsToTxnResponse, HandlerError> {
-    // v4+ batches several transactions into one request; v3 and below carry exactly one
-    let (txn_id, producer_id, epoch, topics) = if version >= 4 {
-        match req.transactions.first() {
-            Some(t) => (
-                t.transactional_id.clone(),
-                t.producer_id,
-                t.producer_epoch,
-                t.topics.clone(),
-            ),
-            None => return Ok(AddPartitionsToTxnResponse::default()),
-        }
-    } else {
+    // v4+ is the broker-to-broker batched shape, and this cluster has no peers. Answering
+    // only the first transaction with an empty `results_by_transaction` would read as
+    // "all partitions verified", so the request is refused whole.
+    if version >= 4 {
+        return Ok(AddPartitionsToTxnResponse {
+            throttle_time_ms: 0,
+            error_code: ErrorCode::InvalidRequest.code(),
+            results_by_transaction: Vec::new(),
+            results_by_topic_v3_and_below: Vec::new(),
+            ..Default::default()
+        });
+    }
+
+    let (txn_id, producer_id, epoch, topics) = {
         (
             req.v3_and_below_transactional_id.clone(),
             req.v3_and_below_producer_id,
@@ -69,11 +87,7 @@ pub fn handle_add_partitions(
         )
     };
 
-    let code = if fenced(producer_id, epoch)? {
-        ErrorCode::InvalidProducerEpoch
-    } else {
-        ErrorCode::None
-    };
+    let code = epoch_verdict(producer_id, epoch)?.unwrap_or(ErrorCode::None);
 
     if code == ErrorCode::None {
         // A transaction *begins* here if this producer's row is not already `ongoing`.
@@ -158,42 +172,127 @@ pub fn handle_add_partitions(
         })
         .collect();
 
+    // Only v3 and below reach here; v4+ returned above.
     Ok(AddPartitionsToTxnResponse {
         throttle_time_ms: 0,
-        error_code: if version >= 4 { code.code() } else { 0 },
-        results_by_topic_v3_and_below: if version >= 4 { Vec::new() } else { results.clone() },
+        error_code: 0,
+        results_by_topic_v3_and_below: results.clone(),
         results_by_transaction: Vec::new(),
         ..Default::default()
     })
 }
 
 /// Commit or abort: write a marker to every partition the transaction touched. Markers
-pub fn handle_end_txn(req: &EndTxnRequest) -> Result<EndTxnResponse, HandlerError> {
+///
+/// At v5 the epoch also rotates (KIP-890 part two): the response carries a fresh epoch so
+/// the producer's next transaction starts without an `InitProducerId` round trip.
+pub fn handle_end_txn(req: &EndTxnRequest, version: i16) -> Result<EndTxnResponse, HandlerError> {
+    // The v5 fields are ignorable and default to -1, which a client may read as an epoch,
+    // so every early return below carries the caller's own pair.
+    let unchanged = |code: ErrorCode| EndTxnResponse {
+        throttle_time_ms: 0,
+        error_code: code.code(),
+        producer_id: req.producer_id,
+        producer_epoch: req.producer_epoch,
+        ..Default::default()
+    };
+
+    // Checked before the fence: after a v5 rotation a retry carries the retired epoch,
+    // which looks exactly like a zombie. KIP-890 has the coordinator answer NONE with the
+    // current pair rather than INVALID_PRODUCER_EPOCH, which the Java client treats as
+    // fatal, but only when the requested outcome matches the recorded one.
+    if version >= 5 && crate::transaction_version() >= 2 {
+        match completed_retry(req.producer_id, req.producer_epoch, req.committed)? {
+            Retry::Of(id, epoch) => {
+                return Ok(EndTxnResponse {
+                    throttle_time_ms: 0,
+                    error_code: ErrorCode::None.code(),
+                    producer_id: id,
+                    producer_epoch: epoch,
+                    ..Default::default()
+                })
+            }
+            Retry::OutcomeMismatch => return Ok(unchanged(ErrorCode::InvalidTxnState)),
+            Retry::No => {}
+        }
+    }
+
     if fenced(req.producer_id, req.producer_epoch)? {
-        return Ok(EndTxnResponse {
-            throttle_time_ms: 0,
-            error_code: ErrorCode::InvalidProducerEpoch.code(),
-            ..Default::default()
-        });
+        return Ok(unchanged(ErrorCode::InvalidProducerEpoch));
     }
 
     // Lost to the expiry sweep, a newer instance, or an operator via `WriteTxnMarkers`: in
     match finish_transaction(req.producer_id, req.producer_epoch, req.committed)? {
         Finish::NotOurs | Finish::Overridden => {
-            return Ok(EndTxnResponse {
-                throttle_time_ms: 0,
-                error_code: ErrorCode::InvalidProducerEpoch.code(),
-                ..Default::default()
-            })
+            return Ok(unchanged(ErrorCode::InvalidProducerEpoch))
         }
         Finish::Ended => {}
     }
 
+    // Rotation is gated on the finalized transaction.version as well as v5: a client that
+    // picked v5 without implementing KIP-890 would be fenced by its own next request.
+    if version < 5 || crate::transaction_version() < 2 {
+        return Ok(unchanged(ErrorCode::None));
+    }
+
+    // The pair may carry a different producer id when the epoch hit its ceiling.
+    let (producer_id, producer_epoch) = crate::producer::bump_epoch_for_next_txn(req.producer_id, req.committed)
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+
     Ok(EndTxnResponse {
         throttle_time_ms: 0,
         error_code: ErrorCode::None.code(),
+        producer_id,
+        producer_epoch,
         ..Default::default()
     })
+}
+
+/// Is this `EndTxn` a retry of the one that retired `epoch`, asking for the same outcome?
+///
+/// The epoch must be exactly the retired one (not merely older, which is a zombie), the
+/// outcome must match, and the transaction must no longer be ongoing.
+fn completed_retry(
+    producer_id: i64,
+    epoch: i16,
+    committed: bool,
+) -> Result<Retry, HandlerError> {
+    // One round trip answers both questions: is the epoch the retired one, and was the
+    // outcome the same? A mismatch is INVALID_TXN_STATE, not fencing.
+    let found: Option<String> = Spi::get_one_with_args(
+        "SELECT (SELECT CASE WHEN p.retired_committed IS NOT DISTINCT FROM $3
+                             THEN p.producer_id || '|' || p.producer_epoch
+                             ELSE 'mismatch' END
+                   FROM kafgres_producers p
+                  WHERE (p.producer_id = $1
+                         OR p.transactional_id = (SELECT transactional_id
+                                                    FROM kafgres_producers
+                                                   WHERE producer_id = $1))
+                    AND p.retired_epoch = $2
+                    AND NOT EXISTS (SELECT 1 FROM kafgres_txns t
+                                     WHERE t.producer_id = $1 AND t.state = 'ongoing')
+                  LIMIT 1)",
+        &[producer_id.into(), (epoch as i32).into(), committed.into()],
+    )
+    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+
+    let Some(s) = found else { return Ok(Retry::No) };
+    if s == "mismatch" {
+        return Ok(Retry::OutcomeMismatch);
+    }
+    let mut it = s.split('|');
+    let id = it.next().and_then(|x| x.parse().ok()).unwrap_or(producer_id);
+    let ep = it.next().and_then(|x| x.parse().ok()).unwrap_or(epoch);
+    Ok(Retry::Of(id, ep))
+}
+
+/// What an `EndTxn` carrying an epoch we may have retired turns out to be.
+enum Retry {
+    /// A genuine retry of the transaction that retired this epoch: answer with this pair.
+    Of(i64, i16),
+    /// The retired epoch, but asking for the opposite outcome.
+    OutcomeMismatch,
+    No,
 }
 
 /// What `finish_transaction` did, which is not always what it was asked to do.
@@ -348,6 +447,12 @@ pub fn handle_add_offsets(req: &AddOffsetsToTxnRequest) -> Result<AddOffsetsToTx
              VALUES ($1, $2, $3, 'ongoing', $4)
              ON CONFLICT (producer_id) DO UPDATE
                 SET state = 'ongoing',
+                    -- Carried, like AddPartitionsToTxn does. EndTxn v5 rotates the epoch
+                    -- every transaction, so a row left holding the first one makes
+                    -- `finish_transaction`'s `p.producer_epoch <= $2` guard false forever:
+                    -- the expiry sweep can then never abort or fence this producer, the
+                    -- staged offsets are never cleared, and the LSO stays pinned.
+                    producer_epoch = EXCLUDED.producer_epoch,
                     started_at = CASE WHEN kafgres_txns.state = 'ongoing'
                                       THEN kafgres_txns.started_at
                                       ELSE EXCLUDED.started_at END",
@@ -370,14 +475,44 @@ pub fn handle_add_offsets(req: &AddOffsetsToTxnRequest) -> Result<AddOffsetsToTx
 }
 
 /// `28 TxnOffsetCommit` — stage offsets that become visible only if the transaction
+///
+/// At v5 this request also marks the transaction ongoing (KIP-890 part two): a
+/// transaction-V2 client no longer sends `25 AddOffsetsToTxn`, so nothing else would.
 pub fn handle_txn_offset_commit(
     req: &TxnOffsetCommitRequest,
+    version: i16,
 ) -> Result<TxnOffsetCommitResponse, HandlerError> {
     let code = if fenced(req.producer_id, req.producer_epoch)? {
         ErrorCode::InvalidProducerEpoch
     } else {
         ErrorCode::None
     };
+
+    if code == ErrorCode::None && version >= 5 {
+        Spi::run_with_args(
+            "INSERT INTO kafgres_txns
+                    (producer_id, producer_epoch, transactional_id, state, started_at)
+             VALUES ($1, $2, $3, 'ongoing', $4)
+             ON CONFLICT (producer_id) DO UPDATE
+                SET state = 'ongoing',
+                    -- Carried, like AddPartitionsToTxn does. EndTxn v5 rotates the epoch
+                    -- every transaction, so a row left holding the first one makes
+                    -- `finish_transaction`'s `p.producer_epoch <= $2` guard false forever:
+                    -- the expiry sweep can then never abort or fence this producer, the
+                    -- staged offsets are never cleared, and the LSO stays pinned.
+                    producer_epoch = EXCLUDED.producer_epoch,
+                    started_at = CASE WHEN kafgres_txns.state = 'ongoing'
+                                      THEN kafgres_txns.started_at
+                                      ELSE EXCLUDED.started_at END",
+            &[
+                req.producer_id.into(),
+                (req.producer_epoch as i32).into(),
+                req.transactional_id.clone().into(),
+                now_millis().into(),
+            ],
+        )
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    }
 
     if code == ErrorCode::None {
         for topic in &req.topics {

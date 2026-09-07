@@ -54,22 +54,66 @@ version range stays inside Kafka's own.
 
 ## Advertised API surface
 
-kafgres advertises 53 of the 77 API keys `kafka-broker-api-versions.sh` knows. The
-served set and version ranges are declared in `codec/implemented.toml`, and the same
-declaration generates both the dispatch table and the ApiVersions payload, so what is
-advertised and what is implemented cannot drift.
+kafgres serves all 75 API keys the reference broker serves.
+`kafka-broker-api-versions.sh` knows 77; the two neither broker advertises are `71
+GetTelemetrySubscriptions` and `72 PushTelemetry`, which a stock 4.x broker does not offer
+without a metrics reporter configured. The served set and version ranges are declared in
+`codec/implemented.toml`, and the same declaration generates both the dispatch table and
+the ApiVersions payload, so what is advertised and what is implemented cannot drift.
 
-### APIs not implemented
+A client's version probe reads the set of advertised keys, not their ranges. franz-go,
+which Redpanda Console, `kcat` and the Go ecosystem use, treats any missing key as an
+old broker however current the served ranges are, so a cluster that omits a key is
+reported as pre-1.0.
 
-| Family | API keys | Reason |
+### Feature flags
+
+`ApiVersions` also reports the cluster features kafgres implements. Clients pick
+protocol behaviour from these rather than from a version range: the Java client uses
+KIP-890 epoch rotation only when `transaction.version` is finalized at 2, and reads a
+missing feature as off.
+
+| Feature | Finalized | Meaning here |
 |---|---|---|
-| Streams groups (KIP-1071) | 88, 89 | Out of scope. |
-| Share-group coordinator state | 83 to 87, 90 to 92 | These are how a broker talks to the share coordinator, and here that is the same process. The client-facing four (76 to 79) are served. |
-| Delegation tokens | 38 to 41 | Out of scope. |
-| Raft voters | 55, 64, 80, 81 | No Raft. `46 ListPartitionReassignments` answers "none in progress", which is true for a single broker. |
-| `UpdateFeatures`, `ListConfigResources`, telemetry | 57, 74, 71, 72 | Out of scope. Telemetry (KIP-714) is probed by 4.x clients, and declining it is handled. |
-| Partition reassignment | 45 | One broker whose replication is Postgres's. Accepting an instruction that cannot be carried out would be worse than refusing it. |
-| `AlterReplicaLogDirs` | 34 | One log directory. |
+| `transaction.version` | 2 | KIP-890. Configurable through `kafgres.transaction_version`; 2 is what a stock 4.x cluster finalizes. |
+| `group.version` | 1 | The KIP-848 consumer protocol is served. |
+| `share.version` | 1 | KIP-932 share groups are served. |
+
+`kraft.version`, `metadata.version` and `eligible.leader.replicas.version` are absent
+because there is no Raft log, no metadata image and no ELR, and `streams.version` because
+KIP-1071 is not served.
+
+### Keys served for probe completeness
+
+Each key below answers what Kafka answers when the feature is unavailable or the request
+cannot apply. None returns a success the broker cannot back.
+
+| API keys | Answer |
+|---|---|
+| `34 AlterReplicaLogDirs` | One log directory: a move to it is a no-op success, any other path is `LOG_DIR_NOT_FOUND`. |
+| `38` to `41` delegation tokens | `DELEGATION_TOKEN_AUTH_DISABLED`. kafgres has no `delegation.token.secret.key`; principals are Postgres roles or mTLS certificates. |
+| `45 AlterPartitionReassignments` | Replication is Postgres's, so a partition has one replica. A cancellation returns `NO_REASSIGNMENT_IN_PROGRESS` and an assignment `INVALID_REPLICA_ASSIGNMENT`. `46` answers that no reassignment is in progress. |
+| `55 DescribeQuorum`, `80`/`81` Raft voters | There is no metadata quorum; replication and failover are Postgres's, so there is no Raft log to inspect. |
+| `57 UpdateFeatures` | The served protocol is fixed at build time, so the answer is `FEATURE_UPDATE_FAILED`: per feature at v0/v1, top level at v2, where the per-feature array does not exist. |
+| `64 UnregisterBroker` | The cluster is one broker and it is this process. |
+| `83` to `87` share-coordinator persister | The share coordinator is this same process, so the peer these RPCs expect does not exist. Gated on `CLUSTER_ACTION` first, as Kafka gates it. |
+| `88`/`89` streams groups | `UNSUPPORTED_VERSION`, what a broker without `streams` among its rebalance protocols returns. |
+
+Three keys return live state instead of a fixed answer. `74 ListConfigResources` lists
+the broker and every topic, matching what `DescribeConfigs` serves; it serves v1 only,
+because v0 of that key was `ListClientMetricsResources`, which lists different
+resources. `90`/`91`/`92` are the share-group offset APIs `kafka-share-groups.sh` drives,
+and they read and write the same table `ShareFetch` takes a group's starting position
+from, so a reset moves where the next acquire begins.
+
+### Version ranges narrower than Kafka's
+
+- **`27 WriteTxnMarkers` serves v1, Kafka v1 to v2.** v2 adds a `TransactionVersion` field
+  to an inter-broker RPC; there is no peer broker to send it.
+- **`68 ConsumerGroupHeartbeat` serves v0, Kafka v0 to v1.** v1 adds
+  `SubscribedTopicRegex`, which requires resolving a pattern against the topic list on
+  every heartbeat and re-resolving it when topics appear. Advertising it without that
+  would silently match nothing.
 
 ### Served with differences
 
@@ -81,20 +125,29 @@ advertised and what is implemented cannot drift.
 - **ACL administration (29 to 31).** The rules live in `kafgres_acls`; these are the
   RPCs `kafka-acls.sh` uses to manage them.
 - **Admin APIs (33, 35, 46, 48, 61, 65, 66).** The tier a UI reaches for.
-- **Share groups (76 to 79).** Every member reads every partition, and the broker
-  tracks the state of individual records rather than one offset, as verified against the
-  real `KafkaShareConsumer`. Fair distribution is not guaranteed, by Kafka or here: a
-  consumer that drains faster takes more. `ShareFetch` does not park, so an idle share
-  consumer polls rather than long-polls.
+- **Share groups (76 to 79, and 90 to 92).** Every member reads every partition, and the
+  broker tracks the state of individual records rather than one offset, as verified
+  against the real `KafkaShareConsumer`. Fair distribution is not guaranteed, by Kafka or
+  here: a consumer that drains faster takes more. `ShareFetch` does not park, so an idle
+  share consumer polls rather than long-polls.
+  `ShareFetch` and `ShareAcknowledge` serve v2: KIP-1222 renew acknowledgements extend a
+  record's lock instead of completing it, and KIP-1206 `ShareAcquireMode` is honoured as
+  record-limit because acquisition never exceeds `MaxRecords`. A reset through `91` or a
+  delete through `92` also clears the per-record state; otherwise the acquire scan would
+  skip records whose state still reads done.
 - **`49 AlterClientQuotas`, `51 AlterUserScramCredentials`, `75 DescribeTopicPartitions`.**
   `throttle_time_ms` is reported, not enforced by muting: a client that ignores it is
   not slowed.
 - **KIP-848 consumer groups (68, 69).** Server-side assignment, with the classic
   protocol still available.
-- **`ListOffsets` tops out at v6** (Kafka serves 1 to 11). Version 7 introduces a
-  `MAX_TIMESTAMP` sentinel and version 9 `LATEST_TIERED_OFFSET`, neither of which is
-  implemented, and advertising them would invite a query the broker can only answer
-  wrongly. Clients negotiate down.
+- **`ListOffsets` serves the full 1 to 11.** v7's `MAX_TIMESTAMP` (KIP-734) returns the
+  offset of the record with the greatest timestamp, decoded from the winning batch rather
+  than taken from its base offset; the two differ when a producer stamps timestamps out
+  of order, which is the case the sentinel exists for. The log is entirely local, so
+  `EARLIEST_LOCAL` is the log start, and `LATEST_TIERED` and `EARLIEST_PENDING_UPLOAD`
+  have no offset to report. Each sentinel is refused below the version that introduced
+  it, because a sentinel is a negative number in a field that otherwise carries a
+  timestamp.
 
 ### Configuration reporting
 
@@ -120,6 +173,12 @@ advertised and what is implemented cannot drift.
   that consumer's position at its next restart. The error code is the one Kafka defines,
   which `kafka-consumer-groups.sh` renders as `GroupSubscribedToTopicException` either
   way.
+- **`ListTransactions`'s id pattern is a POSIX regular expression, not RE2.** Postgres
+  evaluates the filter, so the dialect is Postgres's. The pattern is anchored to the
+  whole id, matching Kafka, but a Perl-style class such as `\p{L}+`, which Kafka's RE2J
+  compiles, is refused here with `INVALID_REGULAR_EXPRESSION`. Plain patterns,
+  alternation and character classes behave the same on both. Evaluating the pattern in
+  the database keeps a filtered listing from materialising every open transaction first.
 - **Leader epochs are not consecutive.** Kafka increments the epoch by one per
   election; kafgres uses the Postgres timeline id, so it jumps. The protocol requires
   monotonicity, not consecutiveness, and a client that assumed `+1` was already broken

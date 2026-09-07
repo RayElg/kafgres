@@ -38,6 +38,28 @@ use kafgres_codec::generated::consumer_group_heartbeat_request::ConsumerGroupHea
 use kafgres_codec::generated::describe_user_scram_credentials_request::DescribeUserScramCredentialsRequest;
 use kafgres_codec::generated::elect_leaders_request::ElectLeadersRequest;
 use kafgres_codec::generated::list_partition_reassignments_request::ListPartitionReassignmentsRequest;
+use kafgres_codec::generated::add_raft_voter_request::AddRaftVoterRequest;
+use kafgres_codec::generated::alter_share_group_offsets_request::AlterShareGroupOffsetsRequest;
+use kafgres_codec::generated::delete_share_group_offsets_request::DeleteShareGroupOffsetsRequest;
+use kafgres_codec::generated::describe_share_group_offsets_request::DescribeShareGroupOffsetsRequest;
+use kafgres_codec::generated::delete_share_group_state_request::DeleteShareGroupStateRequest;
+use kafgres_codec::generated::describe_quorum_request::DescribeQuorumRequest;
+use kafgres_codec::generated::initialize_share_group_state_request::InitializeShareGroupStateRequest;
+use kafgres_codec::generated::read_share_group_state_request::ReadShareGroupStateRequest;
+use kafgres_codec::generated::read_share_group_state_summary_request::ReadShareGroupStateSummaryRequest;
+use kafgres_codec::generated::streams_group_describe_request::StreamsGroupDescribeRequest;
+use kafgres_codec::generated::streams_group_heartbeat_request::StreamsGroupHeartbeatRequest;
+use kafgres_codec::generated::write_share_group_state_request::WriteShareGroupStateRequest;
+use kafgres_codec::generated::alter_partition_reassignments_request::AlterPartitionReassignmentsRequest;
+use kafgres_codec::generated::alter_replica_log_dirs_request::AlterReplicaLogDirsRequest;
+use kafgres_codec::generated::create_delegation_token_request::CreateDelegationTokenRequest;
+use kafgres_codec::generated::describe_delegation_token_request::DescribeDelegationTokenRequest;
+use kafgres_codec::generated::expire_delegation_token_request::ExpireDelegationTokenRequest;
+use kafgres_codec::generated::list_config_resources_request::ListConfigResourcesRequest;
+use kafgres_codec::generated::remove_raft_voter_request::RemoveRaftVoterRequest;
+use kafgres_codec::generated::renew_delegation_token_request::RenewDelegationTokenRequest;
+use kafgres_codec::generated::unregister_broker_request::UnregisterBrokerRequest;
+use kafgres_codec::generated::update_features_request::UpdateFeaturesRequest;
 use kafgres_codec::generated::describe_configs_request::DescribeConfigsRequest;
 use kafgres_codec::generated::fetch_request::FetchRequest;
 use kafgres_codec::generated::incremental_alter_configs_request::IncrementalAlterConfigsRequest;
@@ -881,10 +903,11 @@ fn dispatch(
                 acls: &srv.acls,
                 principal: principal_of(srv, conn_id),
             };
+            let version = req.api_version;
             let body = BackgroundWorker::transaction(|| {
                 crate::dbtx::guarded(|| {
                     let store = crate::storage::open();
-                    handlers::list_offsets::handle(&request, &*store, &authz)
+                    handlers::list_offsets::handle(&request, version, &*store, &authz)
                 })
             })?;
             handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
@@ -1191,8 +1214,9 @@ fn dispatch(
         28 => {
             let mut body_buf = req.body.clone();
             let request = TxnOffsetCommitRequest::decode(&mut body_buf, req.api_version)?;
+            let version = req.api_version;
             let body = BackgroundWorker::transaction(|| {
-                crate::dbtx::guarded(|| handlers::txn::handle_txn_offset_commit(&request))
+                crate::dbtx::guarded(|| handlers::txn::handle_txn_offset_commit(&request, version))
             })?;
             handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
             Ok(Disposition::Reply)
@@ -1200,8 +1224,9 @@ fn dispatch(
         26 => {
             let mut body_buf = req.body.clone();
             let request = EndTxnRequest::decode(&mut body_buf, req.api_version)?;
+            let version = req.api_version;
             let body = BackgroundWorker::transaction(|| {
-                crate::dbtx::guarded(|| handlers::txn::handle_end_txn(&request))
+                crate::dbtx::guarded(|| handlers::txn::handle_end_txn(&request, version))
             })?;
             handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
             Ok(Disposition::Reply)
@@ -1365,6 +1390,240 @@ fn dispatch(
             handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
             Ok(Disposition::Reply)
         }
+        90 => {
+            let mut body_buf = req.body.clone();
+            let request = DescribeShareGroupOffsetsRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = BackgroundWorker::transaction(|| {
+                crate::dbtx::guarded(|| {
+                    let store = crate::storage::open();
+                    handlers::share_offsets::describe(&request, &*store, &authz)
+                })
+            })?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        91 => {
+            let mut body_buf = req.body.clone();
+            let request = AlterShareGroupOffsetsRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = BackgroundWorker::transaction(|| {
+                crate::dbtx::guarded(|| handlers::share_offsets::alter(&request, &authz))
+            })?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        92 => {
+            let mut body_buf = req.body.clone();
+            let request = DeleteShareGroupOffsetsRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = BackgroundWorker::transaction(|| {
+                crate::dbtx::guarded(|| handlers::share_offsets::delete(&request, &authz))
+            })?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        55 => {
+            let mut body_buf = req.body.clone();
+            let request = DescribeQuorumRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::absent_peers::describe_quorum(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        83 => {
+            let mut body_buf = req.body.clone();
+            let request =
+                InitializeShareGroupStateRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::absent_peers::initialize_share_group_state(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        84 => {
+            let mut body_buf = req.body.clone();
+            let request = ReadShareGroupStateRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::absent_peers::read_share_group_state(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        85 => {
+            let mut body_buf = req.body.clone();
+            let request = WriteShareGroupStateRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::absent_peers::write_share_group_state(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        86 => {
+            let mut body_buf = req.body.clone();
+            let request = DeleteShareGroupStateRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::absent_peers::delete_share_group_state(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        87 => {
+            let mut body_buf = req.body.clone();
+            let request =
+                ReadShareGroupStateSummaryRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::absent_peers::read_share_group_state_summary(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        88 => {
+            let mut body_buf = req.body.clone();
+            let request = StreamsGroupHeartbeatRequest::decode(&mut body_buf, req.api_version)?;
+            let body = handlers::absent_peers::streams_group_heartbeat(&request)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        89 => {
+            let mut body_buf = req.body.clone();
+            let request = StreamsGroupDescribeRequest::decode(&mut body_buf, req.api_version)?;
+            let body = handlers::absent_peers::streams_group_describe(&request)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        34 => {
+            let mut body_buf = req.body.clone();
+            let request = AlterReplicaLogDirsRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let log_dir = crate::storage::open().log_dir();
+            let body = handlers::singleton::alter_replica_log_dirs(&request, &log_dir, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        38 => {
+            let mut body_buf = req.body.clone();
+            let request = CreateDelegationTokenRequest::decode(&mut body_buf, req.api_version)?;
+            let body = handlers::singleton::create_delegation_token(&request)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        39 => {
+            let mut body_buf = req.body.clone();
+            let request = RenewDelegationTokenRequest::decode(&mut body_buf, req.api_version)?;
+            let body = handlers::singleton::renew_delegation_token(&request)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        40 => {
+            let mut body_buf = req.body.clone();
+            let request = ExpireDelegationTokenRequest::decode(&mut body_buf, req.api_version)?;
+            let body = handlers::singleton::expire_delegation_token(&request)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        41 => {
+            let mut body_buf = req.body.clone();
+            let request = DescribeDelegationTokenRequest::decode(&mut body_buf, req.api_version)?;
+            let body = handlers::singleton::describe_delegation_token(&request)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        45 => {
+            let mut body_buf = req.body.clone();
+            let request =
+                AlterPartitionReassignmentsRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::singleton::alter_partition_reassignments(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        57 => {
+            let mut body_buf = req.body.clone();
+            let request = UpdateFeaturesRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::singleton::update_features(&request, req.api_version, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        64 => {
+            let mut body_buf = req.body.clone();
+            let request = UnregisterBrokerRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::singleton::unregister_broker(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        74 => {
+            let mut body_buf = req.body.clone();
+            let request = ListConfigResourcesRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            // Reads `kafgres_topics`, so it needs a transaction: SPI outside one takes the postmaster down.
+            let body = BackgroundWorker::transaction(|| {
+                crate::dbtx::guarded(|| handlers::singleton::list_config_resources(&request, &authz))
+            })?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        80 => {
+            let mut body_buf = req.body.clone();
+            let request = AddRaftVoterRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::singleton::add_raft_voter(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        81 => {
+            let mut body_buf = req.body.clone();
+            let request = RemoveRaftVoterRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::singleton::remove_raft_voter(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
         68 => {
             let mut body_buf = req.body.clone();
             let request = ConsumerGroupHeartbeatRequest::decode(&mut body_buf, req.api_version)?;
@@ -1503,6 +1762,7 @@ fn dispatch(
         78 => {
             let mut body_buf = req.body.clone();
             let request = ShareFetchRequest::decode(&mut body_buf, req.api_version)?;
+            let version = req.api_version;
             let authz = crate::acl::Authz {
                 acls: &srv.acls,
                 principal: principal_of(srv, conn_id),
@@ -1510,7 +1770,7 @@ fn dispatch(
             let body = BackgroundWorker::transaction(|| {
                 crate::dbtx::guarded(|| {
                     let store = crate::storage::open();
-                    handlers::share_group::share_fetch(&request, &*store, &authz)
+                    handlers::share_group::share_fetch(&request, version, &*store, &authz)
                 })
             })?;
             handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
@@ -1519,12 +1779,13 @@ fn dispatch(
         79 => {
             let mut body_buf = req.body.clone();
             let request = ShareAcknowledgeRequest::decode(&mut body_buf, req.api_version)?;
+            let version = req.api_version;
             let authz = crate::acl::Authz {
                 acls: &srv.acls,
                 principal: principal_of(srv, conn_id),
             };
             let body = BackgroundWorker::transaction(|| {
-                crate::dbtx::guarded(|| handlers::share_group::share_acknowledge(&request, &authz))
+                crate::dbtx::guarded(|| handlers::share_group::share_acknowledge(&request, version, &authz))
             })?;
             handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
             Ok(Disposition::Reply)

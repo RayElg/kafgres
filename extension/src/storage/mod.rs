@@ -191,6 +191,28 @@ pub fn lock_for_read() -> Result<(), pgrx::spi::Error> {
     table::lock_for_read()
 }
 
+/// Given one batch's bytes, the offset of the first record holding the batch's
+/// `max_timestamp`, and that timestamp (Kafka keeps the earliest offset that reached the
+/// maximum). An undecodable batch yields the base offset, not an error.
+pub fn offset_of_max_timestamp(bytes: kafgres_codec::bytes::Bytes) -> Option<(i64, i64)> {
+    let batch = kafgres_codec::records::RecordBatch::new(bytes).ok()?;
+    let base = batch.base_offset();
+    let want = batch.max_timestamp();
+    let base_ts = batch.base_timestamp();
+
+    if let Ok(records) = batch.records_decompressed() {
+        for record in records {
+            let Ok(record) = record else { break };
+            if base_ts.saturating_add(record.timestamp_delta) == want {
+                return Some((base + record.offset_delta as i64, want));
+            }
+        }
+    }
+    // No record matches the header's max timestamp, or the body did not decode: report
+    // the header against the base offset rather than dropping the partition.
+    Some((base, want))
+}
+
 pub trait LogStore: Send {
     /// Append a batch, assigning offsets; returns the base offset assigned. Offsets
     fn append(
@@ -218,6 +240,16 @@ pub trait LogStore: Send {
         partition: i32,
         timestamp: i64,
     ) -> StoreResult<Option<i64>>;
+
+    /// The offset of the record carrying the partition's greatest timestamp, paired with
+    /// that timestamp; `None` for an empty log. Deliberately not the winning batch's base
+    /// offset: the header does not say which record produced it, and KIP-734 exists for
+    /// exactly that case.
+    fn max_timestamp_offset(
+        &self,
+        topic: TopicId,
+        partition: i32,
+    ) -> StoreResult<Option<(i64, i64)>>;
 
     fn high_watermark(&self, topic: TopicId, partition: i32) -> StoreResult<i64>;
 

@@ -46,12 +46,51 @@ pub fn list_transactions(
     let wanted: Vec<String> = req.state_filters.clone();
     let by_producer: Vec<i64> = req.producer_id_filters.clone();
 
+    // v1 `DurationFilter`: negative means all transactions, otherwise only ones running
+    // longer than this many milliseconds. v2 `TransactionalIdPattern`: a regex, with
+    // empty or null meaning all. Both filters are applied in SQL.
+    let duration = req.duration_filter;
+
+    // Anchored because Kafka matches the whole id; the non-capturing group keeps
+    // alternation (`a|b`) inside the anchors.
+    let pattern: Option<String> = req
+        .transactional_id_pattern
+        .clone()
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("^(?:{p})$"));
+
+    // Compile the pattern before the real query, inside a nested subtransaction so a
+    // Postgres regex error becomes a value instead of aborting the connection. Postgres
+    // rejects some patterns Kafka accepts, so this is reachable with valid patterns too;
+    // either way the response is INVALID_REGULAR_EXPRESSION.
+    if let Some(p) = &pattern {
+        let compiles = crate::dbtx::atomically(
+            || {
+                Spi::get_one_with_args::<bool>("SELECT ''::text ~ $1", &[p.clone().into()])
+                    .map_err(|_| ())?;
+                Ok::<(), ()>(())
+            },
+            |_| (),
+        )
+        .is_ok();
+        if !compiles {
+            return Ok(ListTransactionsResponse {
+                throttle_time_ms: 0,
+                error_code: ErrorCode::InvalidRegularExpression.code(),
+                ..Default::default()
+            });
+        }
+    }
     let rows: Vec<(String, i64, String)> = Spi::connect(|client| {
         let rows = client.select(
+            // `started_at` was written from the database clock, so age uses `now()`.
             "SELECT transactional_id, producer_id, state FROM kafgres_txns
+              WHERE ($1 < 0
+                     OR (EXTRACT(EPOCH FROM now()) * 1000)::bigint - started_at > $1)
+                AND ($2::text IS NULL OR transactional_id ~ $2::text)
               ORDER BY transactional_id",
             None,
-            &[],
+            &[duration.into(), pattern.into()],
         )?;
         let mut out = Vec::new();
         for r in rows {

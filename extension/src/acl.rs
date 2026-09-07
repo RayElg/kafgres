@@ -59,6 +59,53 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// Kafka's `AclOperation` code, also the bit position in `AuthorizedOperations`.
+    fn acl_code(self) -> u32 {
+        match self {
+            Operation::Read => 3,
+            Operation::Write => 4,
+            Operation::Create => 5,
+            Operation::Delete => 6,
+            Operation::Alter => 7,
+            Operation::Describe => 8,
+            Operation::ClusterAction => 9,
+            Operation::DescribeConfigs => 10,
+            Operation::AlterConfigs => 11,
+            Operation::IdempotentWrite => 12,
+        }
+    }
+}
+
+/// The operations each resource type can carry, in Kafka's enumeration order.
+fn operations_for(resource: ResourceType) -> &'static [Operation] {
+    use Operation::*;
+    match resource {
+        ResourceType::Topic => &[
+            Read, Write, Create, Delete, Alter, Describe, DescribeConfigs, AlterConfigs,
+        ],
+        ResourceType::Group => &[Read, Delete, Describe],
+        ResourceType::Cluster => &[
+            Create, ClusterAction, Alter, Describe, DescribeConfigs, AlterConfigs,
+            IdempotentWrite,
+        ],
+        ResourceType::TransactionalId => &[Write, Describe],
+    }
+}
+
+/// The `AuthorizedOperations` bitfield for one resource, as Metadata v8+ and
+/// DescribeGroups v3+ report it. Checks run against the in-memory ACL snapshot, so this
+/// costs no I/O.
+pub fn authorized_operations(authz: &Authz, resource: ResourceType, name: &str) -> i32 {
+    let mut bits: u32 = 0;
+    for op in operations_for(resource) {
+        if authz.check(*op, resource, name).is_ok() {
+            bits |= 1 << op.acl_code();
+        }
+    }
+    bits as i32
+}
+
+impl Operation {
     pub fn as_str(self) -> &'static str {
         match self {
             Operation::Read => "READ",
