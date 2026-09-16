@@ -9,7 +9,7 @@ fn spi_err(e: impl std::fmt::Display) -> StoreError {
 }
 
 pub fn log_start_offset(topic: TopicId, partition: i32) -> StoreResult<i64> {
-    Spi::get_one_with_args::<i64>(
+    crate::plan::get_one::<i64>(
         "SELECT (SELECT log_start_offset FROM kafgres_partitions
                   WHERE topic_id = $1::oid AND partition = $2)",
         &[(topic as i32).into(), partition.into()],
@@ -19,7 +19,7 @@ pub fn log_start_offset(topic: TopicId, partition: i32) -> StoreResult<i64> {
 }
 
 pub fn leader_epoch(topic: TopicId, partition: i32) -> StoreResult<i32> {
-    Spi::get_one_with_args::<i32>(
+    crate::plan::get_one::<i32>(
         "SELECT (SELECT leader_epoch FROM kafgres_partitions
                   WHERE topic_id = $1::oid AND partition = $2)",
         &[(topic as i32).into(), partition.into()],

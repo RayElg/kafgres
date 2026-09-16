@@ -38,6 +38,28 @@ use kafgres_codec::generated::consumer_group_heartbeat_request::ConsumerGroupHea
 use kafgres_codec::generated::describe_user_scram_credentials_request::DescribeUserScramCredentialsRequest;
 use kafgres_codec::generated::elect_leaders_request::ElectLeadersRequest;
 use kafgres_codec::generated::list_partition_reassignments_request::ListPartitionReassignmentsRequest;
+use kafgres_codec::generated::add_raft_voter_request::AddRaftVoterRequest;
+use kafgres_codec::generated::alter_share_group_offsets_request::AlterShareGroupOffsetsRequest;
+use kafgres_codec::generated::delete_share_group_offsets_request::DeleteShareGroupOffsetsRequest;
+use kafgres_codec::generated::describe_share_group_offsets_request::DescribeShareGroupOffsetsRequest;
+use kafgres_codec::generated::delete_share_group_state_request::DeleteShareGroupStateRequest;
+use kafgres_codec::generated::describe_quorum_request::DescribeQuorumRequest;
+use kafgres_codec::generated::initialize_share_group_state_request::InitializeShareGroupStateRequest;
+use kafgres_codec::generated::read_share_group_state_request::ReadShareGroupStateRequest;
+use kafgres_codec::generated::read_share_group_state_summary_request::ReadShareGroupStateSummaryRequest;
+use kafgres_codec::generated::streams_group_describe_request::StreamsGroupDescribeRequest;
+use kafgres_codec::generated::streams_group_heartbeat_request::StreamsGroupHeartbeatRequest;
+use kafgres_codec::generated::write_share_group_state_request::WriteShareGroupStateRequest;
+use kafgres_codec::generated::alter_partition_reassignments_request::AlterPartitionReassignmentsRequest;
+use kafgres_codec::generated::alter_replica_log_dirs_request::AlterReplicaLogDirsRequest;
+use kafgres_codec::generated::create_delegation_token_request::CreateDelegationTokenRequest;
+use kafgres_codec::generated::describe_delegation_token_request::DescribeDelegationTokenRequest;
+use kafgres_codec::generated::expire_delegation_token_request::ExpireDelegationTokenRequest;
+use kafgres_codec::generated::list_config_resources_request::ListConfigResourcesRequest;
+use kafgres_codec::generated::remove_raft_voter_request::RemoveRaftVoterRequest;
+use kafgres_codec::generated::renew_delegation_token_request::RenewDelegationTokenRequest;
+use kafgres_codec::generated::unregister_broker_request::UnregisterBrokerRequest;
+use kafgres_codec::generated::update_features_request::UpdateFeaturesRequest;
 use kafgres_codec::generated::describe_configs_request::DescribeConfigsRequest;
 use kafgres_codec::generated::fetch_request::FetchRequest;
 use kafgres_codec::generated::incremental_alter_configs_request::IncrementalAlterConfigsRequest;
@@ -92,6 +114,9 @@ struct Conn {
     flush_seq: u64,
     /// Completed responses that cannot go out yet because an earlier one is parked: Kafka
     ready: HashMap<u64, BytesMut>,
+    /// A produce response is queued whose bytes are not yet on the platter. Only such a
+    /// connection holds its acks back; a consumer that never produces keeps its mid-pass flush.
+    awaiting_sync: bool,
 
     sasl: crate::sasl::SaslState,
     /// Failed SASL steps on this connection: a failed proof leaves the state at
@@ -191,6 +216,10 @@ struct Server {
     tls: Option<crate::tls::TlsSetup>,
     /// ACLs, cached. Refreshed on a timer rather than queried per request.
     acls: crate::acl::AclCache,
+    /// Partitions appended to whose bytes are not yet on the platter (distinct from `appended`).
+    unsynced: HashSet<(u32, i32)>,
+    /// Frames served since the worker started, read as a "did this pass do anything" edge.
+    served: u64,
 }
 
 pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
@@ -240,6 +269,8 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         quota_config: crate::quota::QuotaCache::default(),
         tls,
         acls: crate::acl::AclCache::default(),
+        unsynced: HashSet::new(),
+        served: 0,
     };
 
     // Load once before the loop, not just on the first tick: the default snapshot is
@@ -256,7 +287,12 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         Err(e) => log!("kafgres: marker reconciliation failed: {e}"),
     }
 
-    while BackgroundWorker::wait_latch(Some(tick)) {
+    // There is no socket readiness yet: every request is served off the timer, so poll again
+    // after any pass that served a frame; a pipelining client's next request is already in
+    // the socket by then. Idle passes go back to sleeping `tick`.
+    let mut spin = false;
+    let mut next_tick_at = Instant::now();
+    while BackgroundWorker::wait_latch(Some(if spin { Duration::ZERO } else { tick })) {
         if BackgroundWorker::sighup_received() {
             crate::reload_config();
             log!("kafgres: SIGHUP, configuration reloaded");
@@ -265,14 +301,25 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
             cfg = crate::cluster_config();
         }
 
-        srv.tick = srv.tick.wrapping_add(1);
+        // Advanced on the wall clock, never on pass count: counting every pass fires the
+        // maintenance sweeps thousands of times a second under the spin loop, and counting
+        // only sleeping passes would freeze `tick`, stopping retention and member expiry.
+        let now = Instant::now();
+        if now >= next_tick_at {
+            srv.tick = srv.tick.wrapping_add(1);
+            next_tick_at = now + tick;
+        }
         // Before anything is served: an unloaded snapshot has `enabled = false`, which
         if !epochs_ready {
+            // This branch serves nothing, so stop spinning; the retry below is gated on it.
+            spin = false;
             if srv.tick % 200 == 0 {
                 epochs_ready = raise_leader_epochs();
             }
             continue;
         }
+
+        let served_before = srv.served;
 
         refresh_acls(&mut srv);
         accept_new(&listener, &mut srv);
@@ -286,7 +333,17 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         refresh_quotas(&mut srv);
         enforce_retention(&mut srv);
         complete_parked(&mut srv, &cfg);
+        // The durability barrier: one fsync per partition per pass, amortised across a
+        // client's requests in flight. Acks are released only if every owed partition synced;
+        // a partial failure leaves the producing connections held and retries next pass.
+        if sync_before_ack(&mut srv) {
+            for c in srv.conns.values_mut() {
+                c.awaiting_sync = false;
+            }
+        }
         flush_all(&mut srv);
+
+        spin = srv.served != served_before;
     }
 
     log!(
@@ -326,6 +383,7 @@ fn accept_new(listener: &TcpListener, srv: &mut Server) {
                         peer: addr.to_string(),
                         inbuf: BytesMut::with_capacity(READ_CHUNK_BYTES),
                         frame_cap: MAX_CONN_BUFFER_BYTES,
+                        awaiting_sync: false,
                         outbuf: BytesMut::new(),
                         next_seq: 0,
                         flush_seq: 0,
@@ -476,7 +534,9 @@ fn serve_frames(srv: &mut Server, id: i32, cfg: &ClusterConfig) -> bool {
                 Some(c) => c,
                 None => return false,
             };
-            if !conn.flush() {
+            // Held back only for a connection waiting on a durability barrier; this flush lets
+            // a pipelining client refill mid-pass and keeps `outbuf` drained between requests.
+            if !conn.awaiting_sync && !conn.flush() {
                 return false;
             }
             if conn.queued_bytes() > MAX_CONN_BUFFER_BYTES {
@@ -527,6 +587,8 @@ fn serve_one(srv: &mut Server, id: i32, frame: Bytes, cfg: &ClusterConfig) -> bo
             return false;
         }
     };
+
+    srv.served = srv.served.wrapping_add(1);
 
     let seq = match srv.conns.get_mut(&id) {
         Some(c) => c.reserve(),
@@ -796,6 +858,12 @@ fn dispatch(
             })?;
             // Ring the doorbell before answering: a consumer parked on this partition
             srv.appended.extend(outcome.appended.iter().copied());
+            if crate::fsync_before_ack() && !outcome.appended.is_empty() {
+                srv.unsynced.extend(outcome.appended.iter().copied());
+                if let Some(c) = srv.conns.get_mut(&conn_id) {
+                    c.awaiting_sync = true;
+                }
+            }
             // Charged after the append, on the bytes actually written — not the request size, or rejected batches get billed.
             let throttle = charge(
                 srv,
@@ -881,10 +949,11 @@ fn dispatch(
                 acls: &srv.acls,
                 principal: principal_of(srv, conn_id),
             };
+            let version = req.api_version;
             let body = BackgroundWorker::transaction(|| {
                 crate::dbtx::guarded(|| {
                     let store = crate::storage::open();
-                    handlers::list_offsets::handle(&request, &*store, &authz)
+                    handlers::list_offsets::handle(&request, version, &*store, &authz)
                 })
             })?;
             handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
@@ -1191,8 +1260,9 @@ fn dispatch(
         28 => {
             let mut body_buf = req.body.clone();
             let request = TxnOffsetCommitRequest::decode(&mut body_buf, req.api_version)?;
+            let version = req.api_version;
             let body = BackgroundWorker::transaction(|| {
-                crate::dbtx::guarded(|| handlers::txn::handle_txn_offset_commit(&request))
+                crate::dbtx::guarded(|| handlers::txn::handle_txn_offset_commit(&request, version))
             })?;
             handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
             Ok(Disposition::Reply)
@@ -1200,8 +1270,9 @@ fn dispatch(
         26 => {
             let mut body_buf = req.body.clone();
             let request = EndTxnRequest::decode(&mut body_buf, req.api_version)?;
+            let version = req.api_version;
             let body = BackgroundWorker::transaction(|| {
-                crate::dbtx::guarded(|| handlers::txn::handle_end_txn(&request))
+                crate::dbtx::guarded(|| handlers::txn::handle_end_txn(&request, version))
             })?;
             handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
             Ok(Disposition::Reply)
@@ -1365,6 +1436,240 @@ fn dispatch(
             handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
             Ok(Disposition::Reply)
         }
+        90 => {
+            let mut body_buf = req.body.clone();
+            let request = DescribeShareGroupOffsetsRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = BackgroundWorker::transaction(|| {
+                crate::dbtx::guarded(|| {
+                    let store = crate::storage::open();
+                    handlers::share_offsets::describe(&request, &*store, &authz)
+                })
+            })?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        91 => {
+            let mut body_buf = req.body.clone();
+            let request = AlterShareGroupOffsetsRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = BackgroundWorker::transaction(|| {
+                crate::dbtx::guarded(|| handlers::share_offsets::alter(&request, &authz))
+            })?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        92 => {
+            let mut body_buf = req.body.clone();
+            let request = DeleteShareGroupOffsetsRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = BackgroundWorker::transaction(|| {
+                crate::dbtx::guarded(|| handlers::share_offsets::delete(&request, &authz))
+            })?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        55 => {
+            let mut body_buf = req.body.clone();
+            let request = DescribeQuorumRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::absent_peers::describe_quorum(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        83 => {
+            let mut body_buf = req.body.clone();
+            let request =
+                InitializeShareGroupStateRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::absent_peers::initialize_share_group_state(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        84 => {
+            let mut body_buf = req.body.clone();
+            let request = ReadShareGroupStateRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::absent_peers::read_share_group_state(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        85 => {
+            let mut body_buf = req.body.clone();
+            let request = WriteShareGroupStateRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::absent_peers::write_share_group_state(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        86 => {
+            let mut body_buf = req.body.clone();
+            let request = DeleteShareGroupStateRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::absent_peers::delete_share_group_state(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        87 => {
+            let mut body_buf = req.body.clone();
+            let request =
+                ReadShareGroupStateSummaryRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::absent_peers::read_share_group_state_summary(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        88 => {
+            let mut body_buf = req.body.clone();
+            let request = StreamsGroupHeartbeatRequest::decode(&mut body_buf, req.api_version)?;
+            let body = handlers::absent_peers::streams_group_heartbeat(&request)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        89 => {
+            let mut body_buf = req.body.clone();
+            let request = StreamsGroupDescribeRequest::decode(&mut body_buf, req.api_version)?;
+            let body = handlers::absent_peers::streams_group_describe(&request)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        34 => {
+            let mut body_buf = req.body.clone();
+            let request = AlterReplicaLogDirsRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let log_dir = crate::storage::open().log_dir();
+            let body = handlers::singleton::alter_replica_log_dirs(&request, &log_dir, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        38 => {
+            let mut body_buf = req.body.clone();
+            let request = CreateDelegationTokenRequest::decode(&mut body_buf, req.api_version)?;
+            let body = handlers::singleton::create_delegation_token(&request)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        39 => {
+            let mut body_buf = req.body.clone();
+            let request = RenewDelegationTokenRequest::decode(&mut body_buf, req.api_version)?;
+            let body = handlers::singleton::renew_delegation_token(&request)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        40 => {
+            let mut body_buf = req.body.clone();
+            let request = ExpireDelegationTokenRequest::decode(&mut body_buf, req.api_version)?;
+            let body = handlers::singleton::expire_delegation_token(&request)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        41 => {
+            let mut body_buf = req.body.clone();
+            let request = DescribeDelegationTokenRequest::decode(&mut body_buf, req.api_version)?;
+            let body = handlers::singleton::describe_delegation_token(&request)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        45 => {
+            let mut body_buf = req.body.clone();
+            let request =
+                AlterPartitionReassignmentsRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::singleton::alter_partition_reassignments(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        57 => {
+            let mut body_buf = req.body.clone();
+            let request = UpdateFeaturesRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::singleton::update_features(&request, req.api_version, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        64 => {
+            let mut body_buf = req.body.clone();
+            let request = UnregisterBrokerRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::singleton::unregister_broker(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        74 => {
+            let mut body_buf = req.body.clone();
+            let request = ListConfigResourcesRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            // Reads `kafgres_topics`, so it needs a transaction: SPI outside one takes the postmaster down.
+            let body = BackgroundWorker::transaction(|| {
+                crate::dbtx::guarded(|| handlers::singleton::list_config_resources(&request, &authz))
+            })?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        80 => {
+            let mut body_buf = req.body.clone();
+            let request = AddRaftVoterRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::singleton::add_raft_voter(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
+        81 => {
+            let mut body_buf = req.body.clone();
+            let request = RemoveRaftVoterRequest::decode(&mut body_buf, req.api_version)?;
+            let authz = crate::acl::Authz {
+                acls: &srv.acls,
+                principal: principal_of(srv, conn_id),
+            };
+            let body = handlers::singleton::remove_raft_voter(&request, &authz)?;
+            handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
+            Ok(Disposition::Reply)
+        }
         68 => {
             let mut body_buf = req.body.clone();
             let request = ConsumerGroupHeartbeatRequest::decode(&mut body_buf, req.api_version)?;
@@ -1503,6 +1808,7 @@ fn dispatch(
         78 => {
             let mut body_buf = req.body.clone();
             let request = ShareFetchRequest::decode(&mut body_buf, req.api_version)?;
+            let version = req.api_version;
             let authz = crate::acl::Authz {
                 acls: &srv.acls,
                 principal: principal_of(srv, conn_id),
@@ -1510,7 +1816,7 @@ fn dispatch(
             let body = BackgroundWorker::transaction(|| {
                 crate::dbtx::guarded(|| {
                     let store = crate::storage::open();
-                    handlers::share_group::share_fetch(&request, &*store, &authz)
+                    handlers::share_group::share_fetch(&request, version, &*store, &authz)
                 })
             })?;
             handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
@@ -1519,12 +1825,13 @@ fn dispatch(
         79 => {
             let mut body_buf = req.body.clone();
             let request = ShareAcknowledgeRequest::decode(&mut body_buf, req.api_version)?;
+            let version = req.api_version;
             let authz = crate::acl::Authz {
                 acls: &srv.acls,
                 principal: principal_of(srv, conn_id),
             };
             let body = BackgroundWorker::transaction(|| {
-                crate::dbtx::guarded(|| handlers::share_group::share_acknowledge(&request, &authz))
+                crate::dbtx::guarded(|| handlers::share_group::share_acknowledge(&request, version, &authz))
             })?;
             handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
             Ok(Disposition::Reply)
@@ -2092,10 +2399,34 @@ fn encode_parked<T: kafgres_codec::Encodable>(
     Ok(out)
 }
 
+/// Make every partition appended to this pass durable before its acks are released. A
+/// failure here keeps the acks queued; the partition stays in the set and retries next pass.
+fn sync_before_ack(srv: &mut Server) -> bool {
+    if srv.unsynced.is_empty() {
+        return true;
+    }
+    let mut store = crate::storage::open();
+    let owed: Vec<(u32, i32)> = srv.unsynced.iter().copied().collect();
+    for (topic, partition) in owed {
+        match store.sync_partition(topic, partition) {
+            Ok(()) => {
+                srv.unsynced.remove(&(topic, partition));
+            }
+            Err(e) => log!("kafgres: fsync before ack failed for {topic}/{partition}: {e}"),
+        }
+    }
+    srv.unsynced.is_empty()
+}
+
 fn flush_all(srv: &mut Server) {
     let ids: Vec<i32> = srv.conns.keys().copied().collect();
     for id in ids {
-        let ok = srv.conns.get_mut(&id).map(|c| c.flush()).unwrap_or(true);
+        // A connection still awaiting its durability barrier keeps its responses queued.
+        let ok = srv
+            .conns
+            .get_mut(&id)
+            .map(|c| if c.awaiting_sync { true } else { c.flush() })
+            .unwrap_or(true);
         if !ok {
             drop_conn(srv, id);
         }

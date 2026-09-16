@@ -17,22 +17,33 @@ fn kafgres_produce(
         error!("kafgres_produce() is disabled by kafgres.allow_transactional_produce");
     }
 
-    let topic_id: i32 = match Spi::get_one_with_args(
-        "SELECT (SELECT topic_id::int FROM kafgres_topics WHERE name = $1)",
+    // One cached plan for both lookups; this reads the statement's existing snapshot, so a
+    // topic created after this transaction's snapshot started is not seen (READ COMMITTED).
+    let found: Option<(i32, i32)> = match crate::plan::select(
+        "SELECT t.topic_id::int,
+                (SELECT count(*)::int FROM kafgres_partitions p WHERE p.topic_id = t.topic_id)
+           FROM kafgres_topics t
+          WHERE t.name = $1",
         &[topic.into()],
+        |rows| {
+            for row in rows {
+                return Ok(Some((
+                    row.get::<i32>(1)?.unwrap_or(0),
+                    row.get::<i32>(2)?.unwrap_or(0),
+                )));
+            }
+            Ok(None)
+        },
     ) {
-        Ok(Some(id)) => id,
-        Ok(None) => error!("kafgres: no such topic {topic:?}"),
+        Ok(v) => v,
         Err(e) => error!("kafgres: {e}"),
     };
+    // No row means no such topic; a row with no partitions is a different failure.
+    let (topic_id, partitions) = match found {
+        Some(v) => v,
+        None => error!("kafgres: no such topic {topic:?}"),
+    };
     let topic_id = topic_id as u32;
-
-    let partitions: i32 = Spi::get_one_with_args(
-        "SELECT (SELECT count(*)::int FROM kafgres_partitions WHERE topic_id = $1::oid)",
-        &[(topic_id as i32).into()],
-    )
-    .unwrap_or(Some(0))
-    .unwrap_or(0);
     if partitions <= 0 {
         error!("kafgres: topic {topic:?} has no partitions");
     }
@@ -44,10 +55,9 @@ fn kafgres_produce(
     };
 
     // One `producerId` per transaction, taken from the xid: the aborted list is keyed by
-    let producer_id: i64 = Spi::get_one("SELECT pg_current_xact_id()::text::bigint")
-        .ok()
-        .flatten()
-        .unwrap_or(0);
+    // What `pg_current_xact_id()` calls, without the SPI round trip; both assign a
+    // top-level xid if none. SAFETY: called inside a transaction, which `#[pg_extern]` is.
+    let producer_id: i64 = unsafe { pg_sys::GetTopFullTransactionId().value as i64 };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -88,7 +98,7 @@ fn kafgres_produce(
     };
 
     // The marker, in the caller's transaction. Everything above already happened; this
-    if let Err(e) = Spi::run_with_args(
+    if let Err(e) = crate::plan::run(
         "INSERT INTO kafgres_markers (topic_id, partition, base_offset, last_offset, bytes)
          VALUES ($1::oid, $2, $3, $4, $5)",
         &[

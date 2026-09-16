@@ -28,6 +28,14 @@ const MAX_ACQUIRE_PER_FETCH: i32 = 5_000;
 /// Kafka's `group.share.partition.max.record.locks`. Bounds `kafgres_share_inflight` to a
 const MAX_RECORD_LOCKS: i64 = 200;
 
+/// KIP-1222's `IsRenewAck` flag is not read: every acknowledgement carries its own type.
+const _IS_RENEW_ACK_IS_REDUNDANT: () = ();
+
+/// KIP-1206 `ShareAcquireMode`: the broker may overshoot `MaxRecords` to finish a batch.
+const ACQUIRE_BATCH_OPTIMIZED: i8 = 0;
+/// KIP-1206 `ShareAcquireMode`: `MaxRecords` is a hard limit.
+const ACQUIRE_RECORD_LIMIT: i8 = 1;
+
 /// Rows one share partition may hold in `kafgres_share_inflight` before it stops handing out
 const MAX_INFLIGHT_ROWS: i64 = 50_000;
 
@@ -494,9 +502,13 @@ pub fn describe_group(group: &str) -> Result<Option<(i32, String)>, HandlerError
     .map_err(|e| HandlerError::Internal(e.to_string()))
 }
 
-pub fn decode_acks(raw: &[i8]) -> Vec<Ack> {
+/// Decode acknowledgement types, refusing any this version does not define.
+pub fn decode_acks(raw: &[i8], version: i16) -> Option<Vec<Ack>> {
     raw.iter()
-        .map(|v| Ack::from_wire(*v).unwrap_or(Ack::Gap))
+        .map(|v| match Ack::from_wire(*v) {
+            Some(Ack::Renew) if version < 2 => None,
+            other => other,
+        })
         .collect()
 }
 
@@ -848,6 +860,7 @@ fn implied_session(group: &str, member: &str) -> Result<Vec<ShareFetchTopic>, Ha
 /// `78 ShareFetch` — acquire records, and apply any acknowledgements riding along. Batches
 pub fn share_fetch(
     req: &ShareFetchRequest,
+    version: i16,
     store: &dyn crate::storage::LogStore,
     authz: &crate::acl::Authz,
 ) -> Result<ShareFetchResponse, HandlerError> {
@@ -907,6 +920,19 @@ pub fn share_fetch(
         &req.topics
     };
 
+    // KIP-1206, v2+: 0 is batch-optimized, 1 is record-limit; this acquire never exceeds it.
+    if version >= 2 && !matches!(req.share_acquire_mode, ACQUIRE_BATCH_OPTIMIZED | ACQUIRE_RECORD_LIMIT) {
+        return Ok(ShareFetchResponse {
+            throttle_time_ms: 0,
+            error_code: ErrorCode::InvalidRequest.code(),
+            error_message: Some(format!(
+                "unknown share acquire mode {}",
+                req.share_acquire_mode
+            )),
+            ..Default::default()
+        });
+    }
+
     let mut budget = req.max_records.clamp(1, MAX_ACQUIRE_PER_FETCH);
     // A running byte total, not a per-partition cap: `budget` counts records, and without
     let mut bytes_left: usize = super::MAX_RESPONSE_BYTES
@@ -936,7 +962,10 @@ pub fn share_fetch(
             // Acknowledgements first, then the fetch: progress must be applied before the
             let mut ack_code = ErrorCode::None;
             for b in &p.acknowledgement_batches {
-                let acks = decode_acks(&b.acknowledge_types);
+                let Some(acks) = decode_acks(&b.acknowledge_types, version) else {
+                    ack_code = ErrorCode::InvalidRequest;
+                    continue;
+                };
                 if let Err(e) = acknowledge(
                     &group, &member, topic_id, p.partition_index,
                     b.first_offset, b.last_offset, &acks,
@@ -1105,6 +1134,7 @@ fn delivery_counts(
 /// `79 ShareAcknowledge` — acknowledgements without a fetch.
 pub fn share_acknowledge(
     req: &ShareAcknowledgeRequest,
+    version: i16,
     authz: &crate::acl::Authz,
 ) -> Result<ShareAcknowledgeResponse, HandlerError> {
     let group = req.group_id.clone().unwrap_or_default();
@@ -1137,7 +1167,10 @@ pub fn share_acknowledge(
                 Some((topic_id, _)) => {
                     let mut code = ErrorCode::None;
                     for b in &p.acknowledgement_batches {
-                        let acks = decode_acks(&b.acknowledge_types);
+                        let Some(acks) = decode_acks(&b.acknowledge_types, version) else {
+                            code = ErrorCode::InvalidRequest;
+                            continue;
+                        };
                         if let Err(e) = acknowledge(
                             &group, &member, *topic_id, p.partition_index,
                             b.first_offset, b.last_offset, &acks,

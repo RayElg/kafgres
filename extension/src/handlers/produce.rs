@@ -109,6 +109,20 @@ pub fn handle(
     store: &mut dyn LogStore,
     authz: &crate::acl::Authz,
 ) -> Result<ProduceOutcome, HandlerError> {
+    // Segment engine, non-transactional only: on the table engine the commit flush is what
+    // makes a record durable, and a transactional produce writes `kafgres_txn_partitions`,
+    // which has no log representation to rebuild from. The batch attribute bit is checked,
+    // not just the request-level `transactional_id`: a batch can carry the bit under a null id.
+    if crate::relaxed_produce_commit()
+        && req.transactional_id.is_none()
+        && !any_transactional_batch(req)
+        && crate::storage_engine_guc() == "segment"
+    {
+        crate::dbtx::relax_commit_durability().map_err(|e| {
+            HandlerError::Internal(format!("could not relax commit durability: {e}"))
+        })?;
+    }
+
     let attempt = crate::dbtx::atomically(
         || build(req, store, authz, Isolation::Shared),
         |_| Abandon::PartitionFailed,
@@ -126,6 +140,21 @@ pub fn handle(
             }
         }),
     }
+}
+
+/// Whether any batch in the request carries the transactional attribute bit (header read, no decode).
+fn any_transactional_batch(req: &ProduceRequest) -> bool {
+    use kafgres_codec::records::BatchIter;
+    req.topic_data.iter().any(|t| {
+        t.partition_data.iter().any(|p| {
+            p.records.as_ref().is_some_and(|bytes| {
+                // Every batch, not just the first: a records field can carry several
+                // concatenated batches. An undecodable batch is treated as transactional.
+                BatchIter::new(bytes.clone())
+                    .any(|b| b.map(|v| v.is_transactional()).unwrap_or(true))
+            })
+        })
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
