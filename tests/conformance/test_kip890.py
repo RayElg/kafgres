@@ -167,6 +167,13 @@ class Broker:
         r.i32()
         return r.i16(), r.i64(), r.i16()
 
+    def init_producer_id_v5(self, txn_id):
+        """v5, flexible: the version a transaction-V2 client negotiates."""
+        body = _cstr(txn_id) + _s32(60_000) + _s64(-1) + _s16(-1) + _uvarint(0)
+        r = self.call(22, 5, body, True)
+        r.i32()
+        return r.i16(), r.i64(), r.i16()
+
 
 def _settle(fn, tries=25, delay=0.4):
     """Retry past CONCURRENT_TRANSACTIONS. Kafka returns it while the previous
@@ -181,7 +188,7 @@ def _settle(fn, tries=25, delay=0.4):
     return out
 
 
-def _ensure_topic(bootstrap):
+def _ensure_topic(bootstrap, topic=TOPIC):
     subprocess.run(
         ["docker", "run", "--rm", "--network", "host", KAFKA_IMAGE,
          "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", bootstrap,
@@ -263,3 +270,57 @@ def test_the_whole_transcript_matches_the_reference_broker():
     ours = transcript(*KAFGRES, "kafgres")
     theirs = transcript(*REFERENCE, "reference")
     assert ours == theirs, f"\nkafgres:   {ours}\nreference: {theirs}"
+
+
+def _never_begun_end_txn(host, port, txn):
+    """InitProducerId v5, then EndTxn v5, with no AddPartitionsToTxn in between: the
+    shape of a transaction-V2 client that ends a transaction it never produced to."""
+    b = Broker(host, port)
+    try:
+        for _ in range(20):
+            if b.find_coordinator(txn) != COORDINATOR_NOT_AVAILABLE:
+                break
+            time.sleep(1.5)
+        err, pid, epoch = b.init_producer_id_v5(txn)
+        assert err == NONE, f"InitProducerId error {err}"
+        return b.end_txn(txn, pid, epoch, True)[0]
+    finally:
+        b.close()
+
+
+def test_end_txn_v5_on_a_transaction_that_was_never_begun_is_not_fencing():
+    """A transaction-V2 client is entitled to end a transaction it only initialised.
+    The epoch errors are fatal to the client, so this must be INVALID_TXN_STATE, the
+    state-machine answer, never INVALID_PRODUCER_EPOCH."""
+    err = _never_begun_end_txn(*KAFGRES, "kip890-never-begun")
+    assert err == INVALID_TXN_STATE, f"EndTxn on a never-begun transaction answered {err}"
+
+
+@needs_reference
+def test_the_never_begun_end_txn_answer_matches_the_reference():
+    ours = _never_begun_end_txn(*KAFGRES, "kip890-never-begun-ours")
+    theirs = _never_begun_end_txn(*REFERENCE, "kip890-never-begun-theirs")
+    assert ours == theirs == INVALID_TXN_STATE, f"kafgres {ours}, reference {theirs}"
+
+
+def test_a_real_transaction_v2_client_transacts_end_to_end():
+    """The 4.3.1 Java client, against our advertised feature levels, runs as
+    transaction-V2: it never sends AddPartitionsToTxn, so the produce path itself must
+    begin the transaction and EndTxn v5 must end it. This is the flow no hand-rolled
+    frame above replays, and the one every 4.x transactional producer uses."""
+    topic = "kip890-tv2-e2e"
+    _ensure_topic(f"{KAFGRES[0]}:{KAFGRES[1]}", topic)
+    txn_id = f"kip890-tv2-{int(time.time())}"
+    out = subprocess.run(
+        ["docker", "run", "--rm", "--network", "host", KAFKA_IMAGE,
+         "/opt/kafka/bin/kafka-producer-perf-test.sh",
+         "--topic", topic, "--num-records", "20", "--record-size", "200",
+         "--throughput", "-1", "--transactional-id", txn_id,
+         "--transaction-duration-ms", "200",
+         "--command-property", f"bootstrap.servers={KAFGRES[0]}:{KAFGRES[1]}"],
+        capture_output=True, text=True, timeout=300,
+    )
+    assert out.returncode == 0, (
+        f"transactional produce failed: {out.stdout[-400:]} {out.stderr[-400:]}"
+    )
+    assert "20 records sent" in out.stdout, out.stdout[-400:]

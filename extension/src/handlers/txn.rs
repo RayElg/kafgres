@@ -221,6 +221,7 @@ pub fn handle_end_txn(req: &EndTxnRequest, version: i16) -> Result<EndTxnRespons
         Finish::NotOurs | Finish::Overridden => {
             return Ok(unchanged(ErrorCode::InvalidProducerEpoch))
         }
+        Finish::NotStarted => return Ok(unchanged(ErrorCode::InvalidTxnState)),
         Finish::Ended => {}
     }
 
@@ -293,6 +294,11 @@ pub enum Finish {
     /// The transaction is not this caller's to end.
     NotOurs,
     Ended,
+    /// The transaction was never begun: a transaction-V2 client can end a transaction it
+    /// only initialised, with no `AddPartitionsToTxn` and no produce behind it. This is
+    /// `INVALID_TXN_STATE`, matching the reference broker; fencing here would be fatal
+    /// to the client for a request it is entitled to make.
+    NotStarted,
     /// Ended with the outcome an operator had already forced; the caller must not be told
     Overridden,
 }
@@ -304,17 +310,23 @@ fn finish_transaction(
 ) -> Result<Finish, HandlerError> {
     let requested = committed;
     // Lock the transaction row and re-check under it: without the lock, the expiry sweep
-    let still_ours: Option<bool> = Spi::get_one_with_args(
-        "SELECT (SELECT t.state = 'ongoing' AND p.producer_epoch <= $2
-                   FROM kafgres_txns t
-                   JOIN kafgres_producers p ON p.producer_id = t.producer_id
-                  WHERE t.producer_id = $1
-                    FOR UPDATE OF t)",
+    let state: Option<String> = Spi::get_one_with_args(
+        "SELECT (SELECT CASE
+                    WHEN p.producer_epoch > $2 THEN 'fenced'
+                    WHEN t.state = 'empty' THEN 'empty'
+                    WHEN t.state = 'ongoing' THEN 'ours'
+                    ELSE 'other' END
+              FROM kafgres_txns t
+              JOIN kafgres_producers p ON p.producer_id = t.producer_id
+             WHERE t.producer_id = $1
+               FOR UPDATE OF t)",
         &[producer_id.into(), (producer_epoch as i32).into()],
     )
     .map_err(|e| HandlerError::Internal(e.to_string()))?;
-    if still_ours != Some(true) {
-        return Ok(Finish::NotOurs);
+    match state.as_deref() {
+        Some("ours") => {}
+        Some("empty") => return Ok(Finish::NotStarted),
+        _ => return Ok(Finish::NotOurs),
     }
 
     // An operator already forced a result on at least one partition; the rest must get the
@@ -590,8 +602,9 @@ pub fn expire_stale_transactions() -> Result<usize, HandlerError> {
     for (producer_id, epoch) in stale {
         // Abort, then fence — both in this one Postgres transaction: inside it the fence
         match finish_transaction(producer_id, epoch, false)? {
-            // Ended underneath us between the SELECT and here. Nothing to fence.
-            Finish::NotOurs => continue,
+            // Ended underneath us between the SELECT and here, or never begun (state
+            // `empty`): nothing to abort and nothing to fence.
+            Finish::NotOurs | Finish::NotStarted => continue,
             // Already forced by an operator; `finish_transaction` fenced on its way out.
             Finish::Overridden => {
                 done += 1;

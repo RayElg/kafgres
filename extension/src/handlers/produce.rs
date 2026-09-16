@@ -363,11 +363,8 @@ fn append_partition(
                 )
                 .map_err(|e| AppendError::ProducerState(e.to_string()))?;
                 if view.is_transactional() && !view.is_control() {
-                    crate::storage::pmeta::note_txn_first_offset(
-                        producer_id,
-                        topic,
-                        partition,
-                        assigned,
+                    crate::storage::pmeta::register_txn_partition(
+                        producer_id, epoch, topic, partition, assigned,
                     )
                     .map_err(|e| AppendError::ProducerState(e.to_string()))?;
                 }
