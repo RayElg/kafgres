@@ -13,7 +13,10 @@ BASE="-Clink-arg=-Wl,--unresolved-symbols=ignore-all"
 rm -rf "$STUB"
 mkdir -p "$STUB" "$CARGO_TARGET_DIR/test-pgdata"
 
-RUSTFLAGS="$BASE" cargo test --features pg16,pg_test --no-run >/dev/null 2>&1 || true
+# --quiet keeps the normal build noise down but a failure still prints, and without
+# `|| true` a failed build aborts here instead of leaving `ls -t` to pick a stale binary
+# out of the persistent target volume and run the suite green against old code.
+RUSTFLAGS="$BASE" cargo test --features pg16,pg_test --no-run --quiet
 BIN=$(ls -t "$CARGO_TARGET_DIR"/debug/deps/kafgres-* | grep -vE '\.(d|rlib|rmeta)$' | head -1)
 
 nm -D --undefined-only "$BIN" | awk '{print $NF}' | sort -u > "$STUB/undef.txt"

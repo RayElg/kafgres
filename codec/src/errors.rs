@@ -181,6 +181,7 @@ impl ErrorCode {
                 | ErrorCode::FencedLeaderEpoch
                 | ErrorCode::UnknownLeaderEpoch
                 | ErrorCode::OffsetNotAvailable
+                | ErrorCode::UnstableOffsetCommit
                 | ErrorCode::UnknownTopicId
         )
     }

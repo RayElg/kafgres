@@ -73,14 +73,11 @@ SaslAuthenticate = "0-2"
 # 4.x schema.
 OffsetForLeaderEpoch = "2-4"
 
-# Kafka's own transactions. Capped below the version where the request shape
-# changes to a batch of transactions per call, so what the dispatcher handles and
-# what is advertised cannot drift: one source in this file enforces that.
+# Kafka's own transactions. What the dispatcher handles and what is advertised cannot
+# drift: one source in this file enforces that.
 # v4+ of AddPartitionsToTxn is the batched VerifyOnly shape reserved for broker-to-broker
 # traffic; with no peer it is served and refused rather than answered. The other three gain
 # only TRANSACTION_ABORTABLE (KIP-890) at v4 over an identical wire shape.
-# EndTxn stops at 4: v5 (KIP-890 part two) has the broker bump and return the producer epoch,
-# whose response fields would otherwise encode as -1, readable as an epoch.
 AddPartitionsToTxn = "0-5"
 AddOffsetsToTxn = "0-4"
 # v5 rotates the producer epoch as part of ending the transaction (KIP-890 part two) and
@@ -116,8 +113,9 @@ AlterConfigs = "0-2"
 # Answers "none", and the answer is true rather than stubbed: one broker has no partition
 # moving between brokers. Implemented because clients *probe* it: a UI asks before
 # drawing a page, and an unknown API degrades a view that had nothing to do with it. The
-# write side (45 AlterPartitionReassignments) stays absent on purpose: accepting a
-# request to move a partition and then not moving it would be the lie.
+# write side (45 AlterPartitionReassignments) is served the same way: it refuses every
+# move with INVALID_REPLICA_ASSIGNMENT and answers every cancellation
+# NO_REASSIGNMENT_IN_PROGRESS, so it never claims a partition is moving when it is not.
 ListPartitionReassignments = "0"
 # `kafka-leader-election.sh` and the same action in a console. One broker means the
 # preferred replica is always already the leader, so the honest answer is "nothing needed
