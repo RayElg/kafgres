@@ -919,7 +919,13 @@ pub unsafe extern "C-unwind" fn kafgres_follower_worker_main(_arg: pg_sys::Datum
     }
     log!("kafgres: follower starting, pulling log from {host}:{port}");
 
-    while BackgroundWorker::wait_latch(Some(Duration::from_millis(500))) {
+    let mut follower = replication::Follower::new(&host, port);
+    // A round that pulled something is followed at once by another; a quiet leader has
+    // already long-polled inside the Fetch, and an unreachable one gets a backoff.
+    let mut delay = Duration::ZERO;
+    let mut applied_since_log = 0i64;
+    let mut last_log = std::time::Instant::now();
+    while BackgroundWorker::wait_latch(Some(delay)) {
         if BackgroundWorker::sighup_received() {
             reload_config();
             if replicate_from().is_none() {
@@ -933,16 +939,32 @@ pub unsafe extern "C-unwind" fn kafgres_follower_worker_main(_arg: pg_sys::Datum
             return;
         }
 
-        // A subtransaction (`contained`) needs an xid and a standby cannot assign one —
-        let pulled = BackgroundWorker::transaction(|| {
-            replication::replicate_once_from(&host, port)
-        });
-        match pulled {
-            Ok(n) if n > 0 => log!("kafgres: follower applied {n} batch(es)"),
-            Ok(_) => {}
+        let still_following = || {
+            if BackgroundWorker::sigterm_received() {
+                return Err("stopping".to_string());
+            }
+            if unsafe { !pg_sys::RecoveryInProgress() } {
+                return Err("promoted".to_string());
+            }
+            Ok(())
+        };
+        match follower.round(still_following) {
+            Ok(n) if n > 0 => {
+                applied_since_log += n;
+                delay = Duration::ZERO;
+            }
+            Ok(_) => delay = Duration::from_millis(50),
             Err(e) => {
                 log!("kafgres: follower: {e}");
+                follower.disconnect();
+                delay = Duration::from_millis(500);
             }
+        }
+        // Logged once a second rather than per round; rounds are milliseconds long.
+        if applied_since_log > 0 && last_log.elapsed() >= Duration::from_secs(1) {
+            log!("kafgres: follower applied {applied_since_log} batch(es)");
+            applied_since_log = 0;
+            last_log = std::time::Instant::now();
         }
     }
 }
