@@ -74,6 +74,7 @@ use kafgres_codec::prelude::*;
 
 use crate::handlers::{self, metadata::ClusterConfig, HandlerError};
 
+mod readiness;
 pub mod transport;
 use transport::Transport;
 
@@ -264,6 +265,10 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
             return;
         }
     };
+    let listener_fd = {
+        use std::os::fd::AsRawFd;
+        listener.as_raw_fd()
+    };
 
     let mut srv = Server {
         conns: HashMap::new(),
@@ -296,12 +301,27 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         Err(e) => log!("kafgres: marker reconciliation failed: {e}"),
     }
 
-    // There is no socket readiness yet: every request is served off the timer, so poll again
-    // after any pass that served a frame; a pipelining client's next request is already in
-    // the socket by then. Idle passes go back to sleeping `tick`.
+    // The wait returns as soon as any socket has bytes; `tick` only bounds the sweeps.
+    // A pass that served a frame polls again immediately: a pipelining client's next
+    // request may already be decrypted into a transport buffer, which readiness cannot
+    // see, and complete frames may be waiting in `inbuf` past the per-tick cap.
+    let mut readiness = readiness::Readiness::new();
+    let mut watched: Vec<(i32, i32, bool)> = Vec::new();
     let mut spin = false;
     let mut next_tick_at = Instant::now();
-    while BackgroundWorker::wait_latch(Some(if spin { Duration::ZERO } else { tick })) {
+    loop {
+        watched.clear();
+        // Write interest only for bytes that may actually go out: a connection held
+        // behind the durability barrier would otherwise wake the loop every pass while
+        // a failing fsync is retried.
+        watched.extend(srv.conns.iter().map(|(id, c)| {
+            (c.stream.raw_fd(), *id, !c.outbuf.is_empty() && !c.awaiting_sync)
+        }));
+        watched.sort_unstable_by_key(|w| w.1);
+        readiness.sync(listener_fd, &watched);
+        if !readiness.wait(if spin { Duration::ZERO } else { tick }) {
+            break;
+        }
         if BackgroundWorker::sighup_received() {
             crate::reload_config();
             log!("kafgres: SIGHUP, configuration reloaded");

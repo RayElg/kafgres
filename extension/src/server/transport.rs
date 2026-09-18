@@ -77,6 +77,13 @@ impl Transport {
         self.socket().set_nodelay(on)
     }
 
+    /// The underlying socket, for readiness registration. TLS buffers decrypted bytes
+    /// internally, which the caller covers by never sleeping after a pass that read.
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.socket().as_raw_fd()
+    }
+
     fn socket(&self) -> &TcpStream {
         match self {
             Transport::Plain(s) => s,
