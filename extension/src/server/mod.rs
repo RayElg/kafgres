@@ -1270,8 +1270,9 @@ fn dispatch(
         25 => {
             let mut body_buf = req.body.clone();
             let request = AddOffsetsToTxnRequest::decode(&mut body_buf, req.api_version)?;
+            let version = req.api_version;
             let body = BackgroundWorker::transaction(|| {
-                crate::dbtx::guarded(|| handlers::txn::handle_add_offsets(&request))
+                crate::dbtx::guarded(|| handlers::txn::handle_add_offsets(&request, version))
             })?;
             handlers::write_response(out, req.api_key, req.api_version, req.correlation_id, &body)?;
             Ok(Disposition::Reply)

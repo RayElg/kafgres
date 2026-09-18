@@ -20,8 +20,10 @@ TOPIC = "kip890-conformance"
 NONE = 0
 COORDINATOR_LOAD_IN_PROGRESS = 14
 COORDINATOR_NOT_AVAILABLE = 15
+INVALID_REQUEST = 42
 INVALID_PRODUCER_EPOCH = 47
 INVALID_TXN_STATE = 48
+INVALID_PRODUCER_ID_MAPPING = 49
 CONCURRENT_TRANSACTIONS = 51
 PRODUCER_FENCED = 90
 
@@ -155,10 +157,11 @@ class Broker:
         r.i32()
         return r.i16(), r.i64(), r.i16()
 
-    def add_partitions(self, txn_id, pid, epoch, topic):
+    def add_partitions(self, txn_id, pid, epoch, topic, version=2):
+        """v0–v2 share one non-flexible shape."""
         body = _nstr(txn_id) + _s64(pid) + _s16(epoch)
         body += _s32(1) + _nstr(topic) + _s32(1) + _s32(0)
-        r = self.call(24, 2, body, False)
+        r = self.call(24, version, body, False)
         r.i32()
         r.i32()          # topics
         r.skip_str()     # topic name
@@ -461,14 +464,181 @@ def _retry_after_takeover(host, port, label):
 
 
 def test_a_retry_after_a_takeover_is_fenced():
-    """Either epoch error: the reference answers PRODUCER_FENCED, kafgres's EndTxn path
-    answers INVALID_PRODUCER_EPOCH for every stale epoch. Both are fatal to the client,
-    which is the point; the exact code is a separate, known difference."""
     err = _retry_after_takeover(*KAFGRES, "kafgres")
-    assert err in (INVALID_PRODUCER_EPOCH, PRODUCER_FENCED), err
+    assert err == PRODUCER_FENCED, err
 
 
 @needs_reference
 def test_a_retry_after_a_takeover_is_fenced_on_the_reference_too():
     theirs = _retry_after_takeover(*REFERENCE, "reference")
     assert theirs == PRODUCER_FENCED, theirs
+
+
+def _end_txn_at(b, version, txn, pid, epoch, committed):
+    """EndTxn at any version; only the error code is read."""
+    if version >= 3:
+        body = (_cstr(txn) + _s64(pid) + _s16(epoch)
+                + bytes([1 if committed else 0]) + _uvarint(0))
+    else:
+        body = _nstr(txn) + _s64(pid) + _s16(epoch) + bytes([1 if committed else 0])
+    r = b.call(26, version, body, version >= 3)
+    r.i32()
+    return r.i16()
+
+
+def _add_offsets(b, version, txn, pid, epoch, group):
+    body = _nstr(txn) + _s64(pid) + _s16(epoch) + _nstr(group)
+    r = b.call(25, version, body, False)
+    r.i32()
+    return r.i16()
+
+
+def _txn_offset_commit(b, version, txn, pid, epoch, group):
+    """One partition; returns its error code, which is where this API reports."""
+    body = _nstr(txn) + _nstr(group) + _s64(pid) + _s16(epoch)
+    body += _s32(1) + _nstr(TOPIC) + _s32(1) + _s32(0) + _s64(0)
+    if version >= 2:
+        body += _s32(-1)     # committed leader epoch
+    body += _nstr("")
+    r = b.call(28, version, body, False)
+    r.i32()
+    r.i32()          # topics
+    r.skip_str()
+    r.i32()          # partitions
+    r.i32()          # partition index
+    return r.i16()
+
+
+def _fencing_transcript(host, port, label):
+    """Every way a coordinator request can name a producer it may not act for: an epoch
+    the coordinator has moved past, a producer id it never mapped to this transactional
+    id, a transactional id it has never seen. The codes are version-gated:
+    PRODUCER_FENCED reached the wire in v2 of each API, older clients get
+    INVALID_PRODUCER_EPOCH — and TxnOffsetCommit reports per partition and stays at
+    INVALID_PRODUCER_EPOCH throughout."""
+    _ensure_topic(f"{host}:{port}")
+    txn = f"kip890-fencing-{label}"
+    b = _coordinated(host, port, txn)
+    try:
+        assert _settle(lambda: b.init_producer_id_v5(txn))[0] == NONE
+        err, pid, epoch = _settle(lambda: b.init_producer_id_v5(txn))
+        assert err == NONE and epoch >= 1, (err, epoch)
+        stale, ahead, unknown = epoch - 1, epoch + 1, pid + 1_000_000
+        out = {}
+        for v in (1, 2, 5):
+            out[f"end_txn_v{v}_stale"] = _settle(lambda: _end_txn_at(b, v, txn, pid, stale, True))
+            out[f"end_txn_v{v}_ahead"] = _settle(lambda: _end_txn_at(b, v, txn, pid, ahead, True))
+            out[f"end_txn_v{v}_unknown_pid"] = _settle(lambda: _end_txn_at(b, v, txn, unknown, epoch, True))
+        out["end_txn_v5_unknown_txn"] = _settle(lambda: _end_txn_at(b, 5, txn + "-x", pid, epoch, True))
+        out["end_txn_v5_empty_txn"] = _settle(lambda: _end_txn_at(b, 5, "", pid, epoch, True))
+        # The retired pair, which a retry would be answered NONE for — but not without an id.
+        assert _settle(lambda: b.add_partitions(txn, pid, epoch, TOPIC)) == NONE
+        _, pid, epoch = _settle(lambda: b.end_txn(txn, pid, epoch, True))
+        out["end_txn_v5_empty_txn_retired_pair"] = _settle(lambda: _end_txn_at(b, 5, "", pid, epoch - 1, True))
+        stale, ahead = epoch - 1, epoch + 1
+        for v in (1, 2):
+            out[f"add_offsets_v{v}_stale"] = _settle(lambda: _add_offsets(b, v, txn, pid, stale, "g"))
+            out[f"add_offsets_v{v}_ahead"] = _settle(lambda: _add_offsets(b, v, txn, pid, ahead, "g"))
+            out[f"add_offsets_v{v}_unknown_pid"] = _settle(lambda: _add_offsets(b, v, txn, unknown, epoch, "g"))
+            out[f"txn_offset_commit_v{v}_stale"] = _settle(lambda: _txn_offset_commit(b, v, txn, pid, stale, "g"))
+            out[f"txn_offset_commit_v{v}_ahead"] = _settle(lambda: _txn_offset_commit(b, v, txn, pid, ahead, "g"))
+            out[f"txn_offset_commit_v{v}_unknown_pid"] = _settle(lambda: _txn_offset_commit(b, v, txn, unknown, epoch, "g"))
+        out["add_offsets_v2_empty_txn"] = _settle(lambda: _add_offsets(b, 2, "", pid, epoch, "g"))
+        for v in (1, 2):
+            out[f"add_partitions_v{v}_stale"] = _settle(lambda: b.add_partitions(txn, pid, stale, TOPIC, v))
+            out[f"add_partitions_v{v}_ahead"] = _settle(lambda: b.add_partitions(txn, pid, ahead, TOPIC, v))
+            out[f"add_partitions_v{v}_unknown_pid"] = _settle(lambda: b.add_partitions(txn, unknown, epoch, TOPIC, v))
+        out["add_partitions_v2_empty_txn"] = _settle(lambda: b.add_partitions("", pid, epoch, TOPIC))
+        return out
+    finally:
+        b.close()
+
+
+def test_fencing_codes_are_exact():
+    ours = _fencing_transcript(*KAFGRES, "kafgres")
+    assert ours == {
+        "end_txn_v1_stale": INVALID_PRODUCER_EPOCH,
+        "end_txn_v1_ahead": INVALID_PRODUCER_EPOCH,
+        "end_txn_v1_unknown_pid": INVALID_PRODUCER_ID_MAPPING,
+        "end_txn_v2_stale": PRODUCER_FENCED,
+        "end_txn_v2_ahead": PRODUCER_FENCED,
+        "end_txn_v2_unknown_pid": INVALID_PRODUCER_ID_MAPPING,
+        "end_txn_v5_stale": PRODUCER_FENCED,
+        "end_txn_v5_ahead": PRODUCER_FENCED,
+        "end_txn_v5_unknown_pid": INVALID_PRODUCER_ID_MAPPING,
+        "end_txn_v5_unknown_txn": INVALID_PRODUCER_ID_MAPPING,
+        "end_txn_v5_empty_txn": INVALID_REQUEST,
+        "end_txn_v5_empty_txn_retired_pair": INVALID_REQUEST,
+        "add_offsets_v1_stale": INVALID_PRODUCER_EPOCH,
+        "add_offsets_v1_ahead": INVALID_PRODUCER_EPOCH,
+        "add_offsets_v1_unknown_pid": INVALID_PRODUCER_ID_MAPPING,
+        "txn_offset_commit_v1_stale": INVALID_PRODUCER_EPOCH,
+        "txn_offset_commit_v1_ahead": INVALID_PRODUCER_EPOCH,
+        "txn_offset_commit_v1_unknown_pid": INVALID_PRODUCER_ID_MAPPING,
+        "add_offsets_v2_stale": PRODUCER_FENCED,
+        "add_offsets_v2_ahead": PRODUCER_FENCED,
+        "add_offsets_v2_unknown_pid": INVALID_PRODUCER_ID_MAPPING,
+        "txn_offset_commit_v2_stale": INVALID_PRODUCER_EPOCH,
+        "txn_offset_commit_v2_ahead": INVALID_PRODUCER_EPOCH,
+        "txn_offset_commit_v2_unknown_pid": INVALID_PRODUCER_ID_MAPPING,
+        "add_offsets_v2_empty_txn": INVALID_REQUEST,
+        "add_partitions_v1_stale": INVALID_PRODUCER_EPOCH,
+        "add_partitions_v1_ahead": INVALID_PRODUCER_EPOCH,
+        "add_partitions_v1_unknown_pid": INVALID_PRODUCER_ID_MAPPING,
+        "add_partitions_v2_stale": PRODUCER_FENCED,
+        "add_partitions_v2_ahead": PRODUCER_FENCED,
+        "add_partitions_v2_unknown_pid": INVALID_PRODUCER_ID_MAPPING,
+        "add_partitions_v2_empty_txn": INVALID_REQUEST,
+    }, ours
+
+
+@needs_reference
+def test_the_fencing_transcript_matches_the_reference():
+    ours = _fencing_transcript(*KAFGRES, "kafgres")
+    theirs = _fencing_transcript(*REFERENCE, "reference")
+    assert ours == theirs, f"\nkafgres:   {ours}\nreference: {theirs}"
+
+
+def _takeover_transcript(host, port, label):
+    """A new instance of a transactional id initialises while the old one's transaction
+    is still open. The coordinator must abort what the old instance left — the reference
+    answers CONCURRENT_TRANSACTIONS while its markers land, then NONE — so that nothing
+    is open under the new epoch: a commit there is INVALID_TXN_STATE, never a commit of
+    the dead instance's records. The old epoch is fenced."""
+    _ensure_topic(f"{host}:{port}")
+    txn = f"kip890-takeover-open-{label}"
+    b = _coordinated(host, port, txn)
+    try:
+        err, pid, epoch = _settle(lambda: b.init_producer_id_v5(txn))
+        assert err == NONE, f"{label}: InitProducerId error {err}"
+        assert _settle(lambda: b.add_partitions(txn, pid, epoch, TOPIC)) == NONE
+        err, pid2, epoch2 = _settle(lambda: b.init_producer_id_v5(txn))
+        return {
+            "init_over_open": err,
+            "same_producer_id": pid2 == pid,
+            "epoch_moved": epoch2 > epoch,
+            "commit_at_new_epoch": _settle(lambda: b.end_txn(txn, pid2, epoch2, True))[0],
+            "old_epoch_end_txn": _settle(lambda: b.end_txn(txn, pid, epoch, True))[0],
+            "old_epoch_add_partitions": _settle(lambda: b.add_partitions(txn, pid, epoch, TOPIC)),
+        }
+    finally:
+        b.close()
+
+
+def test_init_producer_id_aborts_the_open_transaction():
+    ours = _takeover_transcript(*KAFGRES, "kafgres")
+    assert ours == {
+        "init_over_open": NONE,
+        "same_producer_id": True,
+        "epoch_moved": True,
+        "commit_at_new_epoch": INVALID_TXN_STATE,
+        "old_epoch_end_txn": PRODUCER_FENCED,
+        "old_epoch_add_partitions": PRODUCER_FENCED,
+    }, ours
+
+
+@needs_reference
+def test_the_takeover_transcript_matches_the_reference():
+    ours = _takeover_transcript(*KAFGRES, "kafgres")
+    theirs = _takeover_transcript(*REFERENCE, "reference")
+    assert ours == theirs, f"\nkafgres:   {ours}\nreference: {theirs}"

@@ -28,6 +28,10 @@ pub fn handle(
         });
     }
     let txn_id = req.transactional_id.as_deref().filter(|s| !s.is_empty());
+    // Before the epoch moves: the abort is performed at the epoch the transaction ran under.
+    if let Some(id) = txn_id {
+        super::txn::abort_abandoned(id)?;
+    }
     let (producer_id, epoch) = producer::init_producer_id(txn_id)?;
 
     // Clamped as Kafka clamps: an unbounded timeout would let a client pin a partition's LSO forever.

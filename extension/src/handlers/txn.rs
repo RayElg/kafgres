@@ -32,31 +32,62 @@ pub(super) fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Why this producer's epoch is unusable, or `None` if it is fine. Behind the current epoch
-/// means a newer instance took over (`PRODUCER_FENCED`); no row is `INVALID_PRODUCER_EPOCH`.
-fn epoch_verdict(producer_id: i64, epoch: i16) -> Result<Option<ErrorCode>, HandlerError> {
-    let current: Option<i32> = Spi::get_one_with_args(
-        "SELECT (SELECT producer_epoch FROM kafgres_producers WHERE producer_id = $1)",
-        &[producer_id.into()],
-    )
-    .map_err(|e| HandlerError::Internal(e.to_string()))?;
-    Ok(match current {
-        Some(c) if (epoch as i32) < c => Some(ErrorCode::ProducerFenced),
-        Some(_) => None,
-        None => Some(ErrorCode::InvalidProducerEpoch),
-    })
+/// Why a transactional request's `(transactional_id, producer_id, epoch)` cannot act.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Verdict {
+    /// No transactional id at all: the coordinator APIs are meaningless without one.
+    NoTransactionalId,
+    /// No producer id we handed out for this transactional id: the mapping is wrong.
+    UnknownProducer,
+    /// Not the current epoch. Behind it is an instance a newer one has fenced; ahead of
+    /// it is an epoch this coordinator never issued. Both are refused, as Kafka refuses
+    /// them: accepting an epoch ahead would begin a transaction and stamp markers under
+    /// an epoch nobody holds.
+    Stale,
 }
 
-/// Reject a producer whose epoch is behind the one we have fenced to — a zombie instance of
-fn fenced(producer_id: i64, epoch: i16) -> Result<bool, HandlerError> {
-    let current: Option<i32> = Spi::get_one_with_args(
-        "SELECT (SELECT producer_epoch FROM kafgres_producers WHERE producer_id = $1)",
-        &[producer_id.into()],
+impl Verdict {
+    /// `PRODUCER_FENCED` exists from the second version of each coordinator API; an older
+    /// request version gets `INVALID_PRODUCER_EPOCH`, as Kafka answers it.
+    fn code(self, version: i16) -> ErrorCode {
+        match self {
+            Verdict::NoTransactionalId => ErrorCode::InvalidRequest,
+            Verdict::UnknownProducer => ErrorCode::InvalidProducerIdMapping,
+            Verdict::Stale if version >= 2 => ErrorCode::ProducerFenced,
+            Verdict::Stale => ErrorCode::InvalidProducerEpoch,
+        }
+    }
+}
+
+/// Check a transactional request against the producer we handed out for its transactional
+/// id: the id must be the one mapped to that transactional id, and its epoch exactly the
+/// current one. `None` means it may act.
+fn verdict(
+    transactional_id: &str,
+    producer_id: i64,
+    epoch: i16,
+) -> Result<Option<Verdict>, HandlerError> {
+    if transactional_id.is_empty() {
+        return Ok(Some(Verdict::NoTransactionalId));
+    }
+    let row: Option<String> = Spi::get_one_with_args(
+        "SELECT (SELECT producer_epoch || '|' || (transactional_id = $2)::text
+                   FROM kafgres_producers
+                  WHERE producer_id = $1)",
+        &[producer_id.into(), transactional_id.into()],
     )
     .map_err(|e| HandlerError::Internal(e.to_string()))?;
-    Ok(match current {
-        Some(c) => (epoch as i32) < c,
-        None => true,
+    let Some(row) = row else { return Ok(Some(Verdict::UnknownProducer)) };
+    let mut it = row.split('|');
+    let current: i32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(-1);
+    // A NULL transactional id (a plain idempotent producer) concatenates to nothing.
+    let mapped = it.next() == Some("true");
+    Ok(if !mapped {
+        Some(Verdict::UnknownProducer)
+    } else if (epoch as i32) != current {
+        Some(Verdict::Stale)
+    } else {
+        None
     })
 }
 
@@ -85,7 +116,8 @@ pub fn handle_add_partitions(
         )
     };
 
-    let code = epoch_verdict(producer_id, epoch)?.unwrap_or(ErrorCode::None);
+    let code = verdict(&txn_id, producer_id, epoch)?
+        .map_or(ErrorCode::None, |v| v.code(version));
 
     if code == ErrorCode::None {
         // A transaction *begins* here if this producer's row is not already `ongoing`.
@@ -194,6 +226,11 @@ pub fn handle_end_txn(req: &EndTxnRequest, version: i16) -> Result<EndTxnRespons
         ..Default::default()
     };
 
+    // Checked before the retry lookup as well: a retired pair is no exception.
+    if req.transactional_id.is_empty() {
+        return Ok(unchanged(Verdict::NoTransactionalId.code(version)));
+    }
+
     // Checked before the fence: after a v5 rotation a retry carries the retired epoch, which
     // looks exactly like a zombie. KIP-890 answers such a retry NONE with the current pair.
     if version >= 5 && crate::transaction_version() >= 2 {
@@ -212,8 +249,8 @@ pub fn handle_end_txn(req: &EndTxnRequest, version: i16) -> Result<EndTxnRespons
         }
     }
 
-    if fenced(req.producer_id, req.producer_epoch)? {
-        return Ok(unchanged(ErrorCode::InvalidProducerEpoch));
+    if let Some(v) = verdict(&req.transactional_id, req.producer_id, req.producer_epoch)? {
+        return Ok(unchanged(v.code(version)));
     }
 
     // Rotation is gated on the finalized transaction.version as well as v5: a client that
@@ -454,6 +491,37 @@ fn finish_transaction(
     Ok(Finish::Ended)
 }
 
+/// `InitProducerId` for a transactional id whose transaction is still open: the instance
+/// that began it is gone or about to be fenced, and what it left must not be committed by
+/// the new instance. The abort's markers are written inside this request, so the new epoch
+/// is returned in the same answer; Kafka answers CONCURRENT_TRANSACTIONS while its markers
+/// are written and NONE on the retry. Without the abort, the new instance's first commit
+/// would carry the abandoned records, and a `read_committed` consumer would see them.
+pub(super) fn abort_abandoned(transactional_id: &str) -> Result<(), HandlerError> {
+    let open: Option<String> = Spi::get_one_with_args(
+        "SELECT (SELECT p.producer_id || '|' || p.producer_epoch
+                   FROM kafgres_producers p
+                   JOIN kafgres_txns t ON t.producer_id = p.producer_id
+                  WHERE p.transactional_id = $1 AND t.state = 'ongoing')",
+        &[transactional_id.into()],
+    )
+    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    let Some(s) = open else { return Ok(()) };
+    let mut it = s.split('|');
+    let producer_id: i64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(-1);
+    let epoch: i16 = it.next().and_then(|x| x.parse().ok()).unwrap_or(-1);
+
+    // At the producer's current epoch, which the caller bumps next. Every outcome is
+    // acceptable: ended concurrently, already forced by an operator (which fenced the
+    // producer), or aborted here.
+    finish_transaction(producer_id, epoch, false)?;
+    log!(
+        "kafgres: aborted the open transaction of producer {producer_id} — \
+         InitProducerId for '{transactional_id}' supersedes it"
+    );
+    Ok(())
+}
+
 /// Bump a producer's epoch so its next request fails. Not optional: an unfenced producer
 ///
 /// The retired pair is cleared too: it exists to answer a retried `EndTxn` with the
@@ -476,9 +544,12 @@ fn fence(producer_id: i64) -> Result<i32, HandlerError> {
 }
 
 /// `25 AddOffsetsToTxn` — the transaction will also commit consumer offsets. Committed
-pub fn handle_add_offsets(req: &AddOffsetsToTxnRequest) -> Result<AddOffsetsToTxnResponse, HandlerError> {
-    let code = if fenced(req.producer_id, req.producer_epoch)? {
-        ErrorCode::InvalidProducerEpoch
+pub fn handle_add_offsets(
+    req: &AddOffsetsToTxnRequest,
+    version: i16,
+) -> Result<AddOffsetsToTxnResponse, HandlerError> {
+    let code = if let Some(v) = verdict(&req.transactional_id, req.producer_id, req.producer_epoch)? {
+        v.code(version)
     } else {
         Spi::run_with_args(
             "INSERT INTO kafgres_txns
@@ -521,10 +592,12 @@ pub fn handle_txn_offset_commit(
     req: &TxnOffsetCommitRequest,
     version: i16,
 ) -> Result<TxnOffsetCommitResponse, HandlerError> {
-    let code = if fenced(req.producer_id, req.producer_epoch)? {
-        ErrorCode::InvalidProducerEpoch
-    } else {
-        ErrorCode::None
+    // Reported per partition, and a stale epoch is INVALID_PRODUCER_EPOCH at every
+    // version, as Kafka answers it; the other coordinator APIs answer PRODUCER_FENCED.
+    let code = match verdict(&req.transactional_id, req.producer_id, req.producer_epoch)? {
+        Some(Verdict::Stale) => ErrorCode::InvalidProducerEpoch,
+        Some(other) => other.code(version),
+        None => ErrorCode::None,
     };
 
     if code == ErrorCode::None && version >= 5 {
