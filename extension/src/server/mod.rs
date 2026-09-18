@@ -131,6 +131,15 @@ struct Conn {
 }
 
 impl Conn {
+    /// Drain `outbuf` unless a durability barrier holds it; returns false on a fatal write
+    /// error. The transport is pumped either way so a TLS handshake keeps moving.
+    fn flush_unless_held(&mut self) -> bool {
+        if self.awaiting_sync {
+            return self.stream.pump();
+        }
+        self.flush()
+    }
+
     /// Drain `outbuf`; returns false on a fatal write error. Pumps the transport first,
     fn flush(&mut self) -> bool {
         if !self.stream.pump() {
@@ -438,7 +447,10 @@ fn poll_connections(srv: &mut Server, cfg: &ClusterConfig, ready: Option<&HashSe
                 Some(c) => c,
                 None => continue,
             };
-            if !conn.flush() {
+            // Held here as well as at the end of the pass: when an fsync fails,
+            // `sync_before_ack` leaves the barrier up to retry, and a flush here would
+            // release the acks before that retry.
+            if !conn.flush_unless_held() {
                 closed.push(id);
                 continue;
             }
@@ -536,10 +548,17 @@ fn serve_frames(srv: &mut Server, id: i32, cfg: &ClusterConfig) -> bool {
             };
             // Held back only for a connection waiting on a durability barrier; this flush lets
             // a pipelining client refill mid-pass and keeps `outbuf` drained between requests.
-            if !conn.awaiting_sync && !conn.flush() {
+            if !conn.flush_unless_held() {
                 return false;
             }
             if conn.queued_bytes() > MAX_CONN_BUFFER_BYTES {
+                // Behind a barrier nothing could have drained, so the backlog was built by
+                // this pass: a produce ack with a full-size Fetch behind it. Stop serving
+                // the connection until the barrier lifts rather than close it for
+                // responses it was not allowed to receive.
+                if conn.awaiting_sync {
+                    return true;
+                }
                 log!(
                     "kafgres: {} has {} bytes of undelivered responses; closing",
                     conn.peer,
@@ -2425,7 +2444,7 @@ fn flush_all(srv: &mut Server) {
         let ok = srv
             .conns
             .get_mut(&id)
-            .map(|c| if c.awaiting_sync { true } else { c.flush() })
+            .map(|c| c.flush_unless_held())
             .unwrap_or(true);
         if !ok {
             drop_conn(srv, id);

@@ -18,11 +18,18 @@ REFERENCE = ("127.0.0.1", 9292)
 TOPIC = "kip890-conformance"
 
 NONE = 0
+COORDINATOR_LOAD_IN_PROGRESS = 14
+COORDINATOR_NOT_AVAILABLE = 15
 INVALID_PRODUCER_EPOCH = 47
 INVALID_TXN_STATE = 48
-COORDINATOR_NOT_AVAILABLE = 15
 CONCURRENT_TRANSACTIONS = 51
 PRODUCER_FENCED = 90
+
+# What a client backs off and retries rather than reports: the coordinator is still being
+# elected or is still loading its partition (both seen on a freshly started reference,
+# after FindCoordinator has already named it), or the previous transaction is still
+# completing. None of these is an answer, so the transcript waits them out.
+RETRIABLE = {COORDINATOR_LOAD_IN_PROGRESS, COORDINATOR_NOT_AVAILABLE, CONCURRENT_TRANSACTIONS}
 
 
 def reference_available():
@@ -176,12 +183,11 @@ class Broker:
 
 
 def _settle(fn, tries=25, delay=0.4):
-    """Retry past CONCURRENT_TRANSACTIONS. Kafka returns it while the previous
-    transaction is still completing and expects the client to back off."""
+    """Retry past the `RETRIABLE` codes, as a client would."""
     out = fn()
     for _ in range(tries - 1):
         code = out[0] if isinstance(out, tuple) else out
-        if code != CONCURRENT_TRANSACTIONS:
+        if code not in RETRIABLE:
             return out
         time.sleep(delay)
         out = fn()
@@ -192,27 +198,34 @@ def _ensure_topic(bootstrap, topic=TOPIC):
     subprocess.run(
         ["docker", "run", "--rm", "--network", "host", KAFKA_IMAGE,
          "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", bootstrap,
-         "--create", "--topic", TOPIC, "--partitions", "1"],
+         "--create", "--topic", topic, "--partitions", "1"],
         capture_output=True, text=True, timeout=120,
     )
+
+
+def _coordinated(host, port, txn):
+    """A connection whose transaction coordinator exists. The coordinator is created
+    lazily on the reference, so FindCoordinator is retried until it names one; the
+    coordinator may then still be loading, which `_settle` waits out per request."""
+    b = Broker(host, port)
+    for _ in range(20):
+        if b.find_coordinator(txn) not in RETRIABLE:
+            break
+        time.sleep(1.5)
+    return b
 
 
 def transcript(host, port, label):
     """One transaction, ended at v5, then three probes with the retired epoch."""
     _ensure_topic(f"{host}:{port}")
-    b = Broker(host, port)
     txn = f"kip890-{label}"
+    b = _coordinated(host, port, txn)
     try:
-        for _ in range(20):
-            if b.find_coordinator(txn) != COORDINATOR_NOT_AVAILABLE:
-                break
-            time.sleep(1.5)
-
-        err, pid, epoch = b.init_producer_id(txn)
+        err, pid, epoch = _settle(lambda: b.init_producer_id(txn))
         assert err == NONE, f"{label}: InitProducerId error {err}"
-        assert b.add_partitions(txn, pid, epoch, TOPIC) == NONE
+        assert _settle(lambda: b.add_partitions(txn, pid, epoch, TOPIC)) == NONE
 
-        end_err, new_pid, new_epoch = b.end_txn(txn, pid, epoch, True)
+        end_err, new_pid, new_epoch = _settle(lambda: b.end_txn(txn, pid, epoch, True))
 
         return {
             "end_txn": end_err,
@@ -275,15 +288,11 @@ def test_the_whole_transcript_matches_the_reference_broker():
 def _never_begun_end_txn(host, port, txn):
     """InitProducerId v5, then EndTxn v5, with no AddPartitionsToTxn in between: the
     shape of a transaction-V2 client that ends a transaction it never produced to."""
-    b = Broker(host, port)
+    b = _coordinated(host, port, txn)
     try:
-        for _ in range(20):
-            if b.find_coordinator(txn) != COORDINATOR_NOT_AVAILABLE:
-                break
-            time.sleep(1.5)
-        err, pid, epoch = b.init_producer_id_v5(txn)
+        err, pid, epoch = _settle(lambda: b.init_producer_id_v5(txn))
         assert err == NONE, f"InitProducerId error {err}"
-        return b.end_txn(txn, pid, epoch, True)[0]
+        return _settle(lambda: b.end_txn(txn, pid, epoch, True))[0]
     finally:
         b.close()
 
@@ -324,3 +333,142 @@ def test_a_real_transaction_v2_client_transacts_end_to_end():
         f"transactional produce failed: {out.stdout[-400:]} {out.stderr[-400:]}"
     )
     assert "20 records sent" in out.stdout, out.stdout[-400:]
+
+
+
+
+def _nothing_open_transcript(host, port, label):
+    """EndTxn v5 with no transaction open, both outcomes, from both empty and completed
+    states. A transaction-V2 client aborts this way after a failed send, so an abort
+    must succeed (and rotate the epoch, retry-able like any other); a commit is the
+    state-machine refusal. Neither may fence."""
+    _ensure_topic(f"{host}:{port}")
+    txn = f"kip890-nothing-open-{label}"
+    b = _coordinated(host, port, txn)
+    try:
+        err, pid, epoch = _settle(lambda: b.init_producer_id_v5(txn))
+        assert err == NONE, f"{label}: InitProducerId error {err}"
+        assert _settle(lambda: b.add_partitions(txn, pid, epoch, TOPIC)) == NONE
+        _, pid, epoch = _settle(lambda: b.end_txn(txn, pid, epoch, True))
+
+        commit_after_commit = _settle(lambda: b.end_txn(txn, pid, epoch, True))
+        abort_after_commit = _settle(lambda: b.end_txn(txn, pid, epoch, False))
+        retry_empty_abort = _settle(lambda: b.end_txn(txn, pid, epoch, False))
+        pid2, epoch2 = abort_after_commit[1], abort_after_commit[2]
+        abort_after_abort = _settle(lambda: b.end_txn(txn, pid2, epoch2, False))
+        return {
+            "commit_after_commit": commit_after_commit[0],
+            "abort_after_commit": abort_after_commit[0],
+            "abort_after_commit_rotated": abort_after_commit[2] == epoch + 1,
+            "retry_empty_abort": retry_empty_abort[0],
+            "retry_empty_abort_answers_current": retry_empty_abort[2] == epoch2,
+            "abort_after_abort": abort_after_abort[0],
+            "abort_after_abort_rotated": abort_after_abort[2] == epoch2 + 1,
+        }
+    finally:
+        b.close()
+
+
+def test_ending_with_nothing_open_is_never_fencing():
+    ours = _nothing_open_transcript(*KAFGRES, "kafgres")
+    assert ours == {
+        "commit_after_commit": INVALID_TXN_STATE,
+        "abort_after_commit": NONE,
+        "abort_after_commit_rotated": True,
+        "retry_empty_abort": NONE,
+        "retry_empty_abort_answers_current": True,
+        "abort_after_abort": NONE,
+        "abort_after_abort_rotated": True,
+    }, ours
+
+
+@needs_reference
+def test_the_nothing_open_transcript_matches_the_reference():
+    ours = _nothing_open_transcript(*KAFGRES, "kafgres")
+    theirs = _nothing_open_transcript(*REFERENCE, "reference")
+    assert ours == theirs, f"\nkafgres:   {ours}\nreference: {theirs}"
+
+
+def _end_txn_v2(b, txn, pid, epoch, committed):
+    """Pre-KIP-890 shape: no rotation, so a same-outcome replay is a plain retry."""
+    body = _nstr(txn) + _s64(pid) + _s16(epoch) + bytes([1 if committed else 0])
+    r = b.call(26, 2, body, False)
+    r.i32()
+    return r.i16()
+
+
+def _replay_before_rotation_transcript(host, port, label):
+    _ensure_topic(f"{host}:{port}")
+    txn = f"kip890-v2-replay-{label}"
+    b = _coordinated(host, port, txn)
+    try:
+        err, pid, epoch = _settle(lambda: b.init_producer_id(txn))
+        assert err == NONE, f"{label}: InitProducerId error {err}"
+        out = {
+            "empty_commit": _settle(lambda: _end_txn_v2(b, txn, pid, epoch, True)),
+            "empty_abort": _settle(lambda: _end_txn_v2(b, txn, pid, epoch, False)),
+        }
+        assert _settle(lambda: b.add_partitions(txn, pid, epoch, TOPIC)) == NONE
+        out["commit"] = _settle(lambda: _end_txn_v2(b, txn, pid, epoch, True))
+        out["commit_again"] = _settle(lambda: _end_txn_v2(b, txn, pid, epoch, True))
+        out["abort_after_commit"] = _settle(lambda: _end_txn_v2(b, txn, pid, epoch, False))
+        assert _settle(lambda: b.add_partitions(txn, pid, epoch, TOPIC)) == NONE
+        out["abort"] = _settle(lambda: _end_txn_v2(b, txn, pid, epoch, False))
+        out["abort_again"] = _settle(lambda: _end_txn_v2(b, txn, pid, epoch, False))
+        out["commit_after_abort"] = _settle(lambda: _end_txn_v2(b, txn, pid, epoch, True))
+        return out
+    finally:
+        b.close()
+
+
+def test_replaying_end_txn_before_rotation_is_a_retry():
+    ours = _replay_before_rotation_transcript(*KAFGRES, "kafgres")
+    assert ours == {
+        "empty_commit": INVALID_TXN_STATE,
+        "empty_abort": INVALID_TXN_STATE,
+        "commit": NONE,
+        "commit_again": NONE,
+        "abort_after_commit": INVALID_TXN_STATE,
+        "abort": NONE,
+        "abort_again": NONE,
+        "commit_after_abort": INVALID_TXN_STATE,
+    }, ours
+
+
+@needs_reference
+def test_the_replay_before_rotation_transcript_matches_the_reference():
+    ours = _replay_before_rotation_transcript(*KAFGRES, "kafgres")
+    theirs = _replay_before_rotation_transcript(*REFERENCE, "reference")
+    assert ours == theirs, f"\nkafgres:   {ours}\nreference: {theirs}"
+
+
+def _retry_after_takeover(host, port, label):
+    """A retried EndTxn at the retired epoch, arriving after a new instance of the same
+    transactional id ran InitProducerId: the old instance is a zombie and must be fenced,
+    not answered NONE with the epoch the new instance now owns."""
+    _ensure_topic(f"{host}:{port}")
+    txn = f"kip890-takeover-{label}"
+    b = _coordinated(host, port, txn)
+    try:
+        err, pid, epoch = _settle(lambda: b.init_producer_id_v5(txn))
+        assert err == NONE, f"{label}: InitProducerId error {err}"
+        assert _settle(lambda: b.add_partitions(txn, pid, epoch, TOPIC)) == NONE
+        assert _settle(lambda: b.end_txn(txn, pid, epoch, True))[0] == NONE
+        assert _settle(lambda: b.init_producer_id_v5(txn))[0] == NONE
+        return _settle(lambda: b.end_txn(txn, pid, epoch, True))[0]
+    finally:
+        b.close()
+
+
+def test_a_retry_after_a_takeover_is_fenced():
+    """Either epoch error: the reference answers PRODUCER_FENCED, kafgres's EndTxn path
+    answers INVALID_PRODUCER_EPOCH for every stale epoch. Both are fatal to the client,
+    which is the point; the exact code is a separate, known difference."""
+    err = _retry_after_takeover(*KAFGRES, "kafgres")
+    assert err in (INVALID_PRODUCER_EPOCH, PRODUCER_FENCED), err
+
+
+@needs_reference
+def test_a_retry_after_a_takeover_is_fenced_on_the_reference_too():
+    theirs = _retry_after_takeover(*REFERENCE, "reference")
+    assert theirs == PRODUCER_FENCED, theirs

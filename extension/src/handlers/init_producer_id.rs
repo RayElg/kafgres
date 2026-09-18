@@ -42,7 +42,12 @@ pub fn handle(
              VALUES ($1, $2, $3, 'empty', $4, $5)
              ON CONFLICT (producer_id) DO UPDATE
                 SET producer_epoch = EXCLUDED.producer_epoch,
-                    timeout_ms = EXCLUDED.timeout_ms",
+                    timeout_ms = EXCLUDED.timeout_ms,
+                    -- A completed transaction does not carry over to the new instance:
+                    -- its state returns to 'empty', as Kafka's does, so a following
+                    -- EndTxn is judged against nothing open.
+                    state = CASE WHEN kafgres_txns.state = 'ongoing'
+                                 THEN kafgres_txns.state ELSE 'empty' END",
             &[
                 producer_id.into(),
                 (epoch as i32).into(),

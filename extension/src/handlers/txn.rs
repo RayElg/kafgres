@@ -216,18 +216,43 @@ pub fn handle_end_txn(req: &EndTxnRequest, version: i16) -> Result<EndTxnRespons
         return Ok(unchanged(ErrorCode::InvalidProducerEpoch));
     }
 
+    // Rotation is gated on the finalized transaction.version as well as v5: a client that
+    // picked v5 without implementing KIP-890 would be fenced by its own next request.
+    let rotating = version >= 5 && crate::transaction_version() >= 2;
+
     // Lost to the expiry sweep, a newer instance, or an operator via `WriteTxnMarkers`: in
     match finish_transaction(req.producer_id, req.producer_epoch, req.committed)? {
         Finish::NotOurs | Finish::Overridden => {
             return Ok(unchanged(ErrorCode::InvalidProducerEpoch))
         }
-        Finish::NotStarted => return Ok(unchanged(ErrorCode::InvalidTxnState)),
+        Finish::NotOpen { last } => {
+            // Ending a transaction that was never begun, or one that has already ended,
+            // is a state-machine answer, never fencing. A commit with nothing open is
+            // INVALID_TXN_STATE at every version. Before KIP-890 a same-outcome replay of
+            // the completed transaction is a retry and gets NONE. Under KIP-890 the epoch
+            // has already rotated, so a retry was caught above; an abort with nothing
+            // open succeeds and rotates the epoch again, which is how a client aborts
+            // after a failed send.
+            if !rotating {
+                return Ok(unchanged(if last == Some(req.committed) {
+                    ErrorCode::None
+                } else {
+                    ErrorCode::InvalidTxnState
+                }));
+            }
+            if req.committed {
+                return Ok(unchanged(ErrorCode::InvalidTxnState));
+            }
+            Spi::run_with_args(
+                "UPDATE kafgres_txns SET state = 'aborted' WHERE producer_id = $1",
+                &[req.producer_id.into()],
+            )
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        }
         Finish::Ended => {}
     }
 
-    // Rotation is gated on the finalized transaction.version as well as v5: a client that
-    // picked v5 without implementing KIP-890 would be fenced by its own next request.
-    if version < 5 || crate::transaction_version() < 2 {
+    if !rotating {
         return Ok(unchanged(ErrorCode::None));
     }
 
@@ -245,25 +270,26 @@ pub fn handle_end_txn(req: &EndTxnRequest, version: i16) -> Result<EndTxnRespons
 }
 
 /// Is this `EndTxn` a retry of the one that retired `epoch`, asking for the same outcome?
-/// The epoch must be exactly the retired one (a merely older one is a zombie).
+/// The pair must be exactly the retired one (an older epoch is a fenced instance), and only
+/// the rotation records it: an `InitProducerId` or a fence clears it, so a retry arriving
+/// after a newer instance took over is fenced rather than handed that instance's epoch.
 fn completed_retry(
     producer_id: i64,
     epoch: i16,
     committed: bool,
 ) -> Result<Retry, HandlerError> {
-    // A mismatch is INVALID_TXN_STATE, not fencing.
+    // A mismatch is INVALID_TXN_STATE, not fencing. The row is found by the retired id,
+    // which is the live one unless the epoch ceiling moved the transactional id.
     let found: Option<String> = Spi::get_one_with_args(
         "SELECT (SELECT CASE WHEN p.retired_committed IS NOT DISTINCT FROM $3
                              THEN p.producer_id || '|' || p.producer_epoch
                              ELSE 'mismatch' END
                    FROM kafgres_producers p
-                  WHERE (p.producer_id = $1
-                         OR p.transactional_id = (SELECT transactional_id
-                                                    FROM kafgres_producers
-                                                   WHERE producer_id = $1))
+                  WHERE p.retired_producer_id = $1
                     AND p.retired_epoch = $2
                     AND NOT EXISTS (SELECT 1 FROM kafgres_txns t
-                                     WHERE t.producer_id = $1 AND t.state = 'ongoing')
+                                     WHERE t.producer_id = p.producer_id
+                                       AND t.state = 'ongoing')
                   LIMIT 1)",
         &[producer_id.into(), (epoch as i32).into(), committed.into()],
     )
@@ -294,11 +320,12 @@ pub enum Finish {
     /// The transaction is not this caller's to end.
     NotOurs,
     Ended,
-    /// The transaction was never begun: a transaction-V2 client can end a transaction it
-    /// only initialised, with no `AddPartitionsToTxn` and no produce behind it. This is
-    /// `INVALID_TXN_STATE`, matching the reference broker; fencing here would be fatal
-    /// to the client for a request it is entitled to make.
-    NotStarted,
+    /// Nothing is open to end: the transaction was never begun (`None`), or the previous
+    /// one already completed with this outcome (`Some(committed)`). A transaction-version-2
+    /// client ends transactions it only initialised, and aborts with nothing added after
+    /// a failed send; fencing either would be fatal to a client making a legitimate
+    /// request. The answer depends on the request version, so the caller chooses it.
+    NotOpen { last: Option<bool> },
     /// Ended with the outcome an operator had already forced; the caller must not be told
     Overridden,
 }
@@ -313,9 +340,8 @@ fn finish_transaction(
     let state: Option<String> = Spi::get_one_with_args(
         "SELECT (SELECT CASE
                     WHEN p.producer_epoch > $2 THEN 'fenced'
-                    WHEN t.state = 'empty' THEN 'empty'
                     WHEN t.state = 'ongoing' THEN 'ours'
-                    ELSE 'other' END
+                    ELSE t.state END
               FROM kafgres_txns t
               JOIN kafgres_producers p ON p.producer_id = t.producer_id
              WHERE t.producer_id = $1
@@ -325,7 +351,9 @@ fn finish_transaction(
     .map_err(|e| HandlerError::Internal(e.to_string()))?;
     match state.as_deref() {
         Some("ours") => {}
-        Some("empty") => return Ok(Finish::NotStarted),
+        Some("empty") => return Ok(Finish::NotOpen { last: None }),
+        Some("committed") => return Ok(Finish::NotOpen { last: Some(true) }),
+        Some("aborted") => return Ok(Finish::NotOpen { last: Some(false) }),
         _ => return Ok(Finish::NotOurs),
     }
 
@@ -427,10 +455,17 @@ fn finish_transaction(
 }
 
 /// Bump a producer's epoch so its next request fails. Not optional: an unfenced producer
+///
+/// The retired pair is cleared too: it exists to answer a retried `EndTxn` with the
+/// current epoch, and after a fence that answer would revive the instance being fenced.
 fn fence(producer_id: i64) -> Result<i32, HandlerError> {
     let epoch: Option<i32> = Spi::get_one_with_args(
         "WITH up AS (
-             UPDATE kafgres_producers SET producer_epoch = producer_epoch + 1
+             UPDATE kafgres_producers
+                SET producer_epoch = producer_epoch + 1,
+                    retired_producer_id = NULL,
+                    retired_epoch = NULL,
+                    retired_committed = NULL
               WHERE producer_id = $1
              RETURNING producer_epoch)
          SELECT (SELECT producer_epoch FROM up)",
@@ -604,7 +639,7 @@ pub fn expire_stale_transactions() -> Result<usize, HandlerError> {
         match finish_transaction(producer_id, epoch, false)? {
             // Ended underneath us between the SELECT and here, or never begun (state
             // `empty`): nothing to abort and nothing to fence.
-            Finish::NotOurs | Finish::NotStarted => continue,
+            Finish::NotOurs | Finish::NotOpen { .. } => continue,
             // Already forced by an operator; `finish_transaction` fenced on its way out.
             Finish::Overridden => {
                 done += 1;
@@ -614,21 +649,11 @@ pub fn expire_stale_transactions() -> Result<usize, HandlerError> {
         }
 
         // The fence makes expiry safe: the producer may just be slow, and unfenced it keeps
-        let fenced_epoch: Option<i32> = Spi::get_one_with_args(
-            "WITH up AS (
-                 UPDATE kafgres_producers
-                    SET producer_epoch = producer_epoch + 1
-                  WHERE producer_id = $1
-                 RETURNING producer_epoch)
-             SELECT (SELECT producer_epoch FROM up)",
-            &[producer_id.into()],
-        )
-        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        let fenced_epoch = fence(producer_id)?;
 
         log!(
             "kafgres: aborted transaction for producer {producer_id} — no EndTxn within \
-             its transaction timeout; fenced at epoch {}",
-            fenced_epoch.unwrap_or(-1)
+             its transaction timeout; fenced at epoch {fenced_epoch}"
         );
         done += 1;
     }

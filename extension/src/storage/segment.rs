@@ -1022,9 +1022,6 @@ impl SegmentStore {
             None => true,
             Some((_, last_pos)) => pos.saturating_sub(*last_pos) >= INDEX_INTERVAL_BYTES,
         };
-        if indexable {
-            entries.push((base_offset, pos));
-        }
 
         with_active(topic, partition, active_base, generation, |a| {
             a.log.write_all_at(bytes, pos)?;
@@ -1062,6 +1059,13 @@ impl SegmentStore {
             }
             Ok(())
         })?;
+
+        // Only once the bytes are down: a hint for a failed write would survive the retry
+        // that lands the batch at the same position, and the index entry for it — skipped
+        // because the hint claims the interval is already covered — would not.
+        if indexable {
+            entries.push((base_offset, pos));
+        }
 
         // Every batch, not only indexed ones — the entries above claim to dominate them. From the
         // batch header, so a compressed batch costs nothing to read here.
@@ -1148,6 +1152,23 @@ impl SegmentStore {
 
         pmeta::advance_log_start(topic, partition, target)?;
         Ok(unlinked)
+    }
+
+    /// The partition's active segment, its layout generation and committed extent, from an
+    /// existing slot only: `None` if no process holds one, without recovering it. The whole
+    /// shard is probed, as `last_stable_offset_if_tracked` does: a dropped partition leaves
+    /// a hole in the probe chain, so an empty slot does not end the search.
+    fn slot_snapshot(topic: TopicId, partition: i32) -> Option<(i64, u64, u64)> {
+        let slots = SHARDS[shard_of(topic, partition)].share();
+        let start = (partition_hash(topic, partition) as usize) % SLOTS_PER_SHARD;
+        for probe in 0..SLOTS_PER_SHARD {
+            let i = (start + probe) % SLOTS_PER_SHARD;
+            if slots[i].topic == topic && slots[i].partition == partition {
+                let st = &slots[i];
+                return Some((st.active_base, st.layout_generation, st.active_bytes));
+            }
+        }
+        None
     }
 
     /// Run `f` against the partition's shared append position and this process's seek hints,
@@ -1486,8 +1507,16 @@ impl LogStore for SegmentStore {
         partition: i32,
     ) -> StoreResult<Option<(i64, i64)>> {
         // The greatest timestamp can sit in any batch, so walk headers and read only the winner.
+        // That walk covers every segment with no index to shorten it, so it runs outside the
+        // shard lock: only the committed extent of the active segment needs the lock, and
+        // holding it for a whole-partition scan would stall every appender in the shard,
+        // including a `kafgres_produce()` inside a business transaction. The snapshot is a
+        // point-in-time answer: a segment rolled after it is not read, and a file reclaimed
+        // meanwhile is skipped, as elsewhere.
         let bases_on_disk = Self::segment_bases(topic, partition)?;
-        Self::with_slot(topic, partition, |st, _hints| {
+        let (active_base, active_bytes) =
+            Self::with_slot(topic, partition, |st, _| Ok((st.active_base, st.active_bytes)))?;
+        {
             let mut bases = bases_on_disk;
             bases.sort_unstable();
 
@@ -1501,13 +1530,16 @@ impl LogStore for SegmentStore {
             let mut best: Option<Winner> = None;
 
             for base in bases {
+                if base > active_base {
+                    break;
+                }
                 let path = data_path(&segment_path(topic, partition, base, "log"));
                 let vfd = match Vfd::open(&path, false) {
                     Ok(v) => v,
                     Err(_) => continue, // reclaimed while we looked
                 };
-                let data_end = if base == st.active_base {
-                    st.active_bytes
+                let data_end = if base == active_base {
+                    active_bytes
                 } else {
                     vfd.size()?
                 };
@@ -1575,7 +1607,7 @@ impl LogStore for SegmentStore {
                 )));
             }
             Ok(super::offset_of_max_timestamp(kafgres_codec::bytes::Bytes::from(body)))
-        })
+        }
     }
 
     fn high_watermark(&self, topic: TopicId, partition: i32) -> StoreResult<i64> {
@@ -1850,9 +1882,19 @@ impl LogStore for SegmentStore {
         // The slot is read under the shard lock and released before the fsync: holding it
         // across a device flush would stall every other appender, including a
         // `kafgres_produce()` in a business transaction.
-        let (base, generation, bytes) = Self::with_slot(topic, partition, |st, _| {
-            Ok((st.active_base, st.layout_generation, st.active_bytes))
-        })?;
+        //
+        // Read, never allocated: this runs after retention and topic deletion in the same
+        // pass, and a partition appended to and then dropped has no slot. Taking one through
+        // `with_slot` would recover it from an empty directory, and `with_active` would then
+        // recreate the directory and an empty segment, leaving a partition that holds a slot
+        // nothing frees. A slot never appended to has nothing to sync either; the segment
+        // before it was synced when it rolled.
+        let Some((base, generation, bytes)) = Self::slot_snapshot(topic, partition) else {
+            return Ok(());
+        };
+        if bytes == 0 {
+            return Ok(());
+        }
         with_active(topic, partition, base, generation, |a| {
             // Hand the tail to writeback first, as the roll path does.
             a.log

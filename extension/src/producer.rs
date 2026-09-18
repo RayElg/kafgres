@@ -42,13 +42,18 @@ pub fn increment_sequence(sequence: i32, increment: i32) -> i32 {
 /// Allocate a producer id. A plain idempotent producer gets a fresh id and epoch 0 every
 pub fn init_producer_id(transactional_id: Option<&str>) -> Result<(i64, i16), spi::Error> {
     if let Some(txn_id) = transactional_id {
-        // Bump the epoch so any older instance of the same transactional id is fenced.
+        // Bump the epoch so any older instance of the same transactional id is fenced. The
+        // retired pair goes with it: a retried EndTxn from that instance must be fenced too,
+        // not answered NONE with the epoch this new instance now owns.
         let row: Option<String> = Spi::get_one_with_args(
             "WITH up AS (
                  INSERT INTO kafgres_producers (producer_id, producer_epoch, transactional_id)
                  VALUES (nextval('kafgres_producer_id_seq'), 0, $1)
                  ON CONFLICT (transactional_id) DO UPDATE
                     SET producer_epoch = kafgres_producers.producer_epoch + 1,
+                        retired_producer_id = NULL,
+                        retired_epoch = NULL,
+                        retired_committed = NULL,
                         last_ts = now()
                  RETURNING producer_id, producer_epoch)
              SELECT (SELECT producer_id || '|' || producer_epoch FROM up)",
@@ -77,11 +82,12 @@ pub fn bump_epoch_for_next_txn(producer_id: i64, committed: bool) -> Result<(i64
     // One below `i16::MAX`: `producer_epoch` is a `smallint` and the other bump sites add 1 unguarded.
     const EPOCH_CEILING: i32 = i16::MAX as i32 - 1;
 
-    // The retired epoch is recorded so a retried EndTxn is seen as a retry, not a zombie.
+    // The retired pair is recorded so a retried EndTxn is seen as a retry, not a zombie.
     let bumped: Option<i32> = Spi::get_one_with_args(
         "WITH up AS (
              UPDATE kafgres_producers
-                SET retired_epoch = producer_epoch,
+                SET retired_producer_id = producer_id,
+                    retired_epoch = producer_epoch,
                     retired_committed = $3,
                     producer_epoch = producer_epoch + 1,
                     last_ts = now()
@@ -96,18 +102,33 @@ pub fn bump_epoch_for_next_txn(producer_id: i64, committed: bool) -> Result<(i64
 
     // Here the epoch hit the ceiling or the row is gone: move the transactional id to a
     // fresh producer id at epoch 0. No row returns epoch -1 (caller already fenced).
+    //
+    // The transaction row moves with it: it has no foreign key, and left under the old id
+    // the producer's next append would find nothing to register against and its next
+    // EndTxn nothing to end. The old id's deduplication window is dropped rather than moved —
+    // sequences restart at zero with the epoch — and the sweep would never see it again
+    // once the producer row is gone.
     let moved: Option<String> = Spi::get_one_with_args(
         "WITH old AS (
              DELETE FROM kafgres_producers WHERE producer_id = $1
-          RETURNING transactional_id, producer_epoch),
+          RETURNING producer_id, transactional_id, producer_epoch),
          fresh AS (
              INSERT INTO kafgres_producers
                     (producer_id, producer_epoch, transactional_id,
-                     retired_epoch, retired_committed)
+                     retired_producer_id, retired_epoch, retired_committed)
              SELECT nextval('kafgres_producer_id_seq'), 0, transactional_id,
-                    producer_epoch, $2
+                    producer_id, producer_epoch, $2
                FROM old
-          RETURNING producer_id, producer_epoch)
+          RETURNING producer_id, producer_epoch),
+         txn AS (
+             UPDATE kafgres_txns t
+                SET producer_id = fresh.producer_id, producer_epoch = 0
+               FROM fresh
+              WHERE t.producer_id = $1
+          RETURNING 1),
+         window AS (
+             DELETE FROM kafgres_producer_batches WHERE producer_id = $1
+          RETURNING 1)
          SELECT (SELECT producer_id || '|' || producer_epoch FROM fresh)",
         &[producer_id.into(), committed.into()],
     )?;
