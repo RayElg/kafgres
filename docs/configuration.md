@@ -33,6 +33,7 @@ restart does.
 | `kafgres.segment_bytes` | reload | `64 MiB` | Bytes a segment file reaches before rolling. |
 | `kafgres.segment_offsets` | reload | `1000000` | Offsets per log segment, which is the retention granularity. Set before a partition has data: changing it later makes segment ranges overlap. |
 | `kafgres.segment_lock_stripes` | restart | `16` | Lock shards for segment-engine append positions; `1` makes every partition share one lock. Narrowing also narrows capacity. |
+| `kafgres.log_directory` | restart | empty | Directory holding the segment log. Empty means `$PGDATA/kafgres`; a relative path is under `$PGDATA`. Put it on a device other than the WAL's: with both on one device the database's commit flush queues behind the log's writeback. Measured on one box, a co-resident pgbench lost 27% at 500 MB/s of produce with a shared device and 11% with the log on its own, and 9% against nothing at 100 MB/s. A directory outside `$PGDATA` is not carried by `pg_basebackup`: seed a standby's copy yourself, or the follower starts from an empty log. |
 | `kafgres.segment_archive_command` | reload | empty | Shell command shipping one rolled segment to an archive; `%p` is its path, `%f` its filename. Empty disables archiving. Setting it makes retention wait for the archive. |
 | `kafgres.archive_interval_ms` | reload | `10000` | How often the archiver ships sealed segments; `0` disables it. |
 | `kafgres.replicate_from` | reload | empty | `host:port` of the leader to pull log from on a standby; empty disables it. |

@@ -15,6 +15,7 @@ use super::{
     TopicId, TxnContext,
 };
 
+/// Under `$PGDATA` unless `kafgres.log_directory` says otherwise.
 const LOG_DIR: &str = "kafgres";
 
 /// Kafka's own filename convention: base offset, zero-padded to 20 digits.
@@ -22,7 +23,7 @@ const OFFSET_DIGITS: usize = 20;
 
 /// Whether any log exists on disk. Errors propagate: the negative answer is what lets the broker start.
 pub fn log_presence() -> Result<Option<String>, String> {
-    Ok(has_log_on_disk()?.then(|| format!("segment files under {}", data_path(&PathBuf::from(LOG_DIR)).display())))
+    Ok(has_log_on_disk()?.then(|| format!("segment files under {}", log_root().display())))
 }
 
 fn has_log_on_disk() -> Result<bool, String> {
@@ -48,13 +49,12 @@ fn has_log_on_disk() -> Result<bool, String> {
         }
         Ok(false)
     }
-    any_segment(&data_path(&PathBuf::from(LOG_DIR)), 2)
+    any_segment(&log_root(), 2)
 }
 
+/// Relative to the log root; `data_path` places it.
 fn partition_dir(topic: TopicId, partition: i32) -> PathBuf {
-    PathBuf::from(LOG_DIR)
-        .join(topic.to_string())
-        .join(partition.to_string())
+    PathBuf::from(topic.to_string()).join(partition.to_string())
 }
 
 fn segment_path(topic: TopicId, partition: i32, base_offset: i64, ext: &str) -> PathBuf {
@@ -1206,8 +1206,20 @@ fn max_timestamp_of(bytes: &[u8]) -> Option<i64> {
     ))
 }
 
+/// The log root: `kafgres.log_directory`, resolved under `$PGDATA` when relative, else
+/// `$PGDATA/kafgres`. A root outside `$PGDATA` is not carried by `pg_basebackup`.
+fn log_root() -> PathBuf {
+    match crate::log_directory() {
+        Some(dir) => {
+            let p = PathBuf::from(dir);
+            if p.is_absolute() { p } else { PathBuf::from(data_directory()).join(p) }
+        }
+        None => PathBuf::from(data_directory()).join(LOG_DIR),
+    }
+}
+
 fn data_path(relative: &Path) -> PathBuf {
-    PathBuf::from(data_directory()).join(relative)
+    log_root().join(relative)
 }
 
 fn data_directory() -> String {
@@ -1673,7 +1685,7 @@ impl LogStore for SegmentStore {
     }
 
     fn log_dir(&self) -> String {
-        data_path(&PathBuf::from(LOG_DIR)).to_string_lossy().into_owned()
+        log_root().to_string_lossy().into_owned()
     }
 
     /// `unlink`, never a record-by-record delete: whole sealed segments only, never the active
@@ -1860,7 +1872,7 @@ impl LogStore for SegmentStore {
             }
         }
         // And the topic directory once its last partition is gone; `remove_dir` failing with
-        let _ = std::fs::remove_dir(data_path(&PathBuf::from(LOG_DIR).join(topic.to_string())));
+        let _ = std::fs::remove_dir(log_root().join(topic.to_string()));
 
         // Free the shared slot, or the partition keeps its append position across a
         {

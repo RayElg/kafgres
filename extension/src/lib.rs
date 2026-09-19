@@ -91,6 +91,8 @@ static SHARE_LOCK_DURATION_MS: GucSetting<i32> = GucSetting::<i32>::new(30_000);
 static SEGMENT_ARCHIVE_COMMAND: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 
+static LOG_DIRECTORY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+
 static ARCHIVE_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(10_000);
 
 static PRODUCER_ID_EXPIRATION_MS: GucSetting<i32> = GucSetting::<i32>::new(86_400_000);
@@ -165,6 +167,15 @@ pub fn cdc_snapshot_batch_rows() -> i32 {
 
 pub fn share_lock_duration_ms() -> i64 {
     SHARE_LOCK_DURATION_MS.get().max(1_000) as i64
+}
+
+/// Where the segment log lives: empty means `$PGDATA/kafgres`, a relative path is under
+/// `$PGDATA`. Postmaster scope — moving it under a running instance would split the log.
+pub fn log_directory() -> Option<String> {
+    LOG_DIRECTORY
+        .get()
+        .map(|c| c.to_string_lossy().trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn segment_archive_command() -> String {
@@ -457,6 +468,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"",
         &ALLOW_TXN_PRODUCE,
         GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"kafgres.log_directory",
+        c"Directory holding the segment log (segment engine). Empty means $PGDATA/kafgres; a relative path is under $PGDATA. Put it on a device other than the WAL's: the database's commit flush otherwise queues behind the log's writeback",
+        c"",
+        &LOG_DIRECTORY,
+        GucContext::Postmaster,
         GucFlags::default(),
     );
     GucRegistry::define_string_guc(
