@@ -42,6 +42,9 @@ COPY extension/Cargo.toml    ./extension/Cargo.toml
 COPY extension/Cargo.lock    ./extension/Cargo.lock
 COPY extension/kafgres.control ./extension/kafgres.control
 COPY extension/src           ./extension/src
+# Version upgrade scripts (kafgres--X--Y.sql); `cargo pgrx package` ships them alongside
+# the generated schema.
+COPY extension/sql           ./extension/sql
 
 WORKDIR /usr/src/kafgres/extension
 # Compile-check the `#[cfg(test)]` modules, which nothing else does.

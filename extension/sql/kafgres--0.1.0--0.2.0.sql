@@ -1,0 +1,5 @@
+-- kafgres 0.1.0 -> 0.2.0.
+--
+-- The SQL surface is unchanged between the two versions: no function was added, removed or
+-- re-signed. The tables 0.2.0 adds to (kafgres_producers gains retired_producer_id and its
+-- index) are migrated by the broker worker at start, with IF NOT EXISTS, as every table is.
