@@ -76,7 +76,7 @@ jobs:
             sleep 2
           done
           docker compose exec -T postgres psql -U postgres -tAc \
-            "SELECT extversion FROM pg_extension WHERE extname='kafgres'" | grep -q 0.1.0
+            "SELECT extversion FROM pg_extension WHERE extname='kafgres'" | grep -q 0.2.0
           docker compose exec -T postgres psql -U postgres -tAc \
             "SELECT count(*) FROM pg_stat_activity WHERE backend_type='kafgres_broker'" | grep -q '^1$'
 

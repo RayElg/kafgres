@@ -1,5 +1,5 @@
 comment = 'kafgres: a Kafka broker embedded in PostgreSQL'
-default_version = '0.1.0'
+default_version = '0.2.0'
 module_pathname = '$libdir/kafgres'
 relocatable = false
 superuser = true
