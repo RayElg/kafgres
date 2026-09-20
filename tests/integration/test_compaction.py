@@ -336,6 +336,23 @@ def byte_arm_topic(small_active_region, request):
     yield name
     sql(f"SELECT kafgres_drop_topic('{name}')")
 
+def produced_span(name):
+    """How many records were written, read from the log end rather than from a scan.
+
+    The byte-arm tests cannot take their baseline with `read_back`. The background worker
+    sweeps every ~60s and compacts any topic whose policy compacts, and these topics are
+    marked compacted *before* the produce loop — which is eight `docker run kcat`
+    invocations and so tens of seconds on a loaded runner. A sweep landing in that window
+    compacts the log before the baseline is read, and the test then compares a compacted
+    log against itself and reports the arm as doing nothing.
+
+    `offset_span` is `high_watermark - log_start_offset`, and compaction moves neither:
+    it makes the log sparse in place, and `advance_log_start` belongs to the delete arm,
+    which a `compact`-only policy never runs. So this is the same number before and after
+    a pass, whoever ran it.
+    """
+    return int(sql(f"SELECT offset_span FROM kafgres_partition_offsets('{name}')"))
+
 def set_compacted_with_segment_bytes(name, segment_bytes):
     sql(f"UPDATE kafgres_topics SET config = config || "
         f"'{{\"cleanup.policy\":\"compact\",\"min.compaction.lag.ms\":\"0\","
@@ -357,15 +374,16 @@ def test_segment_bytes_alone_makes_a_small_topic_compactable(byte_arm_topic):
     topic = byte_arm_topic
     set_compacted_with_segment_bytes(topic, 3000)
     produce(topic, [f"k1:v{i}" for i in range(8)])
-    before = read_back(topic)
+
+    span = produced_span(topic)
     sql("SELECT kafgres_enforce_retention()")
 
     got = read_back(topic)
-    assert len(got) < len(before), (
-        f"segment.bytes is accepted and reported but changes nothing: {len(before)} in, "
-        f"{len(got)} out"
+    assert len(got) < span, (
+        f"segment.bytes is accepted and reported but changes nothing: {span} produced, "
+        f"{len(got)} readable after a pass"
     )
-    assert got[-1].split()[0] == before[-1].split()[0], (
+    assert got[-1].split()[0] == str(span - 1), (
         f"the newest record for the key did not survive, or was renumbered: {got}"
     )
 
@@ -379,9 +397,12 @@ def test_a_large_segment_bytes_protects_the_whole_log(byte_arm_topic):
     topic = byte_arm_topic
     set_compacted_with_segment_bytes(topic, 1073741824)
     produce(topic, [f"k1:v{i}" for i in range(8)])
-    before = read_back(topic)
+
+    span = produced_span(topic)
     sql("SELECT kafgres_enforce_retention()")
+
     after = read_back(topic)
-    assert after == before, (
-        f"records were compacted inside a 1 GiB active region: {len(before)} -> {len(after)}"
+    assert len(after) == span, (
+        f"records were compacted inside a 1 GiB active region: {span} produced, "
+        f"{len(after)} readable after a pass"
     )
