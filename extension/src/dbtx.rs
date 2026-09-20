@@ -63,9 +63,7 @@ pub fn atomically<T, E>(
 }
 
 fn with_subtransaction<T>(f: impl FnOnce() -> Result<T, HandlerError>) -> Result<T, HandlerError> {
-    atomically(f, |_| {
-        HandlerError::Internal("query aborted (lock or statement timeout)".to_string())
-    })
+    atomically(f, |message| HandlerError::Internal(format!("query aborted: {message}")))
 }
 
 /// Let this transaction's commit return without waiting for its WAL to reach the disk:

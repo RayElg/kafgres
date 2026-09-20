@@ -15,7 +15,10 @@ import pytest
 KAFKA_IMAGE = "apache/kafka:4.3.1"
 KAFGRES = ("127.0.0.1", 9092)
 REFERENCE = ("127.0.0.1", 9292)
-TOPIC = "kip890-conformance"
+# Unique per run: a topic left by an earlier run under the other storage engine exists in
+# the metadata with no log behind it, and `--create` reports it as already there.
+RUN = int(time.time())
+TOPIC = f"kip890-conformance-{RUN}"
 
 NONE = 0
 COORDINATOR_LOAD_IN_PROGRESS = 14
@@ -320,9 +323,9 @@ def test_a_real_transaction_v2_client_transacts_end_to_end():
     transaction-V2: it never sends AddPartitionsToTxn, so the produce path itself must
     begin the transaction and EndTxn v5 must end it. This is the flow no hand-rolled
     frame above replays, and the one every 4.x transactional producer uses."""
-    topic = "kip890-tv2-e2e"
+    topic = f"kip890-tv2-e2e-{RUN}"
     _ensure_topic(f"{KAFGRES[0]}:{KAFGRES[1]}", topic)
-    txn_id = f"kip890-tv2-{int(time.time())}"
+    txn_id = f"kip890-tv2-{RUN}"
     out = subprocess.run(
         ["docker", "run", "--rm", "--network", "host", KAFKA_IMAGE,
          "/opt/kafka/bin/kafka-producer-perf-test.sh",

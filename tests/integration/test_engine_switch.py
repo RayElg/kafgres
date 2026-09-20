@@ -126,6 +126,7 @@ def broker_error():
 def test_a_log_under_both_engines_is_described_as_such(restore_engine):
     """The advice has to be right in the state the escape hatch creates."""
     set_engine("table")
+    sql("SELECT kafgres_drop_topic('both-a')")
     sql("SELECT kafgres_create_topic('both-a', 1)")
     subprocess.run(["docker", "run", "--rm", "--network", "host", "-i", CLIENTS,
                     "kcat", "-b", BROKER, "-t", "both-a", "-P"],
@@ -133,6 +134,7 @@ def test_a_log_under_both_engines_is_described_as_such(restore_engine):
 
     set_engine("segment", mismatch_ok=True)
     assert broker_reachable(), "the override did not let the broker start"
+    sql("SELECT kafgres_drop_topic('both-b')")
     sql("SELECT kafgres_create_topic('both-b', 1)")
     subprocess.run(["docker", "run", "--rm", "--network", "host", "-i", CLIENTS,
                     "kcat", "-b", BROKER, "-t", "both-b", "-P"],
