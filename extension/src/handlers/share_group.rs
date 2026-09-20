@@ -28,8 +28,7 @@ const MAX_ACQUIRE_PER_FETCH: i32 = 5_000;
 /// Kafka's `group.share.partition.max.record.locks`. Bounds `kafgres_share_inflight` to a
 const MAX_RECORD_LOCKS: i64 = 200;
 
-/// KIP-1222's `IsRenewAck` flag is not read: every acknowledgement carries its own type.
-const _IS_RENEW_ACK_IS_REDUNDANT: () = ();
+// KIP-1222's `IsRenewAck` flag is not read: every acknowledgement carries its own type.
 
 /// KIP-1206 `ShareAcquireMode`: the broker may overshoot `MaxRecords` to finish a batch.
 const ACQUIRE_BATCH_OPTIMIZED: i8 = 0;

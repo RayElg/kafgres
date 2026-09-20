@@ -234,7 +234,12 @@ pub fn handle_end_txn(req: &EndTxnRequest, version: i16) -> Result<EndTxnRespons
     // Checked before the fence: after a v5 rotation a retry carries the retired epoch, which
     // looks exactly like a zombie. KIP-890 answers such a retry NONE with the current pair.
     if version >= 5 && crate::transaction_version() >= 2 {
-        match completed_retry(req.producer_id, req.producer_epoch, req.committed)? {
+        match completed_retry(
+            &req.transactional_id,
+            req.producer_id,
+            req.producer_epoch,
+            req.committed,
+        )? {
             Retry::Of(id, epoch) => {
                 return Ok(EndTxnResponse {
                     throttle_time_ms: 0,
@@ -307,10 +312,11 @@ pub fn handle_end_txn(req: &EndTxnRequest, version: i16) -> Result<EndTxnRespons
 }
 
 /// Is this `EndTxn` a retry of the one that retired `epoch`, asking for the same outcome?
-/// The pair must be exactly the retired one (an older epoch is a fenced instance), and only
-/// the rotation records it: an `InitProducerId` or a fence clears it, so a retry arriving
-/// after a newer instance took over is fenced rather than handed that instance's epoch.
+/// The pair must be the retired one under the transactional id that owns it; an older epoch
+/// is a fenced instance. `InitProducerId` and a fence clear the record, so a retry arriving
+/// after a takeover is fenced.
 fn completed_retry(
+    transactional_id: &str,
     producer_id: i64,
     epoch: i16,
     committed: bool,
@@ -324,11 +330,17 @@ fn completed_retry(
                    FROM kafgres_producers p
                   WHERE p.retired_producer_id = $1
                     AND p.retired_epoch = $2
+                    AND p.transactional_id = $4
                     AND NOT EXISTS (SELECT 1 FROM kafgres_txns t
                                      WHERE t.producer_id = p.producer_id
                                        AND t.state = 'ongoing')
                   LIMIT 1)",
-        &[producer_id.into(), (epoch as i32).into(), committed.into()],
+        &[
+            producer_id.into(),
+            (epoch as i32).into(),
+            committed.into(),
+            transactional_id.into(),
+        ],
     )
     .map_err(|e| HandlerError::Internal(e.to_string()))?;
 

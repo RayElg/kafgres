@@ -228,8 +228,19 @@ struct Server {
     acls: crate::acl::AclCache,
     /// Partitions appended to whose bytes are not yet on the platter (distinct from `appended`).
     unsynced: HashSet<(u32, i32)>,
+    /// Consecutive passes on which `sync_before_ack` left something unsynced.
+    sync_failed_passes: u64,
     /// Frames served since the worker started, read as a "did this pass do anything" edge.
     served: u64,
+    /// Whether `tick` advanced on this pass; under the spin loop many passes share one value.
+    ticked: bool,
+}
+
+impl Server {
+    /// Whether a sweep with this period in ticks is due: once per matching tick, not per pass.
+    fn due(&self, every_n_ticks: u64) -> bool {
+        self.ticked && self.tick % every_n_ticks == 0
+    }
 }
 
 pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
@@ -284,7 +295,9 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         tls,
         acls: crate::acl::AclCache::default(),
         unsynced: HashSet::new(),
+        sync_failed_passes: 0,
         served: 0,
+        ticked: false,
     };
 
     // Load once before the loop, not just on the first tick: the default snapshot is
@@ -334,7 +347,8 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         // maintenance sweeps thousands of times a second under the spin loop, and counting
         // only sleeping passes would freeze `tick`, stopping retention and member expiry.
         let now = Instant::now();
-        if now >= next_tick_at {
+        srv.ticked = now >= next_tick_at;
+        if srv.ticked {
             srv.tick = srv.tick.wrapping_add(1);
             next_tick_at = now + tick;
         }
@@ -342,7 +356,7 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         if !epochs_ready {
             // This branch serves nothing, so stop spinning; the retry below is gated on it.
             spin = false;
-            if srv.tick % 200 == 0 {
+            if srv.due(200) {
                 epochs_ready = raise_leader_epochs();
             }
             continue;
@@ -791,7 +805,7 @@ fn quota_now_millis() -> i64 {
 /// Drop quota windows nothing has touched, so a broker that has seen many distinct
 fn expire_quota_windows(srv: &mut Server) {
     const EVERY_N_TICKS: u64 = 12_000; // ~60s at the default 5ms tick
-    if srv.tick % EVERY_N_TICKS != 0 {
+    if !srv.due(EVERY_N_TICKS) {
         return;
     }
     let now = quota_now_millis();
@@ -2039,7 +2053,7 @@ fn fetch_wait(max_wait_ms: i32) -> Duration {
 /// Evict members that stopped heartbeating, and cut join windows whose deadline passed.
 fn expire_group_members(srv: &mut Server) {
     const EVERY_N_TICKS: u64 = 100; // ~500ms at the default 5ms tick
-    if srv.tick % EVERY_N_TICKS != 0 {
+    if !srv.due(EVERY_N_TICKS) {
         return;
     }
     let awaiting: Vec<(String, String)> = srv
@@ -2086,7 +2100,7 @@ fn expire_producer_state(srv: &mut Server) {
     } else {
         EVERY_N_TICKS
     };
-    if srv.tick % every != 0 {
+    if !srv.due(every) {
         return;
     }
 
@@ -2199,7 +2213,7 @@ fn reload_tls(srv: &mut Server) {
 /// Close connections that have not authenticated within `AUTH_DEADLINE`.
 fn drop_unauthenticated(srv: &mut Server) {
     const EVERY_N_TICKS: u64 = 200; // ~1s at the default 5ms tick
-    if srv.tick % EVERY_N_TICKS != 0 || !crate::sasl_required() {
+    if !srv.due(EVERY_N_TICKS) || !crate::sasl_required() {
         return;
     }
     let now = Instant::now();
@@ -2224,7 +2238,7 @@ fn drop_unauthenticated(srv: &mut Server) {
 
 fn expire_share_group_state(srv: &Server) {
     const EVERY_N_TICKS: u64 = 1_000; // ~5s at the default 5ms tick
-    if srv.tick % EVERY_N_TICKS != 0 {
+    if !srv.due(EVERY_N_TICKS) {
         return;
     }
     if let Err(e) = BackgroundWorker::transaction(|| {
@@ -2236,7 +2250,7 @@ fn expire_share_group_state(srv: &Server) {
 
 fn expire_consumer_group_members(srv: &Server) {
     const EVERY_N_TICKS: u64 = 1_000; // ~5s at the default 5ms tick
-    if srv.tick % EVERY_N_TICKS != 0 {
+    if !srv.due(EVERY_N_TICKS) {
         return;
     }
     if let Err(e) = BackgroundWorker::transaction(|| {
@@ -2248,7 +2262,7 @@ fn expire_consumer_group_members(srv: &Server) {
 
 fn enforce_retention(srv: &mut Server) {
     const EVERY_N_TICKS: u64 = 12_000; // ~60s at the default 5ms tick
-    if srv.tick % EVERY_N_TICKS != 0 {
+    if !srv.due(EVERY_N_TICKS) {
         return;
     }
     if let Err(e) = BackgroundWorker::transaction(|| {
@@ -2441,21 +2455,39 @@ fn encode_parked<T: kafgres_codec::Encodable>(
 
 /// Make every partition appended to this pass durable before its acks are released. A
 /// failure here keeps the acks queued; the partition stays in the set and retries next pass.
+///
+/// Acks stay held while any partition fails; the client's delivery timeout is what surfaces
+/// a persistent failure. The log line is rate-limited.
 fn sync_before_ack(srv: &mut Server) -> bool {
     if srv.unsynced.is_empty() {
+        srv.sync_failed_passes = 0;
         return true;
     }
     let mut store = crate::storage::open();
     let owed: Vec<(u32, i32)> = srv.unsynced.iter().copied().collect();
+    let mut failures = Vec::new();
     for (topic, partition) in owed {
         match store.sync_partition(topic, partition) {
             Ok(()) => {
                 srv.unsynced.remove(&(topic, partition));
             }
-            Err(e) => log!("kafgres: fsync before ack failed for {topic}/{partition}: {e}"),
+            Err(e) => failures.push(format!("{topic}/{partition}: {e}")),
         }
     }
-    srv.unsynced.is_empty()
+    if failures.is_empty() {
+        srv.sync_failed_passes = 0;
+        return true;
+    }
+    srv.sync_failed_passes = srv.sync_failed_passes.wrapping_add(1);
+    if srv.sync_failed_passes == 1 || srv.sync_failed_passes % 1000 == 0 {
+        log!(
+            "kafgres: fsync before ack failed on {} consecutive pass(es); produce acks are \
+             held until it succeeds: {}",
+            srv.sync_failed_passes,
+            failures.join("; ")
+        );
+    }
+    false
 }
 
 fn flush_all(srv: &mut Server) {

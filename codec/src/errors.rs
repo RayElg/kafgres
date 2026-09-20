@@ -137,12 +137,9 @@ pub enum ErrorCode {
     /// The named resource does not exist — used by `DescribeUserScramCredentials` for a
     ResourceNotFound = 91,
     UnacceptableCredential = 93,
-    UnknownTopicId = 100,
-    /// A client-supplied regular expression failed to compile, as used by
-    /// `ListTransactions` patterns and KIP-848 topic subscription.
-    InvalidRegularExpression = 128,
     /// UpdateFeatures could not apply a change; there are no finalized features to move.
     FeatureUpdateFailed = 96,
+    UnknownTopicId = 100,
     /// `DescribeTransactions` for a transactional id this broker has no state for. The
     TransactionalIdNotFound = 105,
     FencedMemberEpoch = 110,
@@ -152,6 +149,9 @@ pub enum ErrorCode {
     InvalidRecordState = 121,
     ShareSessionNotFound = 122,
     InvalidShareSessionEpoch = 123,
+    /// A client-supplied regular expression failed to compile, as used by
+    /// `ListTransactions` patterns and KIP-848 topic subscription.
+    InvalidRegularExpression = 128,
     ShareSessionLimitReached = 133,
 }
 

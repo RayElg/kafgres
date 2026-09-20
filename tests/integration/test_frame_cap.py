@@ -25,7 +25,7 @@ def set_cap(value):
     sql("SELECT pg_reload_conf()")
     for _ in range(20):
         time.sleep(0.5)
-        if sql("SHOW kafgres.max_request_bytes").replace("MB", "").strip():
+        if sql("SHOW kafgres.max_request_bytes") == str(value):
             break
     time.sleep(2)
 

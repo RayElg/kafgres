@@ -143,8 +143,8 @@ impl Follower {
         if hdr.correlation_id != self.correlation {
             self.disconnect();
             return Err(format!(
-                "replication: reply {} answers request {}, not {}",
-                hdr.correlation_id, hdr.correlation_id, self.correlation
+                "replication: reply answers request {}, not {}",
+                hdr.correlation_id, self.correlation
             ));
         }
         decode(&mut buf, version).map_err(|e| io_err("decoding the reply", e))

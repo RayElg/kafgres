@@ -939,8 +939,9 @@ pub unsafe extern "C-unwind" fn kafgres_follower_worker_main(_arg: pg_sys::Datum
     log!("kafgres: follower starting, pulling log from {host}:{port}");
 
     let mut follower = replication::Follower::new(&host, port);
-    // A round that pulled something is followed at once by another; a quiet leader has
-    // already long-polled inside the Fetch, and an unreachable one gets a backoff.
+    // A round that pulled something is followed at once by another. The Fetch long-polls
+    // on a quiet leader; the short delay covers a round with nothing to fetch. An
+    // unreachable leader gets a backoff.
     let mut delay = Duration::ZERO;
     let mut applied_since_log = 0i64;
     let mut last_log = std::time::Instant::now();
