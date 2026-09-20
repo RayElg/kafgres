@@ -256,7 +256,7 @@ def test_a_reader_that_stops_reading_is_not_disconnected(tls_server):
     sql(f"SELECT kafgres_drop_topic('{topic}')")
     sql(f"SELECT kafgres_create_topic('{topic}', 1)")
     try:
-        payload = "\n".join("y" * 4000 for _ in range(400)) + "\n"
+        payload = "\n".join("y" * 2000 for _ in range(400)) + "\n"
         assert kcat("-t", topic, "-P", stdin=payload, timeout=240).returncode == 0
 
         deadline = time.time() + 60
@@ -294,7 +294,7 @@ def test_a_reader_that_stops_reading_is_not_disconnected(tls_server):
             assert len(got) == size
             settings = sql("SHOW kafgres.segment_bytes") + "/" + sql("SHOW kafgres.segment_offsets")
             assert size > 65536, (
-                f"response was only {size} bytes (~{size // 4000} of 400 records, hw={hw}) "
+                f"response was only {size} bytes (~{size // 2000} of 400 records, hw={hw}) "
                 f"with segment_bytes/segment_offsets={settings}. The backpressure this test "
                 "is about needs a response over rustls's 64 KiB buffer, so this run did not "
                 "exercise it — look at why the fetch was short, and at whether it stopped on "

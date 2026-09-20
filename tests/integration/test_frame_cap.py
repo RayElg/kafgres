@@ -21,16 +21,16 @@ def set_cap(value):
     sql("SELECT pg_reload_conf()")
     for _ in range(20):
         time.sleep(0.5)
-        if sql("SHOW kafgres.max_request_bytes").replace("MB", "").strip():
+        if sql("SHOW kafgres.max_request_bytes") == str(value):
             break
     time.sleep(2)
 
-def produce_wide(topic, timeout=180):
+def produce_wide(topic, *opts, timeout=180):
     """kcat with its own defaults — the point is that a stock client must work."""
     payload = "".join(f"k{i % 2000}:{i}{'x' * 992}\n" for i in range(RECORDS))
     return subprocess.run(
         ["docker", "run", "--rm", "-i", "--network", "host", CLIENTS,
-         "kcat", "-b", BROKER, "-t", topic, "-P", "-K:", "-l", "/dev/stdin"],
+         "kcat", "-b", BROKER, *opts, "-t", topic, "-P", "-K:", "-l", "/dev/stdin"],
         input=payload, capture_output=True, text=True, timeout=timeout,
     )
 
@@ -62,7 +62,7 @@ def test_a_stock_librdkafka_producer_across_eight_partitions(topic):
 def test_the_cap_still_bounds_a_frame_when_lowered(topic, cap):
     """The ceiling has to still be a ceiling, at the value it is set to."""
     set_cap(cap)
-    produce_wide(topic)
+    produce_wide(topic, "-X", "linger.ms=1000", "-X", "batch.size=1000000")
     time.sleep(2)
     got = landed(topic)
     assert got < RECORDS, (
