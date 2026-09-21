@@ -9,7 +9,7 @@ fn spi_err(e: impl std::fmt::Display) -> StoreError {
 }
 
 pub fn log_start_offset(topic: TopicId, partition: i32) -> StoreResult<i64> {
-    Spi::get_one_with_args::<i64>(
+    crate::plan::get_one::<i64>(
         "SELECT (SELECT log_start_offset FROM kafgres_partitions
                   WHERE topic_id = $1::oid AND partition = $2)",
         &[(topic as i32).into(), partition.into()],
@@ -19,7 +19,7 @@ pub fn log_start_offset(topic: TopicId, partition: i32) -> StoreResult<i64> {
 }
 
 pub fn leader_epoch(topic: TopicId, partition: i32) -> StoreResult<i32> {
-    Spi::get_one_with_args::<i32>(
+    crate::plan::get_one::<i32>(
         "SELECT (SELECT leader_epoch FROM kafgres_partitions
                   WHERE topic_id = $1::oid AND partition = $2)",
         &[(topic as i32).into(), partition.into()],
@@ -275,17 +275,64 @@ pub fn kafka_txn_lso(topic: TopicId, partition: i32) -> StoreResult<Option<i64>>
     .map_err(spi_err)
 }
 
-/// Note where an in-flight transaction's records begin in this partition. The
-pub fn note_txn_first_offset(
+/// Register one (topic, partition) as part of this producer's transaction, and begin the
+/// transaction if nothing else did. A transaction-V2 producer (KIP-890 part two) never
+/// sends `AddPartitionsToTxn`, so the first transactional append is what moves the
+/// transaction out of `empty` and what the LSO and the `EndTxn` marker write read. The
+/// first batch's offset wins as `first_offset`; later batches keep it.
+pub fn register_txn_partition(
     producer_id: i64,
+    epoch: i16,
     topic: TopicId,
     partition: i32,
     base_offset: i64,
 ) -> StoreResult<()> {
+    let state: Option<String> = Spi::get_one_with_args(
+        "SELECT (SELECT state FROM kafgres_txns WHERE producer_id = $1)",
+        &[producer_id.into()],
+    )
+    .map_err(spi_err)?;
+    match state.as_deref() {
+        Some("ongoing") => {
+            // Carry the batch's epoch the way AddPartitionsToTxn does, and leave
+            // `started_at` alone so the expiry sweep keeps its deadline.
+            Spi::run_with_args(
+                "UPDATE kafgres_txns SET producer_epoch = $2 WHERE producer_id = $1",
+                &[producer_id.into(), (epoch as i32).into()],
+            )
+            .map_err(spi_err)?;
+        }
+        Some(_) => {
+            // A transaction the client never began, or a finished predecessor: this
+            // append starts the next one. Stale partition rows from the previous
+            // transaction must not feed the marker write or the LSO.
+            Spi::run_with_args(
+                "DELETE FROM kafgres_txn_partitions WHERE producer_id = $1",
+                &[producer_id.into()],
+            )
+            .map_err(spi_err)?;
+            Spi::run_with_args(
+                "UPDATE kafgres_txns
+                    SET state = 'ongoing', producer_epoch = $2, started_at = $3
+                  WHERE producer_id = $1",
+                &[
+                    producer_id.into(),
+                    (epoch as i32).into(),
+                    now_millis().into(),
+                ],
+            )
+            .map_err(spi_err)?;
+        }
+        // No row at all: the producer's own epoch and sequence checks govern the append,
+        // and there is nothing to register against.
+        None => return Ok(()),
+    }
     Spi::run_with_args(
-        "UPDATE kafgres_txn_partitions SET first_offset = $4
-          WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3
-            AND first_offset < 0",
+        "INSERT INTO kafgres_txn_partitions (producer_id, topic_id, partition, first_offset)
+         VALUES ($1, $2::oid, $3, $4)
+         ON CONFLICT (producer_id, topic_id, partition)
+         DO UPDATE SET first_offset = $4
+          WHERE kafgres_txn_partitions.first_offset < 0",
         &[
             producer_id.into(),
             (topic as i32).into(),
@@ -293,7 +340,15 @@ pub fn note_txn_first_offset(
             base_offset.into(),
         ],
     )
-    .map_err(spi_err)
+    .map_err(spi_err)?;
+    Ok(())
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Record an aborted transaction's offset range so consumers can be told to drop it.

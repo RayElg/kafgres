@@ -1,6 +1,6 @@
 [package]
 name = "kafgres-codec"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Elastic-2.0"
 description = "Kafka wire protocol codec, generated from vendored schemas. No pgrx, no Postgres."

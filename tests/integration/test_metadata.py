@@ -297,7 +297,7 @@ def test_java_admin_client_sees_only_implemented_apis():
     assert "ApiVersions(18): 0 to 4" in out.stdout
     assert "Produce(0): 0 to 13" in out.stdout
     assert "Fetch(1): 4 to 18" in out.stdout
-    assert "ListOffsets(2): 1 to 6" in out.stdout
+    assert "ListOffsets(2): 1 to 11" in out.stdout
     assert "JoinGroup(11): 0 to 9" in out.stdout
     assert "InitProducerId(22): 0 to 5" in out.stdout
     assert "CreateTopics(19): 2 to 7" in out.stdout
@@ -307,15 +307,15 @@ def test_java_admin_client_sees_only_implemented_apis():
     assert "DescribeAcls(29): 1 to 3" in out.stdout
     assert "CreateAcls(30): 1 to 3" in out.stdout
     assert "DeleteAcls(31): 1 to 3" in out.stdout
-    assert "TxnOffsetCommit(28): 0 to 3" in out.stdout
-    assert "AddPartitionsToTxn(24): 0 to 3" in out.stdout
-    assert "EndTxn(26): 0 to 3" in out.stdout
+    assert "TxnOffsetCommit(28): 0 to 5" in out.stdout
+    assert "AddPartitionsToTxn(24): 0 to 5" in out.stdout
+    assert "EndTxn(26): 0 to 5" in out.stdout
     assert "WriteTxnMarkers(27): 1 [usable: 1]" in out.stdout
     assert "DescribeTopicPartitions(75): 0 [usable: 0]" in out.stdout
     assert "AlterClientQuotas(49): 0 to 1" in out.stdout
     assert "AlterUserScramCredentials(51): 0 [usable: 0]" in out.stdout
-    assert "ShareFetch(78): 1 [usable: 1]" in out.stdout
-    assert "StreamsGroupHeartbeat(88): UNSUPPORTED" in out.stdout
+    assert "ShareFetch(78): 1 to 2" in out.stdout
+    assert "StreamsGroupHeartbeat(88): 0 [usable: 0]" in out.stdout
 
 def test_kafka_topics_sh_lists_topics():
     out = docker_run(

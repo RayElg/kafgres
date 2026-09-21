@@ -4,7 +4,8 @@
 # skips the pgrx/Postgres link step and passes on code that cannot load, which is why
 # this gate exists.
 
-FROM rust:bookworm AS builder
+# Pinned for reproducible builds, like `postgresql-server-dev-16` and `cargo-pgrx` below.
+FROM rust:1.98.0-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     lsb-release \
@@ -41,6 +42,9 @@ COPY extension/Cargo.toml    ./extension/Cargo.toml
 COPY extension/Cargo.lock    ./extension/Cargo.lock
 COPY extension/kafgres.control ./extension/kafgres.control
 COPY extension/src           ./extension/src
+# Version upgrade scripts (kafgres--X--Y.sql); `cargo pgrx package` ships them alongside
+# the generated schema.
+COPY extension/sql           ./extension/sql
 
 WORKDIR /usr/src/kafgres/extension
 # Compile-check the `#[cfg(test)]` modules, which nothing else does.
@@ -57,7 +61,11 @@ WORKDIR /usr/src/kafgres/extension
 RUN cargo check --tests && \
     cargo pgrx package && \
     mkdir -p /app/dist && \
-    cp -r target/release/kafgres-pg16/* /app/dist/
+    cp -r target/release/kafgres-pg16/* /app/dist/ && \
+    # Only /app/dist is copied onward; Dockerfile.pgrx-test derives from this image, so
+    # without this every test run re-extracts the whole build tree from the layer.
+    # The tests' own artifacts live in the cargo cache volume, not here.
+    rm -rf /usr/src/kafgres/extension/target
 
 FROM postgres:16-bookworm
 

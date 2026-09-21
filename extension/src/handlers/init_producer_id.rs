@@ -28,6 +28,10 @@ pub fn handle(
         });
     }
     let txn_id = req.transactional_id.as_deref().filter(|s| !s.is_empty());
+    // Before the epoch moves: the abort is performed at the epoch the transaction ran under.
+    if let Some(id) = txn_id {
+        super::txn::abort_abandoned(id)?;
+    }
     let (producer_id, epoch) = producer::init_producer_id(txn_id)?;
 
     // Clamped as Kafka clamps: an unbounded timeout would let a client pin a partition's LSO forever.
@@ -42,7 +46,12 @@ pub fn handle(
              VALUES ($1, $2, $3, 'empty', $4, $5)
              ON CONFLICT (producer_id) DO UPDATE
                 SET producer_epoch = EXCLUDED.producer_epoch,
-                    timeout_ms = EXCLUDED.timeout_ms",
+                    timeout_ms = EXCLUDED.timeout_ms,
+                    -- A completed transaction does not carry over to the new instance:
+                    -- its state returns to 'empty', as Kafka's does, so a following
+                    -- EndTxn is judged against nothing open.
+                    state = CASE WHEN kafgres_txns.state = 'ongoing'
+                                 THEN kafgres_txns.state ELSE 'empty' END",
             &[
                 producer_id.into(),
                 (epoch as i32).into(),

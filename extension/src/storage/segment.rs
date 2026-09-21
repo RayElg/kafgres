@@ -15,6 +15,7 @@ use super::{
     TopicId, TxnContext,
 };
 
+/// Under `$PGDATA` unless `kafgres.log_directory` says otherwise.
 const LOG_DIR: &str = "kafgres";
 
 /// Kafka's own filename convention: base offset, zero-padded to 20 digits.
@@ -22,7 +23,7 @@ const OFFSET_DIGITS: usize = 20;
 
 /// Whether any log exists on disk. Errors propagate: the negative answer is what lets the broker start.
 pub fn log_presence() -> Result<Option<String>, String> {
-    Ok(has_log_on_disk()?.then(|| format!("segment files under {}", data_path(&PathBuf::from(LOG_DIR)).display())))
+    Ok(has_log_on_disk()?.then(|| format!("segment files under {}", log_root().display())))
 }
 
 fn has_log_on_disk() -> Result<bool, String> {
@@ -48,13 +49,12 @@ fn has_log_on_disk() -> Result<bool, String> {
         }
         Ok(false)
     }
-    any_segment(&data_path(&PathBuf::from(LOG_DIR)), 2)
+    any_segment(&log_root(), 2)
 }
 
+/// Relative to the log root; `data_path` places it.
 fn partition_dir(topic: TopicId, partition: i32) -> PathBuf {
-    PathBuf::from(LOG_DIR)
-        .join(topic.to_string())
-        .join(partition.to_string())
+    PathBuf::from(topic.to_string()).join(partition.to_string())
 }
 
 fn segment_path(topic: TopicId, partition: i32, base_offset: i64, ext: &str) -> PathBuf {
@@ -185,6 +185,98 @@ fn shard_of(topic: TopicId, partition: i32) -> usize {
 /// Sparse seek hints, per process — deliberately not shared; a hint only moves the scan start.
 type PartitionHints = (u64, HashMap<i64, Vec<(i64, u64)>>);
 static HINTS: Mutex<Option<HashMap<(TopicId, i32), PartitionHints>>> = Mutex::new(None);
+
+/// Bytes appended to the active segment between writeback hints; sized so the dirty backlog never approaches a segment.
+const WRITEBACK_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The active segment's open descriptors, per partition, for this process.
+/// `PathNameOpenFilePerm` hands back a virtual descriptor, so holding it costs no real fd
+/// and it survives transaction end, which is what makes caching safe. Process-local.
+struct ActiveSeg {
+    generation: u64,
+    base: i64,
+    log: Vfd,
+    /// Opened lazily: failing an append over an index file would reject a record the log can hold.
+    index: Option<Vfd>,
+    timeindex: Option<Vfd>,
+    /// First byte of the log not yet handed to `FileWriteback`.
+    writeback_from: u64,
+}
+
+static ACTIVE: Mutex<Option<HashMap<(TopicId, i32), ActiveSeg>>> = Mutex::new(None);
+
+/// Drop this process's cached descriptors wherever the files underneath them can go.
+/// Append one entry to a lazily-opened index file; failures are logged and swallowed, since
+/// these files are hints and the log write this entry describes has already succeeded.
+fn append_index_entry(slot: &mut Option<Vfd>, path: &Path, entry: &[u8], what: &str) {
+    if slot.is_none() {
+        match Vfd::open(path, true) {
+            Ok(v) => *slot = Some(v),
+            Err(e) => {
+                log!("kafgres: could not open {what} file (harmless, costs a scan): {e}");
+                return;
+            }
+        }
+    }
+    let Some(vfd) = slot.as_mut() else { return };
+    let at = match vfd.size() {
+        Ok(n) => n,
+        Err(e) => {
+            log!("kafgres: could not size {what} file (harmless, costs a scan): {e}");
+            return;
+        }
+    };
+    if let Err(e) = vfd.write_all_at(entry, at) {
+        log!("kafgres: could not write {what} entry (harmless, costs a scan): {e}");
+    }
+}
+
+fn evict_active(topic: TopicId, partition: i32) {
+    if let Some(map) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        map.remove(&(topic, partition));
+    }
+}
+
+/// Run `f` against the open descriptors for `base`, opening them if stale. Lock order is
+/// SHARD -> HINTS -> ACTIVE, and this is the only place ACTIVE is taken while another is held.
+fn with_active<T>(
+    topic: TopicId,
+    partition: i32,
+    base: i64,
+    generation: u64,
+    f: impl FnOnce(&mut ActiveSeg) -> StoreResult<T>,
+) -> StoreResult<T> {
+    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    let stale = match map.get(&(topic, partition)) {
+        Some(a) => a.base != base || a.generation != generation,
+        None => true,
+    };
+    if stale {
+        map.remove(&(topic, partition));
+        // Only here, not per append: walking the directory per write is a syscall per component.
+        ensure_dir(&data_path(&partition_dir(topic, partition)))?;
+        let log = Vfd::open(&data_path(&segment_path(topic, partition, base, "log")), true)?;
+        // Whatever is on disk was written earlier; starting at zero would hand a whole
+        // recovered segment to writeback on first append.
+        let writeback_from = log.size()?;
+        map.insert(
+            (topic, partition),
+            ActiveSeg {
+                generation,
+                base,
+                log,
+                index: None,
+                timeindex: None,
+                writeback_from,
+            },
+        );
+    }
+    let seg = map
+        .get_mut(&(topic, partition))
+        .expect("inserted directly above when absent");
+    f(seg)
+}
 
 /// Recovers from disk if no process has touched the slot since postmaster start; holds the shard lock.
 fn slot_for(slots: &mut [Slot; SLOTS_PER_SHARD], topic: TopicId, partition: i32)
@@ -358,6 +450,23 @@ impl Vfd {
                  dirty pages, so a second call can report success having written nothing."
             );
         }
+    }
+
+    /// Hand a written range to the kernel for writeback without waiting for it.
+    /// `FileWriteback` makes no durability promise; the `sync` above is still the only thing
+    /// that does. It keeps the dirty-page backlog small so `sync` at roll finds little to write.
+    fn writeback(&self, offset: u64, nbytes: u64) {
+        if nbytes == 0 {
+            return;
+        }
+        unsafe {
+            pgrx::pg_sys::FileWriteback(
+                self.file,
+                offset as pgrx::pg_sys::off_t,
+                nbytes as pgrx::pg_sys::off_t,
+                pgrx::pg_sys::WaitEventIO::WAIT_EVENT_DATA_FILE_FLUSH as u32,
+            )
+        };
     }
 
     fn io_err(&self, what: &str) -> StoreError {
@@ -632,40 +741,6 @@ fn now_millis() -> i64 {
 const INDEX_ENTRY: usize = 8;
 
 impl SegmentStore {
-    /// Append a sparse index entry for a batch just written (a hint; never fsynced).
-    fn write_index_entry(
-        topic: TopicId,
-        partition: i32,
-        base: i64,
-        batch_base: i64,
-        pos: u64,
-    ) -> StoreResult<()> {
-        let path = data_path(&segment_path(topic, partition, base, "index"));
-        let mut vfd = Vfd::open(&path, true)?;
-        let at = vfd.size()?;
-        let mut buf = [0u8; INDEX_ENTRY];
-        buf[..4].copy_from_slice(&((batch_base - base) as u32).to_be_bytes());
-        buf[4..].copy_from_slice(&(pos as u32).to_be_bytes());
-        vfd.write_all_at(&buf, at)
-    }
-
-    /// Append a `.timeindex` entry (never fsynced, written after the batch), only when the
-    fn write_time_index_entry(
-        topic: TopicId,
-        partition: i32,
-        base: i64,
-        max_timestamp: i64,
-        pos: u64,
-    ) -> StoreResult<()> {
-        let path = data_path(&segment_path(topic, partition, base, "timeindex"));
-        let mut vfd = Vfd::open(&path, true)?;
-        let at = vfd.size()?;
-        let mut buf = [0u8; TIME_INDEX_ENTRY];
-        buf[..8].copy_from_slice(&max_timestamp.to_be_bytes());
-        buf[8..].copy_from_slice(&(pos as u32).to_be_bytes());
-        vfd.write_all_at(&buf, at)
-    }
-
     /// Where to start scanning for the first batch at or after `timestamp`: the last indexed
     fn time_index_seek(
         topic: TopicId,
@@ -905,6 +980,7 @@ impl SegmentStore {
         bytes: &[u8],
         base_offset: i64,
     ) -> StoreResult<()> {
+        let generation = st.layout_generation;
         let aged_out = st.active_since_ms > 0
             && now_millis() - st.active_since_ms >= st.segment_ms
             && st.active_bytes > 0;
@@ -914,11 +990,21 @@ impl SegmentStore {
             segment_bytes()
         };
         if st.active_bytes > 0 && (aged_out || st.active_bytes + bytes.len() as u64 > roll_at) {
-            let closing = data_path(&segment_path(topic, partition, st.active_base, "log"));
-            Vfd::open(&closing, false)?.sync();
+            // Flush what the pacing below has not already started, then fsync the segment we
+            // are leaving; it now finds most of the file already on the device.
+            let closing_base = st.active_base;
+            let closing_bytes = st.active_bytes;
+            with_active(topic, partition, closing_base, generation, |a| {
+                a.log
+                    .writeback(a.writeback_from, closing_bytes.saturating_sub(a.writeback_from));
+                a.log.sync();
+                Ok(())
+            })?;
+            evict_active(topic, partition);
             st.active_base = base_offset;
             st.active_bytes = 0;
-            // A new segment is empty, so nothing precedes its first byte: carrying the previous
+            // A new segment is empty: carrying the previous maximum forward would poison its
+            // first time-index entry.
             st.max_timestamp_so_far = i64::MIN;
             st.active_since_ms = now_millis();
             hints.insert(base_offset, Vec::new());
@@ -927,34 +1013,62 @@ impl SegmentStore {
             st.active_since_ms = now_millis();
         }
 
-        let path = data_path(&segment_path(topic, partition, st.active_base, "log"));
-        ensure_dir(&data_path(&partition_dir(topic, partition)))?;
-        let mut vfd = Vfd::open(&path, true)?;
         let pos = st.active_bytes;
-        vfd.write_all_at(bytes, pos)?;
+        let active_base = st.active_base;
+        let max_timestamp_so_far = st.max_timestamp_so_far;
 
-        let entries = hints.entry(st.active_base).or_default();
+        let entries = hints.entry(active_base).or_default();
         let indexable = match entries.last() {
             None => true,
             Some((_, last_pos)) => pos.saturating_sub(*last_pos) >= INDEX_INTERVAL_BYTES,
         };
+
+        with_active(topic, partition, active_base, generation, |a| {
+            a.log.write_all_at(bytes, pos)?;
+            let end = pos + bytes.len() as u64;
+            if end.saturating_sub(a.writeback_from) >= WRITEBACK_BYTES {
+                a.log.writeback(a.writeback_from, end - a.writeback_from);
+                a.writeback_from = end;
+            }
+
+            if indexable {
+                // Both index writes stay non-fatal: a missing entry costs a scan. The write
+                // position is re-read from the file because the worker and a user backend
+                // appending in different processes would otherwise number entries independently.
+                let mut entry = [0u8; INDEX_ENTRY];
+                entry[..4].copy_from_slice(&((base_offset - active_base) as u32).to_be_bytes());
+                entry[4..].copy_from_slice(&(pos as u32).to_be_bytes());
+                append_index_entry(
+                    &mut a.index,
+                    &data_path(&segment_path(topic, partition, active_base, "index")),
+                    &entry,
+                    "index",
+                );
+
+                // Pairs the max over everything *before* this batch with this batch's position,
+                // so a time lookup lands at or before the first record that can match.
+                let mut tentry = [0u8; TIME_INDEX_ENTRY];
+                tentry[..8].copy_from_slice(&max_timestamp_so_far.to_be_bytes());
+                tentry[8..].copy_from_slice(&(pos as u32).to_be_bytes());
+                append_index_entry(
+                    &mut a.timeindex,
+                    &data_path(&segment_path(topic, partition, active_base, "timeindex")),
+                    &tentry,
+                    "time index",
+                );
+            }
+            Ok(())
+        })?;
+
+        // Only once the bytes are down: a hint for a failed write would survive the retry
+        // that lands the batch at the same position, and the index entry for it — skipped
+        // because the hint claims the interval is already covered — would not.
         if indexable {
             entries.push((base_offset, pos));
-            if let Err(e) = Self::write_index_entry(topic, partition, st.active_base, base_offset, pos) {
-                log!("kafgres: could not write index entry (harmless, costs a scan): {e}");
-            }
-            // The entry pairs the max over everything *before* this batch with this batch's position —
-            if let Err(e) = Self::write_time_index_entry(
-                topic,
-                partition,
-                st.active_base,
-                st.max_timestamp_so_far,
-                pos,
-            ) {
-                log!("kafgres: could not write time index entry (harmless): {e}");
-            }
         }
+
         // Every batch, not only indexed ones — the entries above claim to dominate them. From the
+        // batch header, so a compressed batch costs nothing to read here.
         if let Some(ts) = max_timestamp_of(bytes) {
             st.max_timestamp_so_far = st.max_timestamp_so_far.max(ts);
         }
@@ -1033,10 +1147,28 @@ impl SegmentStore {
                     hint.remove(&infos[i].base);
                 }
             }
+            evict_active(topic, partition);
         }
 
         pmeta::advance_log_start(topic, partition, target)?;
         Ok(unlinked)
+    }
+
+    /// The partition's active segment, its layout generation and committed extent, from an
+    /// existing slot only: `None` if no process holds one, without recovering it. The whole
+    /// shard is probed, as `last_stable_offset_if_tracked` does: a dropped partition leaves
+    /// a hole in the probe chain, so an empty slot does not end the search.
+    fn slot_snapshot(topic: TopicId, partition: i32) -> Option<(i64, u64, u64)> {
+        let slots = SHARDS[shard_of(topic, partition)].share();
+        let start = (partition_hash(topic, partition) as usize) % SLOTS_PER_SHARD;
+        for probe in 0..SLOTS_PER_SHARD {
+            let i = (start + probe) % SLOTS_PER_SHARD;
+            if slots[i].topic == topic && slots[i].partition == partition {
+                let st = &slots[i];
+                return Some((st.active_base, st.layout_generation, st.active_bytes));
+            }
+        }
+        None
     }
 
     /// Run `f` against the partition's shared append position and this process's seek hints,
@@ -1074,8 +1206,20 @@ fn max_timestamp_of(bytes: &[u8]) -> Option<i64> {
     ))
 }
 
+/// The log root: `kafgres.log_directory`, resolved under `$PGDATA` when relative, else
+/// `$PGDATA/kafgres`. A root outside `$PGDATA` is not carried by `pg_basebackup`.
+fn log_root() -> PathBuf {
+    match crate::log_directory() {
+        Some(dir) => {
+            let p = PathBuf::from(dir);
+            if p.is_absolute() { p } else { PathBuf::from(data_directory()).join(p) }
+        }
+        None => PathBuf::from(data_directory()).join(LOG_DIR),
+    }
+}
+
 fn data_path(relative: &Path) -> PathBuf {
-    PathBuf::from(data_directory()).join(relative)
+    log_root().join(relative)
 }
 
 fn data_directory() -> String {
@@ -1369,6 +1513,115 @@ impl LogStore for SegmentStore {
         })
     }
 
+    fn max_timestamp_offset(
+        &self,
+        topic: TopicId,
+        partition: i32,
+    ) -> StoreResult<Option<(i64, i64)>> {
+        // The greatest timestamp can sit in any batch, so walk headers and read only the winner.
+        // That walk covers every segment with no index to shorten it, so it runs outside the
+        // shard lock: only the committed extent of the active segment needs the lock, and
+        // holding it for a whole-partition scan would stall every appender in the shard,
+        // including a `kafgres_produce()` inside a business transaction. The snapshot is a
+        // point-in-time answer: a segment rolled after it is not read, and a file reclaimed
+        // meanwhile is skipped, as elsewhere.
+        let bases_on_disk = Self::segment_bases(topic, partition)?;
+        let (active_base, active_bytes) =
+            Self::with_slot(topic, partition, |st, _| Ok((st.active_base, st.active_bytes)))?;
+        {
+            let mut bases = bases_on_disk;
+            bases.sort_unstable();
+
+            // Pass one: find the winning batch from headers alone, without reading bodies.
+            struct Winner {
+                max_ts: i64,
+                seg_base: i64,
+                pos: u64,
+                len: u64,
+            }
+            let mut best: Option<Winner> = None;
+
+            for base in bases {
+                if base > active_base {
+                    break;
+                }
+                let path = data_path(&segment_path(topic, partition, base, "log"));
+                let vfd = match Vfd::open(&path, false) {
+                    Ok(v) => v,
+                    Err(_) => continue, // reclaimed while we looked
+                };
+                let data_end = if base == active_base {
+                    active_bytes
+                } else {
+                    vfd.size()?
+                };
+                let mut header = [0u8; records::RECORD_BATCH_OVERHEAD];
+                let mut pos = 0u64;
+                while pos + header.len() as u64 <= data_end {
+                    if vfd.read_at(&mut header, pos)? != header.len() {
+                        break;
+                    }
+                    let length = i32::from_be_bytes(
+                        header[records::LENGTH_OFFSET..records::LENGTH_OFFSET + 4]
+                            .try_into()
+                            .expect("4 bytes"),
+                    );
+                    if length <= 0 {
+                        break;
+                    }
+                    let total = records::LENGTH_OFFSET as u64 + 4 + length as u64;
+                    // `total` comes from the file and pass two allocates exactly this size; a
+                    // torn page yields a garbled length, so requiring the batch to fit the
+                    // committed region bounds the allocation.
+                    if pos + total > data_end {
+                        break;
+                    }
+                    let max_ts = i64::from_be_bytes(
+                        header[records::MAX_TIMESTAMP_OFFSET..records::MAX_TIMESTAMP_OFFSET + 8]
+                            .try_into()
+                            .expect("8 bytes"),
+                    );
+                    // Strictly greater: a tie keeps the earlier batch, matching Kafka.
+                    let better = match &best {
+                        Some(w) => max_ts > w.max_ts,
+                        None => true,
+                    };
+                    if better {
+                        best = Some(Winner {
+                            max_ts,
+                            seg_base: base,
+                            pos,
+                            len: total,
+                        });
+                    }
+                    pos += total;
+                }
+            }
+
+            // Pass two: read just that batch and find which record carried the timestamp.
+            let Some(w) = best else { return Ok(None) };
+            let path = data_path(&segment_path(topic, partition, w.seg_base, "log"));
+
+            // Pass one proved the partition is not empty, so `Ok(None)` here would report an
+            // empty log; only an unlinked file is benign, the winner having been reclaimed.
+            let vfd = match Vfd::open(&path, false) {
+                Ok(v) => v,
+                Err(_) if !path.exists() => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let mut body = vec![0u8; w.len as usize];
+            if vfd.read_at(&mut body, w.pos)? != body.len() {
+                return Err(StoreError::Io(format!(
+                    "short read of the max-timestamp batch at {}+{} in {}",
+                    w.pos,
+                    w.len,
+                    path.display()
+                )));
+            }
+            Ok(super::offset_of_max_timestamp(kafgres_codec::bytes::Bytes::from(body)))
+        }
+    }
+
     fn high_watermark(&self, topic: TopicId, partition: i32) -> StoreResult<i64> {
         Self::with_slot(topic, partition, |st, _| Ok(st.next_offset))
     }
@@ -1432,7 +1685,7 @@ impl LogStore for SegmentStore {
     }
 
     fn log_dir(&self) -> String {
-        data_path(&PathBuf::from(LOG_DIR)).to_string_lossy().into_owned()
+        log_root().to_string_lossy().into_owned()
     }
 
     /// `unlink`, never a record-by-record delete: whole sealed segments only, never the active
@@ -1619,7 +1872,7 @@ impl LogStore for SegmentStore {
             }
         }
         // And the topic directory once its last partition is gone; `remove_dir` failing with
-        let _ = std::fs::remove_dir(data_path(&PathBuf::from(LOG_DIR).join(topic.to_string())));
+        let _ = std::fs::remove_dir(log_root().join(topic.to_string()));
 
         // Free the shared slot, or the partition keeps its append position across a
         {
@@ -1633,7 +1886,35 @@ impl LogStore for SegmentStore {
         if let Some(map) = HINTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             map.remove(&(topic, partition));
         }
+        evict_active(topic, partition);
         Ok(())
+    }
+
+    fn sync_partition(&mut self, topic: TopicId, partition: i32) -> StoreResult<()> {
+        // The slot is read under the shard lock and released before the fsync: holding it
+        // across a device flush would stall every other appender, including a
+        // `kafgres_produce()` in a business transaction.
+        //
+        // Read, never allocated: this runs after retention and topic deletion in the same
+        // pass, and a partition appended to and then dropped has no slot. Taking one through
+        // `with_slot` would recover it from an empty directory, and `with_active` would then
+        // recreate the directory and an empty segment, leaving a partition that holds a slot
+        // nothing frees. A slot never appended to has nothing to sync either; the segment
+        // before it was synced when it rolled.
+        let Some((base, generation, bytes)) = Self::slot_snapshot(topic, partition) else {
+            return Ok(());
+        };
+        if bytes == 0 {
+            return Ok(());
+        }
+        with_active(topic, partition, base, generation, |a| {
+            // Hand the tail to writeback first, as the roll path does.
+            a.log
+                .writeback(a.writeback_from, bytes.saturating_sub(a.writeback_from));
+            a.log.sync();
+            a.writeback_from = bytes;
+            Ok(())
+        })
     }
 
     fn leader_epoch(&self, topic: TopicId, partition: i32) -> StoreResult<i32> {
@@ -1697,6 +1978,9 @@ impl LogStore for SegmentStore {
                 return Ok(0); // Nothing above it; not divergence.
             }
             let removed = st.next_offset - offset;
+
+            // Whether any segment survived far enough to be cut in place.
+            let mut truncated_in_place = false;
 
             for base in bases.iter().rev() {
                 if *base >= offset {
@@ -1773,7 +2057,22 @@ impl LogStore for SegmentStore {
                 hints.remove(base);
                 st.active_base = *base;
                 st.active_bytes = cut;
+                // A truncation is a byte-layout change, so it takes the same generation bump a
+                // compaction rewrite takes: other processes hold hints past the cut, and this
+                // process holds open descriptors for the index files removed just above.
+                st.layout_generation = st.layout_generation.wrapping_add(1);
+                truncated_in_place = true;
                 break;
+            }
+
+            if !truncated_in_place {
+                // Every base was at or above the cut, so the loop unlinked all of them. Without
+                // this the next append writes into a zero-filled prefix the first scan stops
+                // on, or into the unlinked inode this process still holds open.
+                st.active_base = offset;
+                st.active_bytes = 0;
+                st.max_timestamp_so_far = i64::MIN;
+                st.layout_generation = st.layout_generation.wrapping_add(1);
             }
 
             st.next_offset = offset;
@@ -1889,8 +2188,147 @@ impl SegmentStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
 mod tests {
+    // The name is load-bearing: `#[pg_schema]` makes it a SQL schema and pgrx calls each test
+    // as `tests.<fn>()`, so the plain unit tests above are `slot_tests`. It also cannot start
+    // with `pg_`, which Postgres reserves: `CREATE EXTENSION kafgres` then fails (42939)
+    // and every `#[pg_test]` in the crate fails in the harness.
+    use pgrx::prelude::*;
+
+    use crate::storage::RawBatch;
+    use kafgres_codec::records::{build_batch, NewRecord};
+
+    fn raw(value: &[u8]) -> RawBatch {
+        let bytes = build_batch(&[NewRecord {
+            key: None,
+            value: Some(value.to_vec()),
+            timestamp: 0,
+        }]);
+        RawBatch {
+            bytes: bytes.to_vec(),
+            record_count: 1,
+            last_offset_delta: 0,
+            max_timestamp: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            is_transactional: false,
+            is_control: false,
+        }
+    }
+
+    /// Truncating to at or below the partition's first base removes every segment, so the loop
+    /// never reaches the in-place branch that resets the slot; its only caller is the follower worker.
+    #[pg_test]
+    fn pg_a_full_truncation_leaves_the_partition_writable() {
+        crate::ensure_tables_exist();
+        let created = crate::meta::create_topic("trunc-regression", 1, &[])
+            .expect("topic creation failed");
+        let topic = created.topic_id;
+
+        let mut store = crate::storage::open();
+        store.append(topic, 0, raw(b"before"), None).expect("first append failed");
+
+        // Everything this node holds is divergent: the cut is at the partition's first base.
+        store.truncate_to(topic, 0, 0).expect("truncation failed");
+
+        let base = store
+            .append(topic, 0, raw(b"after"), None)
+            .expect("append after a full truncation failed");
+        assert_eq!(base, 0, "the refilled partition must restart at the cut");
+
+        let slice = store
+            .read(topic, 0, 0, 1 << 20, crate::storage::IsolationLevel::ReadUncommitted)
+            .expect("read failed");
+        assert!(
+            !slice.bytes.is_empty(),
+            "the partition read back empty after a full truncation and a re-append. The \
+             slot still described the segment the truncation deleted, so the append either \
+             wrote past a zero-filled hole that the first scan stops on, or into the \
+             unlinked inode this process still held open."
+        );
+        assert_eq!(
+            slice.next_offset, 1,
+            "one record was appended after the cut, so the next offset is 1"
+        );
+    }
+
+    /// A transaction-V2 producer never sends AddPartitionsToTxn, so the first transactional
+    /// append is what begins the transaction. `register_txn_partition` is that append's bookkeeping.
+    #[pg_test]
+    fn pg_a_transactional_append_begins_the_transaction() {
+        crate::ensure_tables_exist();
+        let created = crate::meta::create_topic("txn-register", 1, &[])
+            .expect("topic creation failed");
+        let topic = created.topic_id;
+
+        Spi::run_with_args(
+            "INSERT INTO kafgres_producers (producer_id, producer_epoch, transactional_id)
+             VALUES (424242, 0, 'pg-register')",
+            &[],
+        )
+        .expect("producer insert failed");
+        Spi::run_with_args(
+            "INSERT INTO kafgres_txns
+                    (producer_id, producer_epoch, transactional_id, state, started_at)
+             VALUES (424242, 0, 'pg-register', 'empty', 1)",
+            &[],
+        )
+        .expect("txn insert failed");
+
+        crate::storage::pmeta::register_txn_partition(424242, 0, topic, 0, 7)
+            .expect("register failed");
+        let state: String = Spi::get_one(
+            "SELECT (SELECT state FROM kafgres_txns WHERE producer_id = 424242)",
+        )
+        .expect("state query failed")
+        .expect("txn row missing");
+        assert_eq!(state, "ongoing", "the append must begin an empty transaction");
+        let first: i64 = Spi::get_one(
+            "SELECT (SELECT first_offset FROM kafgres_txn_partitions
+                      WHERE producer_id = 424242)",
+        )
+        .expect("first offset query failed")
+        .expect("partition row missing");
+        assert_eq!(first, 7);
+
+        // A later batch in the same transaction keeps the first batch's offset.
+        crate::storage::pmeta::register_txn_partition(424242, 0, topic, 0, 9)
+            .expect("second register failed");
+        let first: i64 = Spi::get_one(
+            "SELECT (SELECT first_offset FROM kafgres_txn_partitions
+                      WHERE producer_id = 424242)",
+        )
+        .expect("first offset query failed")
+        .expect("partition row missing");
+        assert_eq!(first, 7);
+
+        // The next transaction, after the previous one finished, begins fresh: the finished
+        // transaction's partition rows must not feed this one's marker write or LSO.
+        Spi::run("UPDATE kafgres_txns SET state = 'committed' WHERE producer_id = 424242")
+            .expect("state update failed");
+        crate::storage::pmeta::register_txn_partition(424242, 1, topic, 0, 11)
+            .expect("third register failed");
+        let state: String = Spi::get_one(
+            "SELECT (SELECT state FROM kafgres_txns WHERE producer_id = 424242)",
+        )
+        .expect("state query failed")
+        .expect("txn row missing");
+        assert_eq!(state, "ongoing");
+        let first: i64 = Spi::get_one(
+            "SELECT (SELECT first_offset FROM kafgres_txn_partitions
+                      WHERE producer_id = 424242)",
+        )
+        .expect("first offset query failed")
+        .expect("partition row missing");
+        assert_eq!(first, 11);
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
     use super::*;
 
     /// A seed read before a promotion must never override the epoch that promotion published

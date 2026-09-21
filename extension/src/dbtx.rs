@@ -63,9 +63,14 @@ pub fn atomically<T, E>(
 }
 
 fn with_subtransaction<T>(f: impl FnOnce() -> Result<T, HandlerError>) -> Result<T, HandlerError> {
-    atomically(f, |_| {
-        HandlerError::Internal("query aborted (lock or statement timeout)".to_string())
-    })
+    atomically(f, |message| HandlerError::Internal(format!("query aborted: {message}")))
+}
+
+/// Let this transaction's commit return without waiting for its WAL to reach the disk:
+/// `synchronous_commit = off` lets the WAL writer batch many transactions into one flush.
+/// Scoped `SET LOCAL`, so it dies with the transaction and cannot leak into a caller's transaction.
+pub fn relax_commit_durability() -> Result<(), pgrx::spi::Error> {
+    pgrx::Spi::run("SET LOCAL synchronous_commit = off")
 }
 
 /// For a request path that touches no kafgres table: timeouts and containment, no locks.

@@ -108,6 +108,8 @@ pub enum ErrorCode {
     SaslAuthenticationFailed = 58,
     UnknownProducerId = 59,
     ReassignmentInProgress = 60,
+    /// Kafka returns this for every token RPC when `delegation.token.secret.key` is unset.
+    DelegationTokenAuthDisabled = 61,
     /// The group has members. Kafka refuses to delete a live group rather than
     NonEmptyGroup = 68,
     GroupIdNotFound = 69,
@@ -119,13 +121,24 @@ pub enum ErrorCode {
     GroupMaxSizeReached = 81,
     /// The preferred replica is already the leader, so there is nothing to elect.
     ElectionNotNeeded = 84,
+    /// Cancel of a reassignment that was not in flight: replication is Postgres's here, so
+    /// none ever is. The reassign tool keys its output on this code.
+    NoReassignmentInProgress = 85,
     /// The group still has members, so its committed offsets are in use. Kafka scopes this
     GroupSubscribedToTopic = 86,
     /// Terminal, unlike `CorruptMessage`. Upstream returns this for a batch that is
     InvalidRecord = 87,
+    /// The committed offset is staged in a transaction that has not ended, so it may still
+    /// be retracted. `OffsetFetch` returns this to callers that asked for stable offsets.
+    UnstableOffsetCommit = 88,
+    /// A newer producer instance took over this transactional id. Unlike
+    /// `InvalidProducerEpoch`, clients treat this as fatal rather than re-initialisable.
+    ProducerFenced = 90,
     /// The named resource does not exist — used by `DescribeUserScramCredentials` for a
     ResourceNotFound = 91,
     UnacceptableCredential = 93,
+    /// UpdateFeatures could not apply a change; there are no finalized features to move.
+    FeatureUpdateFailed = 96,
     UnknownTopicId = 100,
     /// `DescribeTransactions` for a transactional id this broker has no state for. The
     TransactionalIdNotFound = 105,
@@ -136,6 +149,9 @@ pub enum ErrorCode {
     InvalidRecordState = 121,
     ShareSessionNotFound = 122,
     InvalidShareSessionEpoch = 123,
+    /// A client-supplied regular expression failed to compile, as used by
+    /// `ListTransactions` patterns and KIP-848 topic subscription.
+    InvalidRegularExpression = 128,
     ShareSessionLimitReached = 133,
 }
 
@@ -165,6 +181,7 @@ impl ErrorCode {
                 | ErrorCode::FencedLeaderEpoch
                 | ErrorCode::UnknownLeaderEpoch
                 | ErrorCode::OffsetNotAvailable
+                | ErrorCode::UnstableOffsetCommit
                 | ErrorCode::UnknownTopicId
         )
     }

@@ -12,20 +12,37 @@ import pytest
 BROKER = "127.0.0.1:9092"
 CLIENTS = "kafgres-clients"
 
-def sql(q, timeout=60):
+def sql(q, timeout=60, required=True):
+    """Run a statement against the broker's database.
+
+    `required=False` is for the polling loops below, which expect psql to fail while the
+    container is coming back. Everywhere else a failure raises, because this helper used
+    to return "" for a failed query and `restore_engine` fed that straight back into
+    `ALTER SYSTEM SET kafgres.storage_engine`. That writes an empty value, after which the
+    broker refuses to start with `unknown kafgres.storage_engine ""` and *every remaining
+    test in the session* fails on a fixture that cannot create a topic. The failure is
+    silent here and surfaces hundreds of tests later, in files that have nothing to do
+    with engine switching.
+    """
     out = subprocess.run(
         ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-tAc", q],
         capture_output=True, text=True, timeout=timeout,
     )
+    if out.returncode != 0:
+        if not required:
+            return ""
+        raise RuntimeError(f"psql failed for {q!r}: {out.stderr.strip()}")
     return out.stdout.strip()
 
 def set_engine(engine, mismatch_ok=False):
+    # Never write an engine the broker cannot parse.
+    assert engine in ("table", "segment"), f"refusing to set storage_engine to {engine!r}"
     sql(f"ALTER SYSTEM SET kafgres.storage_engine='{engine}'")
     sql(f"ALTER SYSTEM SET kafgres.allow_engine_mismatch={'on' if mismatch_ok else 'off'}")
     subprocess.run(["docker", "compose", "up", "-d", "--force-recreate"],
                    capture_output=True, timeout=300)
     for _ in range(40):
-        if sql("SELECT 1") == "1":
+        if sql("SELECT 1", required=False) == "1":
             return
         time.sleep(2)
     raise AssertionError("postgres did not come back")
@@ -46,7 +63,7 @@ def wipe_both_logs():
     subprocess.run(["docker", "compose", "up", "-d", "--force-recreate"],
                    capture_output=True, timeout=300)
     for _ in range(40):
-        if sql("SELECT 1") == "1":
+        if sql("SELECT 1", required=False) == "1":
             break
         time.sleep(2)
     sql("DELETE FROM kafgres_log")
@@ -109,6 +126,7 @@ def broker_error():
 def test_a_log_under_both_engines_is_described_as_such(restore_engine):
     """The advice has to be right in the state the escape hatch creates."""
     set_engine("table")
+    sql("SELECT kafgres_drop_topic('both-a')")
     sql("SELECT kafgres_create_topic('both-a', 1)")
     subprocess.run(["docker", "run", "--rm", "--network", "host", "-i", CLIENTS,
                     "kcat", "-b", BROKER, "-t", "both-a", "-P"],
@@ -116,6 +134,7 @@ def test_a_log_under_both_engines_is_described_as_such(restore_engine):
 
     set_engine("segment", mismatch_ok=True)
     assert broker_reachable(), "the override did not let the broker start"
+    sql("SELECT kafgres_drop_topic('both-b')")
     sql("SELECT kafgres_create_topic('both-b', 1)")
     subprocess.run(["docker", "run", "--rm", "--network", "host", "-i", CLIENTS,
                     "kcat", "-b", BROKER, "-t", "both-b", "-P"],

@@ -210,23 +210,43 @@ pub fn join(
         ],
     )?;
 
+    // The window opens only when the group forms from Empty; a Stable group's rebalance has nothing to batch.
+    let delay = crate::group_initial_rebalance_delay_ms();
     if g.state != GroupState::PreparingRebalance {
+        let opens_window = delay > 0 && g.state == GroupState::Empty;
         Spi::run_with_args(
             "UPDATE kafgres_groups
                 SET state = 'PreparingRebalance',
                     protocol_type = COALESCE(NULLIF($2, ''), protocol_type),
                     rebalance_deadline = now() + ($3::int || ' milliseconds')::interval,
+                    /* Capped by the same rebalance timeout that sets the deadline below. */
+                    join_window_until = CASE WHEN $4
+                        THEN now() + (LEAST($5::int, $3::int) || ' milliseconds')::interval
+                        ELSE NULL END,
                     updated_at = now()
               WHERE group_id = $1",
             &[
                 group_id.into(),
                 protocol_type.into(),
                 clamp_rebalance_timeout(rebalance_timeout_ms).into(),
+                opens_window.into(),
+                delay.into(),
             ],
         )?;
         Spi::run_with_args(
             "UPDATE kafgres_group_members SET assignment = NULL WHERE group_id = $1",
             &[group_id.into()],
+        )?;
+    } else if delay > 0 {
+        // Extend, so a run of arrivals is batched by the gap between them. `LEAST` against
+        // the rebalance deadline keeps the window from outliving it.
+        Spi::run_with_args(
+            "UPDATE kafgres_groups
+                SET join_window_until =
+                        LEAST(now() + ($2::int || ' milliseconds')::interval, rebalance_deadline),
+                    updated_at = now()
+              WHERE group_id = $1 AND join_window_until IS NOT NULL",
+            &[group_id.into(), delay.into()],
         )?;
     }
     Ok(())
@@ -234,13 +254,17 @@ pub fn join(
 
 pub fn join_window_closed(group_id: &str) -> Result<bool, spi::Error> {
     let ready: bool = Spi::get_one_with_args(
-        "SELECT COALESCE(
-                  (SELECT count(*) = 0
-                     FROM kafgres_group_members m
-                     JOIN kafgres_groups g USING (group_id)
-                    WHERE m.group_id = $1
-                      AND m.joined_generation <= g.generation),
-                  true)
+        "SELECT (COALESCE(
+                   (SELECT count(*) = 0
+                      FROM kafgres_group_members m
+                      JOIN kafgres_groups g USING (group_id)
+                     WHERE m.group_id = $1
+                       AND m.joined_generation <= g.generation),
+                   true)
+                 AND COALESCE(
+                   (SELECT join_window_until IS NULL OR now() >= join_window_until
+                      FROM kafgres_groups WHERE group_id = $1),
+                   true))
              OR COALESCE((SELECT rebalance_deadline < now() FROM kafgres_groups WHERE group_id = $1), false)",
         &[group_id.into()],
     )?
@@ -262,7 +286,8 @@ pub fn complete_join(group_id: &str) -> Result<Result<Group, NoCommonProtocol>, 
         Spi::run_with_args(
             "UPDATE kafgres_groups
                 SET state = 'Empty', leader_member = NULL, protocol_name = NULL,
-                    generation = generation + 1, rebalance_deadline = NULL, updated_at = now()
+                    generation = generation + 1, rebalance_deadline = NULL,
+                    join_window_until = NULL, updated_at = now()
               WHERE group_id = $1",
             &[group_id.into()],
         )?;
@@ -288,6 +313,7 @@ pub fn complete_join(group_id: &str) -> Result<Result<Group, NoCommonProtocol>, 
                 protocol_name = $2,
                 leader_member = $3,
                 rebalance_deadline = NULL,
+                join_window_until = NULL,
                 updated_at = now()
           WHERE group_id = $1",
         &[group_id.into(), protocol.into(), leader.into()],
@@ -350,6 +376,7 @@ pub fn open_rebalance(group_id: &str) -> Result<(), spi::Error> {
                 rebalance_deadline = now() + (
                     COALESCE((SELECT max(rebalance_timeout_ms) FROM kafgres_group_members
                                WHERE group_id = $1), 60000) || ' milliseconds')::interval,
+                join_window_until = NULL,
                 updated_at = now()
           WHERE g.group_id = $1",
         &[group_id.into()],
@@ -466,11 +493,14 @@ pub fn sweep() -> Result<Vec<String>, spi::Error> {
     Ok(changed)
 }
 
+/// Groups whose parked `JoinGroup` requests should be looked at again: waking re-runs
+/// `join_window_closed`, which decides. Nothing else fires when a join window elapses.
 pub fn groups_past_deadline() -> Result<Vec<String>, spi::Error> {
     Spi::connect(|client| {
         let rows = client.select(
             "SELECT group_id FROM kafgres_groups
-              WHERE state = 'PreparingRebalance' AND rebalance_deadline < now()",
+              WHERE state = 'PreparingRebalance'
+                AND (rebalance_deadline < now() OR join_window_until < now())",
             None,
             &[],
         )?;

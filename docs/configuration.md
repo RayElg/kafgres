@@ -33,6 +33,7 @@ restart does.
 | `kafgres.segment_bytes` | reload | `64 MiB` | Bytes a segment file reaches before rolling. |
 | `kafgres.segment_offsets` | reload | `1000000` | Offsets per log segment, which is the retention granularity. Set before a partition has data: changing it later makes segment ranges overlap. |
 | `kafgres.segment_lock_stripes` | restart | `16` | Lock shards for segment-engine append positions; `1` makes every partition share one lock. Narrowing also narrows capacity. |
+| `kafgres.log_directory` | restart | empty | Directory holding the segment log. Empty means `$PGDATA/kafgres`; a relative path is under `$PGDATA`. Put it on a device other than the WAL's: with both on one device the database's commit flush queues behind the log's writeback. Measured on one box, a co-resident pgbench lost 27% at 500 MB/s of produce with a shared device and 11% with the log on its own, and 9% against nothing at 100 MB/s. A directory outside `$PGDATA` is not carried by `pg_basebackup`: seed a standby's copy yourself, or the follower starts from an empty log. |
 | `kafgres.segment_archive_command` | reload | empty | Shell command shipping one rolled segment to an archive; `%p` is its path, `%f` its filename. Empty disables archiving. Setting it makes retention wait for the archive. |
 | `kafgres.archive_interval_ms` | reload | `10000` | How often the archiver ships sealed segments; `0` disables it. |
 | `kafgres.replicate_from` | reload | empty | `host:port` of the leader to pull log from on a standby; empty disables it. |
@@ -63,6 +64,15 @@ restart does.
 | Setting | Reload | Default | Description |
 |---|---|---|---|
 | `kafgres.max_request_bytes` | reload | `32 MiB` | Largest inbound request frame, as Kafka's `socket.request.max.bytes`. A bounded number of connections may exceed the 8 MiB free tier at a time. |
+| `kafgres.transaction_version` | reload | `2` | Kafka's `transaction.version` feature level, reported in `ApiVersions` and matching what a stock 4.x cluster finalizes. At `2`, `EndTxn` v5 hands the producer a fresh epoch with the result, so its next transaction needs no `InitProducerId` (KIP-890). Set `1` to keep the pre-KIP-890 behaviour. |
+| `kafgres.fsync_before_ack` | reload | `off` | Make record bytes durable before the produce response leaves the broker (segment engine). Without it the log is fsynced only when a segment rolls, so `acks=all` returns while the records are still in the page cache: they survive `kill -9` but not a power cut. The fsync is per produce pass, not per request, so a pipelining client amortises one flush across everything in flight. No effect on the table engine, whose records are Postgres rows made durable by the commit. |
+| `kafgres.relaxed_produce_commit` | reload | `on` | Let a wire-protocol produce commit without waiting for its WAL flush (segment engine, non-transactional only). Acknowledged records already live in the page cache rather than on the platter, so a synchronous WAL flush of the metadata about them buys durability the records themselves do not have, at one device barrier per request; with it on, that metadata rides the WAL writer's next flush. The cost: after an OS or power failure the idempotent-producer window may be missing its newest entries, so a retried in-flight batch can land twice — at-least-once instead of exactly-once across an unclean shutdown. Never applies to transactional produce, to `kafgres_produce()`, or to the table engine. |
 | `kafgres.producer_id_expiration_ms` | reload | `86400000` (24 h) | Drop idempotent-producer state idle this long; `0` disables expiration. |
 | `kafgres.max_producer_ids` | reload | `10000` | Ceiling on retained producer ids; the least recently used are dropped first, `0` disables. |
 | `kafgres.share_record_lock_duration_ms` | reload | `30000` | How long a share-group consumer holds an acquired record before it is offered again. |
+
+## Consumer groups
+
+| Setting | Reload | Default | Description |
+|---|---|---|---|
+| `kafgres.group_initial_rebalance_delay_ms` | reload | `500` | How long a forming consumer group holds its join window open before cutting a generation. A cold group would otherwise close it as soon as every member it knows about has rejoined — one member when the group is empty — so its peers arrive into an already-cut generation and pay another round. Holding the window open batches simultaneous arrivals into a single round; each new member extends it, capped by the group's rebalance timeout. `0` disables the wait. |

@@ -42,13 +42,18 @@ pub fn increment_sequence(sequence: i32, increment: i32) -> i32 {
 /// Allocate a producer id. A plain idempotent producer gets a fresh id and epoch 0 every
 pub fn init_producer_id(transactional_id: Option<&str>) -> Result<(i64, i16), spi::Error> {
     if let Some(txn_id) = transactional_id {
-        // Bump the epoch so any older instance of the same transactional id is fenced.
+        // Bump the epoch so any older instance of the same transactional id is fenced. The
+        // retired pair goes with it: a retried EndTxn from that instance must be fenced too,
+        // not answered NONE with the epoch this new instance now owns.
         let row: Option<String> = Spi::get_one_with_args(
             "WITH up AS (
                  INSERT INTO kafgres_producers (producer_id, producer_epoch, transactional_id)
                  VALUES (nextval('kafgres_producer_id_seq'), 0, $1)
                  ON CONFLICT (transactional_id) DO UPDATE
                     SET producer_epoch = kafgres_producers.producer_epoch + 1,
+                        retired_producer_id = NULL,
+                        retired_epoch = NULL,
+                        retired_committed = NULL,
                         last_ts = now()
                  RETURNING producer_id, producer_epoch)
              SELECT (SELECT producer_id || '|' || producer_epoch FROM up)",
@@ -71,6 +76,71 @@ pub fn init_producer_id(transactional_id: Option<&str>) -> Result<(i64, i16), sp
     Ok((id, 0))
 }
 
+/// KIP-890 part two: bump the epoch as part of ending a transaction and return the new
+/// pair. At the epoch ceiling the transactional id moves to a fresh producer id.
+pub fn bump_epoch_for_next_txn(producer_id: i64, committed: bool) -> Result<(i64, i16), spi::Error> {
+    // One below `i16::MAX`: `producer_epoch` is a `smallint` and the other bump sites add 1 unguarded.
+    const EPOCH_CEILING: i32 = i16::MAX as i32 - 1;
+
+    // The retired pair is recorded so a retried EndTxn is seen as a retry, not a zombie.
+    let bumped: Option<i32> = Spi::get_one_with_args(
+        "WITH up AS (
+             UPDATE kafgres_producers
+                SET retired_producer_id = producer_id,
+                    retired_epoch = producer_epoch,
+                    retired_committed = $3,
+                    producer_epoch = producer_epoch + 1,
+                    last_ts = now()
+              WHERE producer_id = $1 AND producer_epoch < $2
+          RETURNING producer_epoch)
+         SELECT (SELECT producer_epoch FROM up)",
+        &[producer_id.into(), EPOCH_CEILING.into(), committed.into()],
+    )?;
+    if let Some(e) = bumped {
+        return Ok((producer_id, e as i16));
+    }
+
+    // Here the epoch hit the ceiling or the row is gone: move the transactional id to a
+    // fresh producer id at epoch 0. No row returns epoch -1 (caller already fenced).
+    //
+    // The transaction row moves with it: it has no foreign key, and left under the old id
+    // the producer's next append would find nothing to register against and its next
+    // EndTxn nothing to end. The old id's deduplication window is dropped rather than moved —
+    // sequences restart at zero with the epoch — and the sweep would never see it again
+    // once the producer row is gone.
+    let moved: Option<String> = Spi::get_one_with_args(
+        "WITH old AS (
+             DELETE FROM kafgres_producers WHERE producer_id = $1
+          RETURNING producer_id, transactional_id, producer_epoch),
+         fresh AS (
+             INSERT INTO kafgres_producers
+                    (producer_id, producer_epoch, transactional_id,
+                     retired_producer_id, retired_epoch, retired_committed)
+             SELECT nextval('kafgres_producer_id_seq'), 0, transactional_id,
+                    producer_id, producer_epoch, $2
+               FROM old
+          RETURNING producer_id, producer_epoch),
+         txn AS (
+             UPDATE kafgres_txns t
+                SET producer_id = fresh.producer_id, producer_epoch = 0
+               FROM fresh
+              WHERE t.producer_id = $1
+          RETURNING 1),
+         window AS (
+             DELETE FROM kafgres_producer_batches WHERE producer_id = $1
+          RETURNING 1)
+         SELECT (SELECT producer_id || '|' || producer_epoch FROM fresh)",
+        &[producer_id.into(), committed.into()],
+    )?;
+    let Some(s) = moved else {
+        return Ok((producer_id, -1));
+    };
+    let mut it = s.split('|');
+    let id = it.next().and_then(|x| x.parse().ok()).unwrap_or(producer_id);
+    let epoch = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    Ok((id, epoch))
+}
+
 struct Retained {
     epoch: i16,
     first_seq: i32,
@@ -80,26 +150,25 @@ struct Retained {
 
 /// The window in **insertion order**, oldest first. Ordering by `last_seq` is not
 fn window(producer_id: i64, topic_id: u32, partition: i32) -> Result<Vec<Retained>, spi::Error> {
-    Spi::connect(|client| {
-        let rows = client.select(
-            "SELECT producer_epoch, first_seq, last_seq, base_offset
-               FROM kafgres_producer_batches
-              WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3
-              ORDER BY added_seq",
-            None,
-            &[producer_id.into(), (topic_id as i32).into(), partition.into()],
-        )?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(Retained {
-                epoch: row.get::<i32>(1)?.unwrap_or(0) as i16,
-                first_seq: row.get::<i32>(2)?.unwrap_or(NO_SEQUENCE),
-                last_seq: row.get::<i32>(3)?.unwrap_or(NO_SEQUENCE),
-                base_offset: row.get::<i64>(4)?.unwrap_or(-1),
-            });
-        }
-        Ok(out)
-    })
+    crate::plan::select(
+        "SELECT producer_epoch, first_seq, last_seq, base_offset
+           FROM kafgres_producer_batches
+          WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3
+          ORDER BY added_seq",
+        &[producer_id.into(), (topic_id as i32).into(), partition.into()],
+        |rows| {
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(Retained {
+                    epoch: row.get::<i32>(1)?.unwrap_or(0) as i16,
+                    first_seq: row.get::<i32>(2)?.unwrap_or(NO_SEQUENCE),
+                    last_seq: row.get::<i32>(3)?.unwrap_or(NO_SEQUENCE),
+                    base_offset: row.get::<i64>(4)?.unwrap_or(-1),
+                });
+            }
+            Ok(out)
+        },
+    )
 }
 
 /// Upstream's `inSequence`, including the wraparound: a long-lived producer really does
@@ -176,7 +245,7 @@ pub fn record(
     last_seq: i32,
     base_offset: i64,
 ) -> Result<(), spi::Error> {
-    Spi::run_with_args(
+    crate::plan::run(
         "INSERT INTO kafgres_producer_batches
             (producer_id, topic_id, partition, producer_epoch, first_seq, last_seq, base_offset)
          VALUES ($1, $2::oid, $3, $4, $5, $6, $7)
@@ -201,7 +270,7 @@ pub fn record(
     )?;
 
     // Keep the newest `RETAINED_BATCHES` **by insertion order**. `ORDER BY last_seq DESC`
-    Spi::run_with_args(
+    crate::plan::run(
         "DELETE FROM kafgres_producer_batches
           WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3
             AND added_seq NOT IN (
@@ -217,7 +286,7 @@ pub fn record(
     )?;
 
     // Keep `last_ts` roughly current without an UPDATE per batch: writes at most once per
-    Spi::run_with_args(
+    crate::plan::run(
         "UPDATE kafgres_producers
             SET last_ts = now()
           WHERE producer_id = $1

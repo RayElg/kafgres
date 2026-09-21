@@ -25,4 +25,4 @@ exec docker run --rm \
     `# on the extension build too.` \
     -e RUSTFLAGS="-Clink-arg=-Wl,--unresolved-symbols=ignore-all" \
     kafgres-pgrx-test \
-    sh -c 'mkdir -p "$CARGO_TARGET_DIR/test-pgdata" && cargo pgrx test pg16 '"${FILTER:+$FILTER}"
+    bash /src/scripts/pgrx-in-container.sh "${FILTER:-}"

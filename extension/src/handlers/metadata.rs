@@ -101,6 +101,14 @@ pub fn handle(
 
     for t in topics.iter_mut() {
         if let Some(name) = t.name.clone() {
+            // v8+, only when asked; unset means the broker did not check.
+            if req.include_topic_authorized_operations {
+                t.topic_authorized_operations = crate::acl::authorized_operations(
+                    authz,
+                    crate::acl::ResourceType::Topic,
+                    &name,
+                );
+            }
             if let Err(code) = authz.check(
                 crate::acl::Operation::Describe,
                 crate::acl::ResourceType::Topic,
@@ -181,7 +189,16 @@ pub fn handle(
         cluster_id: Some(cfg.cluster_id.clone()),
         controller_id: cfg.node_id,
         topics,
-        cluster_authorized_operations: AUTHORIZED_OPERATIONS_UNSET,
+        // v8-v10 only; the field was removed at v11, and the encoder drops it there.
+        cluster_authorized_operations: if req.include_cluster_authorized_operations {
+            crate::acl::authorized_operations(
+                authz,
+                crate::acl::ResourceType::Cluster,
+                "kafka-cluster",
+            )
+        } else {
+            AUTHORIZED_OPERATIONS_UNSET
+        },
         error_code: ErrorCode::None.code(),
         unknown_tagged_fields: Vec::new(),
     })

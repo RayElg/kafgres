@@ -29,8 +29,11 @@ mod init110;
 mod init120;
 mod init130;
 mod init140;
+mod init150;
+mod init160;
 pub mod quota;
 pub mod meta;
+pub mod plan;
 pub mod produce_sql;
 pub mod producer;
 pub mod replication;
@@ -53,6 +56,7 @@ static ADVERTISED_PORT: GucSetting<i32> = GucSetting::<i32>::new(0);
 static NODE_ID: GucSetting<i32> = GucSetting::<i32>::new(1);
 static CLUSTER_ID: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static TICK_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
+static GROUP_INITIAL_REBALANCE_DELAY_MS: GucSetting<i32> = GucSetting::<i32>::new(500);
 
 static STORAGE_ENGINE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"segment"));
@@ -66,8 +70,13 @@ static REPLICATE_FROM: GucSetting<Option<CString>> = GucSetting::<Option<CString
 static ALLOW_TXN_PRODUCE: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 static MAX_REQUEST_BYTES: GucSetting<i32> = GucSetting::<i32>::new(32 * 1024 * 1024);
+static TRANSACTION_VERSION: GucSetting<i32> = GucSetting::<i32>::new(2);
 
 static ALLOW_ENGINE_MISMATCH: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+static RELAXED_PRODUCE_COMMIT: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+static FSYNC_BEFORE_ACK: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 static AUTO_CREATE_TOPICS: GucSetting<bool> = GucSetting::<bool>::new(true);
 
@@ -81,6 +90,8 @@ static SHARE_LOCK_DURATION_MS: GucSetting<i32> = GucSetting::<i32>::new(30_000);
 
 static SEGMENT_ARCHIVE_COMMAND: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
+
+static LOG_DIRECTORY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
 static ARCHIVE_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(10_000);
 
@@ -156,6 +167,15 @@ pub fn cdc_snapshot_batch_rows() -> i32 {
 
 pub fn share_lock_duration_ms() -> i64 {
     SHARE_LOCK_DURATION_MS.get().max(1_000) as i64
+}
+
+/// Where the segment log lives: empty means `$PGDATA/kafgres`, a relative path is under
+/// `$PGDATA`. Postmaster scope — moving it under a running instance would split the log.
+pub fn log_directory() -> Option<String> {
+    LOG_DIRECTORY
+        .get()
+        .map(|c| c.to_string_lossy().trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn segment_archive_command() -> String {
@@ -239,6 +259,26 @@ pub fn max_request_bytes() -> usize {
     MAX_REQUEST_BYTES.get().max(0) as usize
 }
 
+/// Kafka's `transaction.version` finalized level; EndTxn v5 epoch rotation is gated on it.
+pub fn transaction_version() -> i32 {
+    TRANSACTION_VERSION.get()
+}
+
+pub fn fsync_before_ack() -> bool {
+    FSYNC_BEFORE_ACK.get()
+}
+
+pub fn relaxed_produce_commit() -> bool {
+    RELAXED_PRODUCE_COMMIT.get()
+}
+
+/// How long a group forming from `Empty` holds its join window open so members arriving
+/// together land in one generation. 0 restores the old behaviour; past the spread of arrivals
+/// it just becomes a floor on formation time.
+pub fn group_initial_rebalance_delay_ms() -> i32 {
+    GROUP_INITIAL_REBALANCE_DELAY_MS.get()
+}
+
 pub fn allow_engine_mismatch() -> bool {
     ALLOW_ENGINE_MISMATCH.get()
 }
@@ -312,6 +352,18 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::SUPERUSER_ONLY,
     );
     GucRegistry::define_int_guc(
+        c"kafgres.group_initial_rebalance_delay_ms",
+        c"How long a forming consumer group waits for more members before cutting a generation",
+        c"A cold group closes its join window as soon as every member it knows about has rejoined, which is one member when the group is empty; its peers then arrive into an already-cut generation and pay another round, which the members already holding assignments notice only at their next heartbeat. Holding the window open batches simultaneous arrivals into a single round. Each new member joining during the window extends it, capped by the group's rebalance timeout. 0 disables the wait; a value past the spread of arrivals just becomes a floor on formation time.",
+        &GROUP_INITIAL_REBALANCE_DELAY_MS,
+        0,
+        // Well under MAX_REBALANCE_TIMEOUT_MS: the window is capped by the rebalance
+        // deadline, so a delay equal to that timeout would stall every cold group's formation.
+        30_000,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
         c"kafgres.node_id",
         c"Broker node id reported in Metadata",
         c"",
@@ -359,6 +411,16 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
+        c"kafgres.transaction_version",
+        c"Kafka transaction.version feature level: 2 enables KIP-890 epoch rotation at EndTxn v5",
+        c"2 matches what a stock Kafka 4.x cluster finalizes; set 1 to keep the pre-KIP-890 behaviour",
+        &TRANSACTION_VERSION,
+        1,
+        2,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
         c"kafgres.max_request_bytes",
         c"Largest inbound request frame, as Kafka's socket.request.max.bytes. A bounded number of connections may exceed the 8 MiB free tier at a time",
         c"",
@@ -377,6 +439,22 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
     GucRegistry::define_bool_guc(
+        c"kafgres.fsync_before_ack",
+        c"Make record bytes durable before the produce response leaves the broker (segment engine)",
+        c"Without this the segment log is fsynced only when a segment rolls, so acks=all returns while the records are still in the page cache: they survive kill -9 but not a power cut. With it, the loop fsyncs every partition it appended to before releasing that pass's responses. The fsync is per pass, not per request, so a pipelining client amortises one device flush across everything in flight rather than paying one each. Costs throughput in proportion to how little the client pipelines. No effect on the table engine, whose records are Postgres rows made durable by the commit",
+        &FSYNC_BEFORE_ACK,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"kafgres.relaxed_produce_commit",
+        c"Let a wire-protocol produce commit without waiting for its WAL flush (segment engine, non-transactional only)",
+        c"The segment engine keeps records in files that are fsynced at segment roll, not per produce, so an acknowledged record already lives in the page cache rather than on the platter. Flushing the WAL synchronously for the *metadata* about those records buys durability the records themselves do not have, at the cost of one device barrier per request. With this on, that metadata rides the WAL writer's next flush instead. What it costs: after an OS or power failure the idempotent-producer window may be missing its newest entries, so an in-flight batch that is retried can land twice — at-least-once instead of exactly-once across an unclean shutdown. Off restores a flush per produce. Never applies to transactional produce, to kafgres_produce(), or to the table engine, where records are in Postgres and the flush is what makes them durable",
+        &RELAXED_PRODUCE_COMMIT,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
         c"kafgres.auto_create_topics",
         c"Create a topic the first time a client produces to or fetches from it, as Kafka's auto.create.topics.enable does",
         c"",
@@ -390,6 +468,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"",
         &ALLOW_TXN_PRODUCE,
         GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"kafgres.log_directory",
+        c"Directory holding the segment log (segment engine). Empty means $PGDATA/kafgres; a relative path is under $PGDATA. Put it on a device other than the WAL's: the database's commit flush otherwise queues behind the log's writeback",
+        c"",
+        &LOG_DIRECTORY,
+        GucContext::Postmaster,
         GucFlags::default(),
     );
     GucRegistry::define_string_guc(
@@ -774,6 +860,8 @@ pub(crate) fn ensure_tables_exist() {
     init120::init_120();
     init130::init_130();
     init140::init_140();
+    init150::init_150();
+    init160::init_160();
 }
 
 #[pg_extern]
@@ -850,7 +938,14 @@ pub unsafe extern "C-unwind" fn kafgres_follower_worker_main(_arg: pg_sys::Datum
     }
     log!("kafgres: follower starting, pulling log from {host}:{port}");
 
-    while BackgroundWorker::wait_latch(Some(Duration::from_millis(500))) {
+    let mut follower = replication::Follower::new(&host, port);
+    // A round that pulled something is followed at once by another. The Fetch long-polls
+    // on a quiet leader; the short delay covers a round with nothing to fetch. An
+    // unreachable leader gets a backoff.
+    let mut delay = Duration::ZERO;
+    let mut applied_since_log = 0i64;
+    let mut last_log = std::time::Instant::now();
+    while BackgroundWorker::wait_latch(Some(delay)) {
         if BackgroundWorker::sighup_received() {
             reload_config();
             if replicate_from().is_none() {
@@ -864,16 +959,32 @@ pub unsafe extern "C-unwind" fn kafgres_follower_worker_main(_arg: pg_sys::Datum
             return;
         }
 
-        // A subtransaction (`contained`) needs an xid and a standby cannot assign one —
-        let pulled = BackgroundWorker::transaction(|| {
-            replication::replicate_once_from(&host, port)
-        });
-        match pulled {
-            Ok(n) if n > 0 => log!("kafgres: follower applied {n} batch(es)"),
-            Ok(_) => {}
+        let still_following = || {
+            if BackgroundWorker::sigterm_received() {
+                return Err("stopping".to_string());
+            }
+            if unsafe { !pg_sys::RecoveryInProgress() } {
+                return Err("promoted".to_string());
+            }
+            Ok(())
+        };
+        match follower.round(still_following) {
+            Ok(n) if n > 0 => {
+                applied_since_log += n;
+                delay = Duration::ZERO;
+            }
+            Ok(_) => delay = Duration::from_millis(50),
             Err(e) => {
                 log!("kafgres: follower: {e}");
+                follower.disconnect();
+                delay = Duration::from_millis(500);
             }
+        }
+        // Logged once a second rather than per round; rounds are milliseconds long.
+        if applied_since_log > 0 && last_log.elapsed() >= Duration::from_secs(1) {
+            log!("kafgres: follower applied {applied_since_log} batch(es)");
+            applied_since_log = 0;
+            last_log = std::time::Instant::now();
         }
     }
 }

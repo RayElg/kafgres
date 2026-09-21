@@ -54,7 +54,7 @@ fn creation_outcome(
     // Its own savepoint: a partway failure folds into a per-topic error code, and the
     crate::dbtx::atomically(
         || meta::create_topic(&topic.name, partitions, &config),
-        |_| TopicError::Internal("create aborted (lock or statement timeout)".to_string()),
+        |message| TopicError::Internal(format!("create aborted: {message}")),
     )
 }
 
@@ -217,7 +217,7 @@ pub fn create_partitions(
         } else {
             crate::dbtx::atomically(
                 || meta::create_partitions(&topic.name, topic.count),
-                |_| TopicError::Internal("expand aborted (lock or statement timeout)".to_string()),
+                |message| TopicError::Internal(format!("expand aborted: {message}")),
             )
         };
 
