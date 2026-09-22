@@ -346,8 +346,18 @@ pub fn apply(store: &mut dyn crate::storage::LogStore, pulled: &[Pulled]) -> Res
     Ok(applied)
 }
 
+/// One follower round by hand, for a standby whose follower worker is not running.
+///
+/// Superuser-only and standby-only: a round truncates every partition to match
+/// the named leader, so on a primary it would discard the live log.
 #[pg_extern]
 fn kafgres_replicate_once(host: &str, port: i32) -> i64 {
+    if !unsafe { pgrx::pg_sys::superuser() } {
+        error!("kafgres: kafgres_replicate_once() is superuser-only; it rewrites the log to match the leader");
+    }
+    if !unsafe { pgrx::pg_sys::RecoveryInProgress() } {
+        error!("kafgres: kafgres_replicate_once() only runs on a standby; this node is a primary");
+    }
     let mut follower = Follower::new(host, port);
     match follower.round(|| Ok(())) {
         Ok(n) => n,

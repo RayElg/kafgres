@@ -344,6 +344,28 @@ pub fn register_txn_partition(
     Ok(())
 }
 
+/// Stamps the transaction's first offset in this partition. Only overwrites the `-1`
+/// placeholder, so a later batch of the same transaction leaves it alone.
+pub fn stamp_txn_partition(
+    producer_id: i64,
+    topic: TopicId,
+    partition: i32,
+    base_offset: i64,
+) -> StoreResult<()> {
+    Spi::run_with_args(
+        "UPDATE kafgres_txn_partitions SET first_offset = $4
+          WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3
+            AND first_offset < 0",
+        &[
+            producer_id.into(),
+            (topic as i32).into(),
+            partition.into(),
+            base_offset.into(),
+        ],
+    )
+    .map_err(spi_err)
+}
+
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
