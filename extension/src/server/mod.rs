@@ -85,6 +85,13 @@ const MAX_CONN_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// Bytes, across all connections, that may sit *above* the per-connection free tier: keeps
 const MAX_OVERSIZE_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 
+/// Bytes of inbound buffer across all connections, free tiers included. The oversize budget
+/// alone bounds only what sits above the tiers; the tiers themselves add up to
+/// `MAX_CONNECTIONS × MAX_CONN_BUFFER_BYTES` = 4 GiB, pinnable by opening every connection
+/// and leaving a frame one byte short on each. A failed allocation aborts the process, so
+/// the aggregate is capped too.
+const MAX_INBOUND_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+
 /// Connection ceiling, Kafka's `max.connections`: without it the per-connection buffer cap
 const MAX_CONNECTIONS: usize = 512;
 
@@ -463,6 +470,7 @@ fn poll_connections(srv: &mut Server, cfg: &ClusterConfig, ready: Option<&HashSe
         .values()
         .map(|c| c.inbuf.len().saturating_sub(tier))
         .sum();
+    let mut inbound_total: usize = srv.conns.values().map(|c| c.inbuf.len()).sum();
 
     for id in ids {
         if let Some(r) = ready {
@@ -491,12 +499,17 @@ fn poll_connections(srv: &mut Server, cfg: &ClusterConfig, ready: Option<&HashSe
             // Free tier plus what is left of the shared budget; its own excess is excluded so a connection mid-frame keeps what it holds.
             let mine = conn.inbuf.len().saturating_sub(tier);
             let others = oversize_total.saturating_sub(mine);
+            // Aggregate cap: what every other connection holds, tiers included. Own bytes
+            // excluded, so a mid-frame connection always keeps what it has.
+            let others_total = inbound_total.saturating_sub(conn.inbuf.len());
             let inbound_cap = tier
                 .saturating_add(MAX_OVERSIZE_TOTAL_BYTES.saturating_sub(others))
-                .min(requested_cap.max(tier));
+                .min(requested_cap.max(tier))
+                .min(MAX_INBOUND_TOTAL_BYTES.saturating_sub(others_total));
             conn.frame_cap = inbound_cap;
             let outcome = read_available(conn, inbound_cap);
             oversize_total = others + conn.inbuf.len().saturating_sub(tier);
+            inbound_total = others_total + conn.inbuf.len();
             // The certificate does not exist until the handshake finishes; read once and cached.
             if !conn.tls_checked && conn.stream.handshake_done() {
                 conn.tls_checked = true;
@@ -560,7 +573,8 @@ fn read_available(conn: &mut Conn, cap: usize) -> ReadResult {
             return ReadResult::Fatal(format!(
                 "inbound buffer exceeded {cap} bytes without a complete frame \
                  (kafgres.max_request_bytes, or the per-connection free tier if too many \
-                 connections are already holding large frames)"
+                 connections are already holding large frames, or the aggregate inbound \
+                 ceiling if too many connections are holding partial frames at all)"
             ));
         }
         match conn.stream.read(&mut chunk) {

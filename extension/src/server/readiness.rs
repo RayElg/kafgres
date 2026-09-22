@@ -70,6 +70,9 @@ impl Readiness {
         unsafe {
             if !self.set.is_null() {
                 pg_sys::FreeWaitEventSet(self.set);
+                // Cleared before create: CreateWaitEventSet can raise ERROR (epoll_create1
+                // failure), and Drop would otherwise double-pfree the freed pointer.
+                self.set = std::ptr::null_mut();
             }
             let n = (FIRST_SOCKET + want.len()) as i32;
             self.set = pg_sys::CreateWaitEventSet(pg_sys::TopMemoryContext, n);
