@@ -33,6 +33,13 @@ pub fn offset_commit(
     authz: &crate::acl::Authz,
 ) -> Result<OffsetCommitResponse, HandlerError> {
     let group_denied = authz.check(crate::acl::Operation::Read, crate::acl::ResourceType::Group, &req.group_id).err();
+    // Both caps: empty topic entries sum to zero partitions.
+    if req.topics.len() > MAX_OFFSET_PARTITIONS {
+        return Err(HandlerError::TooLarge {
+            what: "offset commit topic list",
+            n: req.topics.len(),
+        });
+    }
     let total: usize = req.topics.iter().map(|t| t.partitions.len()).sum();
     if total > MAX_OFFSET_PARTITIONS {
         return Err(HandlerError::TooLarge {
@@ -168,6 +175,8 @@ pub fn offset_fetch(
     }
 
     if version >= OFFSET_FETCH_BATCHED_FROM {
+        // Each group carries its own topic list, so cap the group count too.
+        super::check_admin_len("offset fetch group list", req.groups.len())?;
         let mut groups = Vec::with_capacity(req.groups.len());
         for g in &req.groups {
             if let Err(code) = authz.check(crate::acl::Operation::Read, crate::acl::ResourceType::Group, &g.group_id) {
@@ -298,7 +307,16 @@ fn fetch_topics(
     require_stable: bool,
 ) -> Result<Vec<OffsetFetchResponseTopic>, HandlerError> {
     let wanted: Vec<(String, u32, Vec<i32>)> = match requested {
-        Some(list) => resolve_requested(list)?,
+        Some(list) => {
+            // Capped before resolving: `resolve_requested` does one lookup per entry.
+            if list.len() > MAX_OFFSET_PARTITIONS {
+                return Err(HandlerError::TooLarge {
+                    what: "offset fetch topic list",
+                    n: list.len(),
+                });
+            }
+            resolve_requested(list)?
+        }
         None => committed_topics(group_id)?,
     };
 

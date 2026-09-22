@@ -8,6 +8,9 @@ use super::HandlerError;
 use crate::meta;
 use crate::storage::LogStore;
 
+/// Matches the Fetch and OffsetCommit per-consumer data-path limit.
+const MAX_LIST_OFFSETS_PARTITIONS: usize = 4096;
+
 pub const TIMESTAMP_EARLIEST: i64 = -2;
 /// The high watermark — the offset of the *next* record, not the last one.
 pub const TIMESTAMP_LATEST: i64 = -1;
@@ -38,6 +41,21 @@ pub fn handle(
     store: &dyn LogStore,
     authz: &crate::acl::Authz,
 ) -> Result<ListOffsetsResponse, HandlerError> {
+    // Both caps: empty topic entries sum to zero partitions.
+    if req.topics.len() > MAX_LIST_OFFSETS_PARTITIONS {
+        return Err(HandlerError::TooLarge {
+            what: "list offsets topic list",
+            n: req.topics.len(),
+        });
+    }
+    let total: usize = req.topics.iter().map(|t| t.partitions.len()).sum();
+    if total > MAX_LIST_OFFSETS_PARTITIONS {
+        return Err(HandlerError::TooLarge {
+            what: "list offsets partition list",
+            n: total,
+        });
+    }
+
     let mut topics = Vec::with_capacity(req.topics.len());
 
     for topic in &req.topics {

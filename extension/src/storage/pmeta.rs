@@ -216,33 +216,52 @@ pub fn advance_log_start(topic: TopicId, partition: i32, offset: i64) -> StoreRe
     forget_aborted_below(topic, partition, offset)
 }
 
+/// Cap on markers loaded per Fetch. Without it a `read_committed` consumer far behind the
+/// LSO could pull an unbounded set into memory; a Rust allocation failure in a Postgres
+/// backend is an `abort()`, crashing the whole cluster.
+const MARKERS_PER_FETCH: usize = 65_536;
+
 /// Base offsets in `[from, to)` that have a committed marker. MVCC does the work: an
+///
+/// Also returns the effective ceiling: at the cap, only markers up to the highest one
+/// loaded are known, and the caller must not read past it.
 pub fn committed_markers(
     topic: TopicId,
     partition: i32,
     from: i64,
     to: i64,
-) -> StoreResult<std::collections::HashSet<i64>> {
+) -> StoreResult<(std::collections::HashSet<i64>, i64)> {
     Spi::connect(|client| {
         let rows = client.select(
             "SELECT base_offset FROM kafgres_markers
               WHERE topic_id = $1::oid AND partition = $2
-                AND base_offset >= $3 AND base_offset < $4",
+                AND base_offset >= $3 AND base_offset < $4
+              ORDER BY base_offset LIMIT $5",
             None,
             &[
                 (topic as i32).into(),
                 partition.into(),
                 from.into(),
                 to.into(),
+                (MARKERS_PER_FETCH as i64).into(),
             ],
         )?;
         let mut out = std::collections::HashSet::new();
+        let mut highest = from;
         for row in rows {
             if let Some(b) = row.get::<i64>(1)? {
                 out.insert(b);
+                highest = highest.max(b);
             }
         }
-        Ok::<_, spi::Error>(out)
+        // Under the cap the range is covered exhaustively; at the cap, knowledge stops
+        // after the highest marker loaded.
+        let ceiling = if out.len() < MARKERS_PER_FETCH {
+            to
+        } else {
+            (highest + 1).min(to)
+        };
+        Ok::<_, spi::Error>((out, ceiling))
     })
     .map_err(spi_err)
 }

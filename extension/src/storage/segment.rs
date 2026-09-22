@@ -1301,11 +1301,15 @@ impl LogStore for SegmentStore {
             // Enumerate from disk, not the hint map: hints are per-process, so a partition appended by
             // TODO: cache the per-Fetch `read_dir`; the list changes only on roll/reclaim.
             let bases_on_disk = Self::segment_bases(topic, partition)?;
-            let committed = match isolation {
+            // The marker load can lower the ceiling: past its cap, reading beyond it would
+            // judge a batch committed on missing evidence.
+            let (committed, ceiling) = match isolation {
                 IsolationLevel::ReadCommitted => {
-                    Some(pmeta::committed_markers(topic, partition, offset, ceiling)?)
+                    let (set, capped) =
+                        pmeta::committed_markers(topic, partition, offset, ceiling)?;
+                    (Some(set), capped)
                 }
-                IsolationLevel::ReadUncommitted => None,
+                IsolationLevel::ReadUncommitted => (None, ceiling),
             };
             // Producer ids Kafka handed out, so a transactional batch from one of them is
             let kafka_producers = if committed.is_some() {
