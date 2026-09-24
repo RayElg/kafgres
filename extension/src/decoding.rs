@@ -86,9 +86,9 @@ unsafe extern "C-unwind" fn change(
 
     let tp = (*change).data.tp;
     let cols_json = columns_json(desc);
-    let new_json = tuple_json(tp.newtuple, desc);
+    let new_json = tuple_json(heap_tuple(tp.newtuple), desc);
     // `old` is present only when the table's REPLICA IDENTITY provides it; the default gives the key columns alone.
-    let old_json = tuple_json(tp.oldtuple, desc);
+    let old_json = tuple_json(heap_tuple(tp.oldtuple), desc);
 
     // `ts` is the transaction's commit timestamp from the commit WAL record — always
     // present; `track_commit_timestamp` only backs pg_xact_commit_timestamp(). Microseconds.
@@ -97,7 +97,7 @@ unsafe extern "C-unwind" fn change(
         &format!(
             r#"{{"v":3,"op":"{op}","xid":{},"ts":{},"schema":{},"table":{},"cols":{cols_json},"new":{new_json},"old":{old_json}}}"#,
             (*txn).xid,
-            (*txn).xact_time.commit_time,
+            commit_time(txn),
             json_string(&schema),
             json_string(&table)
         ),
@@ -106,20 +106,19 @@ unsafe extern "C-unwind" fn change(
 
 /// The relation's shape as of this change; `format_type_with_typemod` because `numeric(10,2)` and bare `numeric` share an OID.
 unsafe fn columns_json(desc: pg_sys::TupleDesc) -> String {
-    let natts = (*desc).natts;
+    let tupdesc = pgrx::PgTupleDesc::from_pg_unchecked(desc);
     let mut out = String::from("[");
     let mut first = true;
-    for i in 0..natts {
-        let att = (*desc).attrs.as_ptr().add(i as usize);
-        if (*att).attisdropped || (*att).attnum <= 0 {
+    for att in tupdesc.iter() {
+        if att.attisdropped || att.attnum <= 0 {
             continue;
         }
         if !first {
             out.push(',');
         }
         first = false;
-        let name = name_lossy(&(*att).attname);
-        let ty = pg_sys::format_type_with_typemod((*att).atttypid, (*att).atttypmod);
+        let name = name_lossy(&att.attname);
+        let ty = pg_sys::format_type_with_typemod(att.atttypid, att.atttypmod);
         let ty = if ty.is_null() {
             "text".to_string()
         } else {
@@ -136,24 +135,22 @@ unsafe fn columns_json(desc: pg_sys::TupleDesc) -> String {
 }
 
 /// A tuple as `{"col":"text value"}`, or `null`.
-unsafe fn tuple_json(buf: *mut pg_sys::ReorderBufferTupleBuf, desc: pg_sys::TupleDesc) -> String {
-    if buf.is_null() {
+unsafe fn tuple_json(tuple: pg_sys::HeapTuple, desc: pg_sys::TupleDesc) -> String {
+    if tuple.is_null() {
         return "null".to_string();
     }
-    let tuple = &mut (*buf).tuple as *mut pg_sys::HeapTupleData;
-    let natts = (*desc).natts;
+    let tupdesc = pgrx::PgTupleDesc::from_pg_unchecked(desc);
     let mut out = String::from("{");
     let mut first = true;
 
-    for i in 0..natts {
-        let att = (*desc).attrs.as_ptr().add(i as usize);
-        if (*att).attisdropped || (*att).attnum <= 0 {
+    for att in tupdesc.iter() {
+        if att.attisdropped || att.attnum <= 0 {
             continue;
         }
-        let name = name_lossy(&(*att).attname);
+        let name = name_lossy(&att.attname);
 
         let mut is_null = false;
-        let datum = pg_sys::heap_getattr(tuple, (*att).attnum as _, desc, &mut is_null);
+        let datum = pg_sys::heap_getattr(tuple, att.attnum as _, desc, &mut is_null);
 
         if !first {
             out.push(',');
@@ -170,7 +167,7 @@ unsafe fn tuple_json(buf: *mut pg_sys::ReorderBufferTupleBuf, desc: pg_sys::Tupl
         // The type's own output function; inferring from the JSON side would mangle types like `numeric`.
         let mut typoutput = pg_sys::Oid::INVALID;
         let mut typisvarlena = false;
-        pg_sys::getTypeOutputInfo((*att).atttypid, &mut typoutput, &mut typisvarlena);
+        pg_sys::getTypeOutputInfo(att.atttypid, &mut typoutput, &mut typisvarlena);
 
         // An unchanged TOASTed value is not in the WAL — an UPDATE logs only an external pointer,
         if typisvarlena && is_external_ondisk(datum) {
@@ -184,6 +181,33 @@ unsafe fn tuple_json(buf: *mut pg_sys::ReorderBufferTupleBuf, desc: pg_sys::Tupl
     }
     out.push('}');
     out
+}
+
+/// The commit timestamp. From PG 15 it is in the `xact_time` union with the prepare time.
+#[cfg(any(feature = "pg13", feature = "pg14"))]
+unsafe fn commit_time(txn: *mut pg_sys::ReorderBufferTXN) -> pg_sys::TimestampTz {
+    (*txn).commit_time
+}
+
+#[cfg(not(any(feature = "pg13", feature = "pg14")))]
+unsafe fn commit_time(txn: *mut pg_sys::ReorderBufferTXN) -> pg_sys::TimestampTz {
+    (*txn).xact_time.commit_time
+}
+
+/// A decoded change's tuple. Through PG 16 it is wrapped in a `ReorderBufferTupleBuf`; from
+/// PG 17 it is a plain `HeapTuple`. Null when the change has no tuple on that side.
+#[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
+unsafe fn heap_tuple(buf: *mut pg_sys::ReorderBufferTupleBuf) -> pg_sys::HeapTuple {
+    if buf.is_null() {
+        std::ptr::null_mut()
+    } else {
+        &mut (*buf).tuple
+    }
+}
+
+#[cfg(any(feature = "pg17", feature = "pg18"))]
+unsafe fn heap_tuple(tuple: pg_sys::HeapTuple) -> pg_sys::HeapTuple {
+    tuple
 }
 
 /// Identifiers are bytes in the database encoding, not UTF-8; `pgrx::name_data_to_str` unwraps
