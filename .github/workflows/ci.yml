@@ -53,7 +53,16 @@ jobs:
   # `cargo check` skips the pgrx/Postgres link step and passes on code that cannot
   # load. Only a real package build proves the extension is loadable.
   extension:
+    name: Extension (PG ${{ matrix.pg }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [13, 14, 15, 16, 17, 18]
+    # Passed to the image build; the standby shares the image, so every step below,
+    # including the failover suite, runs on this PG version.
+    env:
+      PG_MAJOR: ${{ matrix.pg }}
     steps:
       - uses: actions/checkout@v4
       - name: Build image

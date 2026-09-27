@@ -18,11 +18,12 @@ permissions:
 jobs:
   # ─── Stage 1: Build tarball + runtime image ────────────────────────────
   build:
-    name: Build PG 16 / ${{ matrix.arch }}
+    name: Build PG ${{ matrix.pg }} / ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        pg: [13, 14, 15, 16, 17, 18]
         arch: [amd64, arm64]
         include:
           - arch: amd64
@@ -30,7 +31,7 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     env:
-      TARBALL: kafgres-pg16-${{ matrix.arch }}
+      TARBALL: kafgres-pg${{ matrix.pg }}-${{ matrix.arch }}
 
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +43,7 @@ jobs:
       # repo is the only gate that proves the extension actually compiles and links,
       # since cargo check skips the pgrx/Postgres link step.
       - name: Build runtime image
-        run: docker buildx build --load -f docker/Dockerfile -t kafgres-postgres:${{ matrix.arch }} .
+        run: docker buildx build --load --build-arg PG_MAJOR=${{ matrix.pg }} -f docker/Dockerfile -t kafgres-postgres:${{ matrix.arch }} .
 
       # The pgrx package output only exists in the builder stage; the runtime stage
       # carries the installed copy. The builder build is served from cache, so this
@@ -50,14 +51,14 @@ jobs:
       - name: Build extension tarball
         run: |
           set -euo pipefail
-          docker buildx build --load -f docker/Dockerfile --target builder -t kafgres-builder:${{ matrix.arch }} .
+          docker buildx build --load --build-arg PG_MAJOR=${{ matrix.pg }} -f docker/Dockerfile --target builder -t kafgres-builder:${{ matrix.arch }} .
           CID=$(docker create kafgres-builder:${{ matrix.arch }})
           trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
           rm -rf staging dist
           mkdir -p "staging/${TARBALL}" dist
           docker cp "${CID}:/app/dist/." staging/root
-          mv staging/root/usr/lib/postgresql/16/lib        "staging/${TARBALL}/lib"
-          mv staging/root/usr/share/postgresql/16/extension "staging/${TARBALL}/extension"
+          mv staging/root/usr/lib/postgresql/${{ matrix.pg }}/lib        "staging/${TARBALL}/lib"
+          mv staging/root/usr/share/postgresql/${{ matrix.pg }}/extension "staging/${TARBALL}/extension"
           tar -czf "dist/${TARBALL}.tar.gz" -C staging "${TARBALL}"
           ls -lh dist/
 
@@ -65,24 +66,25 @@ jobs:
         run: |
           set -euo pipefail
           docker save kafgres-postgres:${{ matrix.arch }} | gzip \
-            > dist/kafgres-postgres-pg16-${{ matrix.arch }}-image.tar.gz
+            > dist/kafgres-postgres-pg${{ matrix.pg }}-${{ matrix.arch }}-image.tar.gz
           ls -lh dist/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: kafgres-pg16-${{ matrix.arch }}
+          name: kafgres-pg${{ matrix.pg }}-${{ matrix.arch }}
           path: dist/
           retention-days: 5
 
   # ─── Stage 2: Test the built image ─────────────────────────────────────
   smoke:
-    name: Test PG 16 / ${{ matrix.arch }}
+    name: Test PG ${{ matrix.pg }} / ${{ matrix.arch }}
     needs: build
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        pg: [13, 14, 15, 16, 17, 18]
         arch: [amd64, arm64]
         include:
           - arch: amd64
@@ -96,13 +98,13 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: kafgres-pg16-${{ matrix.arch }}
+          name: kafgres-pg${{ matrix.pg }}-${{ matrix.arch }}
           path: dist/
 
       - name: Load runtime image
         run: |
           set -euo pipefail
-          docker load -i dist/kafgres-postgres-pg16-${{ matrix.arch }}-image.tar.gz
+          docker load -i dist/kafgres-postgres-pg${{ matrix.pg }}-${{ matrix.arch }}-image.tar.gz
           docker tag kafgres-postgres:${{ matrix.arch }} kafgres-postgres
 
       - name: Set up Docker Buildx
@@ -270,10 +272,30 @@ jobs:
 
           | File | PostgreSQL | Architecture |
           |------|-----------|--------------|
+          | `kafgres-pg13-amd64.tar.gz` | 13.x | x86_64 |
+          | `kafgres-pg13-arm64.tar.gz` | 13.x | aarch64 |
+          | `kafgres-pg14-amd64.tar.gz` | 14.x | x86_64 |
+          | `kafgres-pg14-arm64.tar.gz` | 14.x | aarch64 |
+          | `kafgres-pg15-amd64.tar.gz` | 15.x | x86_64 |
+          | `kafgres-pg15-arm64.tar.gz` | 15.x | aarch64 |
           | `kafgres-pg16-amd64.tar.gz` | 16.x | x86_64 |
           | `kafgres-pg16-arm64.tar.gz` | 16.x | aarch64 |
+          | `kafgres-pg17-amd64.tar.gz` | 17.x | x86_64 |
+          | `kafgres-pg17-arm64.tar.gz` | 17.x | aarch64 |
+          | `kafgres-pg18-amd64.tar.gz` | 18.x | x86_64 |
+          | `kafgres-pg18-arm64.tar.gz` | 18.x | aarch64 |
+          | `kafgres-postgres-pg13-amd64-image.tar.gz` | 13.x | x86_64 |
+          | `kafgres-postgres-pg13-arm64-image.tar.gz` | 13.x | aarch64 |
+          | `kafgres-postgres-pg14-amd64-image.tar.gz` | 14.x | x86_64 |
+          | `kafgres-postgres-pg14-arm64-image.tar.gz` | 14.x | aarch64 |
+          | `kafgres-postgres-pg15-amd64-image.tar.gz` | 15.x | x86_64 |
+          | `kafgres-postgres-pg15-arm64-image.tar.gz` | 15.x | aarch64 |
           | `kafgres-postgres-pg16-amd64-image.tar.gz` | 16.x | x86_64 |
           | `kafgres-postgres-pg16-arm64-image.tar.gz` | 16.x | aarch64 |
+          | `kafgres-postgres-pg17-amd64-image.tar.gz` | 17.x | x86_64 |
+          | `kafgres-postgres-pg17-arm64-image.tar.gz` | 17.x | aarch64 |
+          | `kafgres-postgres-pg18-amd64-image.tar.gz` | 18.x | x86_64 |
+          | `kafgres-postgres-pg18-arm64-image.tar.gz` | 18.x | aarch64 |
 
           All artifacts have been tested via CI before release.
           NOTES
