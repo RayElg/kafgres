@@ -93,9 +93,10 @@ jobs:
       # exists rather than skipping, because a failover suite that quietly does not
       # run is worse than none. The standby shares the primary's image, which
       # `docker compose build` has already produced; see the comment on the service.
+      # Standby must run the primary's engine: test_replication skips on a mismatch.
       - name: Failover rig
         run: |
-          docker compose --profile failover up -d standby
+          KAFGRES_ENGINE=segment docker compose --profile failover up -d standby
           for i in $(seq 1 60); do
             if docker compose exec -T standby pg_isready -U postgres >/dev/null 2>&1; then break; fi
             sleep 2
@@ -146,8 +147,10 @@ jobs:
       # refuse to start its broker. Wipe it first, the same dance as
       # test_engine_switch.wipe_both_logs: the mismatch guard off so the broker starts
       # while its files vanish, both GUCs, then recreate so the postmaster GUC applies.
+      # Remove the segment standby; rebuilt on `table` from a fresh base backup below.
       - name: Table engine integration and conformance suite
         run: |
+          docker compose --profile failover rm -sfv standby
           docker compose exec -T postgres psql -U postgres \
             -c "ALTER SYSTEM SET kafgres.allow_engine_mismatch=on"
           docker compose exec -T postgres bash -c 'rm -rf "$PGDATA"/kafgres/*'
@@ -170,6 +173,12 @@ jobs:
              WHERE backend_type='kafgres_broker'" | grep -q '^1$'
           test "$(docker compose exec -T postgres psql -U postgres -tAc \
                     'SHOW kafgres.storage_engine' | tr -d '[:space:]')" = table
+          KAFGRES_ENGINE=table docker compose --profile failover up -d standby
+          for i in $(seq 1 60); do
+            if docker compose exec -T standby pg_isready -U postgres >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          docker compose exec -T standby pg_isready -U postgres
           python3 -m pytest tests/integration/ tests/conformance/ -v
 
       - name: Worker logs

@@ -10,9 +10,12 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
 
     echo "standby: base backup from $PRIMARY_HOST"
     rm -rf "${PGDATA:?}"/*
+    # From PG 18, PGDATA's parent dir may not exist; as root, pg_basebackup would create
+    # it 0700 root, unreachable by the postgres-owned server. `install -d` fixes perms.
+    install -d -o postgres -g postgres -m 700 "$PGDATA"
     # STANDBY_SLOT, when set, creates a physical replication slot so the primary keeps
     # WAL the standby has not yet received.
-    PGPASSWORD=postgres pg_basebackup \
+    PGPASSWORD=postgres gosu postgres pg_basebackup \
         -h "$PRIMARY_HOST" -U postgres -D "$PGDATA" \
         -Fp -Xs -R -c fast -P ${STANDBY_SLOT:+-C -S "$STANDBY_SLOT"}
 
