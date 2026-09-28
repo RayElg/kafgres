@@ -1,0 +1,4 @@
+-- kafgres 0.2.0 -> 0.3.0.
+--
+-- The SQL surface is unchanged between the two versions. Postgres still needs the file to
+-- exist for ALTER EXTENSION UPDATE.
