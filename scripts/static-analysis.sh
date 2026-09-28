@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Static analysis over the extension and codec crates, non-test code only.
 #
-#   scripts/static-analysis.sh [outdir]   default: docs/static-analysis/raw
+#   scripts/static-analysis.sh [outdir]   default: docs-impl/static-analysis/raw
 #
 # Outputs: complexity.md, rca/ (raw JSON), clippy-extension.json, clippy-codec.json,
 # clippy-summary.md, geiger.txt, unsafe-sites.txt.
@@ -11,7 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
-OUT="${1:-docs/static-analysis/raw}"
+OUT="${1:-docs-impl/static-analysis/raw}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 

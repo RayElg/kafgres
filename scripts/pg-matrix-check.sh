@@ -5,7 +5,7 @@
 #   scripts/pg-matrix-check.sh 17 18        just those
 #
 # `cargo check --lib --tests`, one version at a time, logs in target/pg-matrix/. Compile
-# only, no link or load (see CLAUDE.md): a clean check is necessary, not sufficient.
+# only, no link or load: a clean check is necessary, not sufficient.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
