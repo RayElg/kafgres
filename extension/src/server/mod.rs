@@ -358,6 +358,9 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         if srv.ticked {
             srv.tick = srv.tick.wrapping_add(1);
             next_tick_at = now + tick;
+            // Here, not per pass: the loop can spin with a zero wait, and this is the one
+            // point each tick reliably between transactions.
+            crate::dbtx::report_stats();
         }
         // Before anything is served: an unloaded snapshot has `enabled = false`, which
         if !epochs_ready {

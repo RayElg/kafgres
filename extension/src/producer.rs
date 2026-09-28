@@ -270,13 +270,17 @@ pub fn record(
     )?;
 
     // Keep the newest `RETAINED_BATCHES` **by insertion order**. `ORDER BY last_seq DESC`
+    //
+    // Deletes "older than the Nth newest" via a scalar sub-select on `added_idx`,
+    // not `NOT IN (newest N)`. With fewer than N rows the sub-select is NULL,
+    // so nothing is pruned.
     crate::plan::run(
         "DELETE FROM kafgres_producer_batches
           WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3
-            AND added_seq NOT IN (
+            AND added_seq < (
                 SELECT added_seq FROM kafgres_producer_batches
                  WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3
-                 ORDER BY added_seq DESC LIMIT $4)",
+                 ORDER BY added_seq DESC OFFSET $4 - 1 LIMIT 1)",
         &[
             producer_id.into(),
             (topic_id as i32).into(),
