@@ -62,7 +62,7 @@ without a metrics reporter configured. The served set and version ranges are dec
 the ApiVersions payload, so what is advertised and what is implemented cannot drift.
 
 A client's version probe reads the set of advertised keys, not their ranges. franz-go,
-which Redpanda Console, `kcat` and the Go ecosystem use, treats any missing key as an
+which Redpanda Console and the Go ecosystem use, treats any missing key as an
 old broker however current the served ranges are, so a cluster that omits a key is
 reported as pre-1.0.
 
@@ -151,11 +151,14 @@ from, so a reset moves where the next acquire begins.
 
 ### Configuration reporting
 
-- `kafka-topics.sh --describe` reports the topic config keys the broker actually
-  implements: `retention.ms`, `retention.bytes`, `cleanup.policy`, and `segment.bytes`.
-  Kafka reports `min.insync.replicas=1`; kafgres reports nothing there, because it does
-  not honour the setting (replication is Postgres's), and reporting an unimplemented
-  setting invites clients to act on it.
+- `kafka-configs.sh --describe --all` reports only the topic config keys the broker
+  actually implements: `retention.ms`, `retention.bytes`, `max.message.bytes`,
+  `segment.bytes`, `segment.ms`, `cleanup.policy`, `min.compaction.lag.ms` and
+  `delete.retention.ms`. `min.insync.replicas`, `compression.type` and
+  `message.timestamp.type` are reported at the one value kafgres implements (`1`,
+  `producer`, `CreateTime`) and any other value is refused as read-only: replication is
+  Postgres's, so `min.insync.replicas` above 1 would be a promise nothing keeps, and
+  reporting an unimplemented setting invites clients to act on it.
 - `__consumer_offsets` does not exist in Metadata or in `kafka-topics.sh --list`.
   Consumer group offsets live in `kafgres_offsets`, and every group API answers from
   there, so `kafka-consumer-groups.sh` and admin-protocol UIs see everything they
@@ -179,7 +182,7 @@ from, so a reset moves where the next acquire begins.
   compiles, is refused here with `INVALID_REGULAR_EXPRESSION`. Plain patterns,
   alternation and character classes behave the same on both.
 - **Leader epochs are not consecutive.** Kafka increments the epoch by one per
-  election; kafgres uses the Postgres timeline id, so it jumps. The protocol requires
+  election; kafgres derives it from the Postgres timeline id, so it can jump. The protocol requires
   monotonicity, not consecutiveness, and a client that assumed `+1` was already broken
   against real Kafka.
 - **Frame and message limits.** `kafgres.max_request_bytes` (SIGHUP-reloadable, default

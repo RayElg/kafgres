@@ -14,14 +14,14 @@ restart does.
 
 | Setting | Reload | Default | Description |
 |---|---|---|---|
-| `kafgres.database` | reload | `postgres` | Database the broker background worker connects to. Changing it requires a broker worker restart. |
+| `kafgres.database` | reload | `postgres` | Database the kafgres background workers (broker, CDC, archiver, follower) connect to. Changing it requires an instance restart. |
 | `kafgres.port` | reload | `9092` | TCP port the Kafka listener binds. Changing it requires a broker worker restart. |
 | `kafgres.bind_host` | reload | `0.0.0.0` | Address the Kafka listener binds. Changing it requires a broker worker restart. |
 | `kafgres.advertised_host` | reload | `localhost` | Host clients are told to connect to, the `advertised.listeners` equivalent. |
 | `kafgres.advertised_port` | reload | `0` | Port clients are told to connect to; `0` means use `kafgres.port`. |
 | `kafgres.node_id` | reload | `1` | Broker node id reported in Metadata. |
 | `kafgres.cluster_id` | reload | `kafgres-cluster` | Cluster id reported in Metadata. |
-| `kafgres.tick_interval_ms` | reload | `5` | Broker event loop poll interval in milliseconds (1 to 1000). |
+| `kafgres.tick_interval_ms` | reload | `5` | Broker event loop poll interval in milliseconds (1 to 1000). Changing it requires a broker worker restart. |
 | `kafgres.auto_create_topics` | reload | on | Create a topic the first time a client produces to or fetches from it, as Kafka's `auto.create.topics.enable` does. |
 | `kafgres.storage_engine` | restart | `segment` | Log storage engine: `segment` (default) or `table`. Does not migrate existing data. |
 | `kafgres.allow_engine_mismatch` | restart | off | Start even if a log written by the other storage engine is present. That log stays intact but invisible. |
@@ -31,12 +31,12 @@ restart does.
 | Setting | Reload | Default | Description |
 |---|---|---|---|
 | `kafgres.segment_bytes` | reload | `64 MiB` | Bytes a segment file reaches before rolling. |
-| `kafgres.segment_offsets` | reload | `1000000` | Offsets per log segment, which is the retention granularity. Set before a partition has data: changing it later makes segment ranges overlap. |
+| `kafgres.segment_offsets` | reload | `1000000` | Offsets per log segment on the table engine, which is its retention granularity; the segment engine does not read it. Set before a partition has data: changing it later makes segment ranges overlap. |
 | `kafgres.segment_lock_stripes` | restart | `16` | Lock shards for segment-engine append positions; `1` makes every partition share one lock. Narrowing also narrows capacity. |
 | `kafgres.log_directory` | restart | empty | Directory holding the segment log. Empty means `$PGDATA/kafgres`; a relative path is under `$PGDATA`. Put it on a device other than the WAL's: with both on one device the database's commit flush queues behind the log's writeback. Measured on one box, a co-resident pgbench lost 27% at 500 MB/s of produce with a shared device and 11% with the log on its own, and 9% against nothing at 100 MB/s. A directory outside `$PGDATA` is not carried by `pg_basebackup`: seed a standby's copy yourself, or the follower starts from an empty log. |
 | `kafgres.segment_archive_command` | reload | empty | Shell command shipping one rolled segment to an archive; `%p` is its path, `%f` its filename. Empty disables archiving. Setting it makes retention wait for the archive. |
 | `kafgres.archive_interval_ms` | reload | `10000` | How often the archiver ships sealed segments; `0` disables it. |
-| `kafgres.replicate_from` | reload | empty | `host:port` of the leader to pull log from on a standby; empty disables it. |
+| `kafgres.replicate_from` | reload | empty | `host:port` of the leader to pull log from on a standby; empty disables it. The follower reads it when it starts: a reload can clear it, but setting it on a standby that started without it takes an instance restart, and changing the address takes a restart of the follower worker. |
 | `kafgres.allow_transactional_produce` | reload | on | Enable `kafgres_produce()`, the transactional SQL produce path. |
 
 ## CDC
@@ -51,7 +51,7 @@ restart does.
 
 | Setting | Reload | Default | Description |
 |---|---|---|---|
-| `kafgres.tls_cert_file` | reload | empty | PEM server certificate chain. TLS is enabled when this and `kafgres.tls_key_file` are both set; changing them requires a broker worker restart. |
+| `kafgres.tls_cert_file` | reload | empty | PEM server certificate chain. TLS is enabled when this and `kafgres.tls_key_file` are both set; a reload applies a change to new connections. |
 | `kafgres.tls_key_file` | reload | empty | PEM private key for `kafgres.tls_cert_file`. |
 | `kafgres.tls_ca_file` | reload | empty | PEM CA bundle that client certificates are verified against; enables mTLS. |
 | `kafgres.tls_client_cert_required` | reload | off | Refuse the TLS handshake unless the client presents a certificate valid against `kafgres.tls_ca_file`. |

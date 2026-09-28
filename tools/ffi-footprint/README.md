@@ -21,7 +21,7 @@ tools/ffi-footprint/ffi-footprint.sh                    # every [project] pg maj
 tools/ffi-footprint/ffi-footprint.sh --pg 13 --pg 18    # these majors
 tools/ffi-footprint/ffi-footprint.sh --pg 16 --image kafgres-postgres   # existing image, no build
 tools/ffi-footprint/ffi-footprint.sh --write-baseline ffi-footprint.baseline.json
-tools/ffi-footprint/ffi-footprint.sh --baseline ffi-footprint.baseline.json   # exit 1 on new findings
+tools/ffi-footprint/ffi-footprint.sh --baseline ffi-footprint.baseline.json   # exit 1 on new findings of a fail_on kind
 python3 tools/ffi-footprint/tests/test_ffi_footprint.py # the tool's own test, no Docker
 ```
 
@@ -69,7 +69,8 @@ replace. Sections most likely to need project entries:
 - `[entries]`: symbol names, registrations and pointer escapes that make a function an
   entry, and `[entry_kinds]`: what an escaping ERROR or panic becomes in each.
 - `[server]`: overrides for the server model in `cfx.py` (`DEFAULTS`): effect tables,
-  sinks, elevel functions, edges to cut.
+  sinks, elevel functions, edges to cut. Each key set here replaces that key's whole
+  default, tables included.
 - `[accepted]`: finding-key patterns (`fnmatch`, e.g. `"ffi-panic-unhandled:File*"`) mapped
   to the reason for accepting them. Accepted findings keep their severity, are listed
   separately with the reason, and never fail a baseline.
@@ -122,7 +123,7 @@ Finding kinds, with stable keys for the baseline:
 | `unsafe-no-safety` | medium | an `unsafe` block with no `SAFETY` comment on it, above its statement, or on its first line |
 | `export-unmapped` | medium | the library exports a symbol no source function explains |
 | `unsafe-fn-no-safety-doc`, `export-missing`, `c-abi-entry` | low | as named |
-| `ffi-not-linked` | info | a `pg_sys` call that is not a server symbol: pgrx implements it in Rust, or it is a header inline |
+| `ffi-not-linked` | info | a `pg_sys` call the library does not import from the server: pgrx implements it in Rust, or it is a header inline |
 
 ## What it cannot see
 
