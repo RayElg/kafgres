@@ -22,7 +22,7 @@ deployment:
         ▼             ▼                              ▼
    fulfilment    inventory                      (any consumer)
         │             │
-        │             └─► inventory.state   keyed by SKU
+        │             └─► inventory.state   compacted, keyed by SKU
         ▼                                   ← the current stock level per SKU,
    shipments                                  which is a table shaped like a topic
         │
