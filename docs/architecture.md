@@ -83,9 +83,9 @@ records remain physically in the log, and consumers skip them using the aborted
 transaction information in the Fetch response. Postgres transaction abort maps onto Kafka
 transaction abort directly.
 
-The cost of transactionality is paid only when it is used: a non-transactional produce
-never touches Postgres tables, while a transactional one adds a marker row to the
-caller's transaction.
+The cost of transactionality is paid only when it is used: a plain produce never touches
+Postgres tables (an idempotent one records its sequence window there), while a
+transactional one adds a marker row to the caller's transaction.
 
 ## Segment log replication
 
@@ -112,9 +112,9 @@ postmaster
 +-- kafgres_follower   on a standby, applies the segment log streamed from the primary
 ```
 
-The broker is one background worker, not a pool. It owns the listener and makes a
-non-blocking read pass over every connection per tick, flushing completed responses
-afterwards; a long-poll Fetch that cannot be satisfied yet is parked and completed when
+The broker is one background worker, not a pool. It owns the listener, waits on every
+socket at once with the tick as the longest wait, and makes a non-blocking read pass over
+every connection each time it wakes, flushing completed responses afterwards; a long-poll Fetch that cannot be satisfied yet is parked and completed when
 the produce that fills it lands in this same process, or at its deadline. Group
 coordination, ACLs and quota accounting run inline in the request path, each request in
 its own short transaction. One broker per instance is the design — HA is Postgres HA —
@@ -127,13 +127,15 @@ kafgres_topics(topic_id, name, num_partitions, config jsonb, created_at)
 kafgres_partitions(topic_id, partition, next_offset, log_start_offset,
                    leader_epoch, epoch_start_offset,
                    PRIMARY KEY (topic_id, partition))
-kafgres_groups(group_id, generation, protocol_type, protocol, leader_member, state)
-kafgres_group_members(group_id, member_id, client_id, host, metadata bytea,
+kafgres_groups(group_id, generation, protocol_type, protocol_name, leader_member, state)
+kafgres_group_members(group_id, member_id, client_id, client_host, metadata bytea,
                       assignment bytea, session_timeout_ms, last_heartbeat)
-kafgres_offsets(group_id, topic_id, partition, committed_offset, leader_epoch,
+kafgres_offsets(group_id, topic_id, partition, committed_offset, committed_leader_epoch,
                 metadata, commit_ts)
-kafgres_producers(producer_id, epoch, last_seq jsonb, last_ts)
-kafgres_txns(txn_id, producer_id, epoch, state, partitions, started_at)
+kafgres_producers(producer_id, producer_epoch, transactional_id, last_ts)
+kafgres_producer_batches(producer_id, topic_id, partition, first_seq, last_seq, base_offset)
+kafgres_txns(producer_id, producer_epoch, transactional_id, state, started_at)
+kafgres_txn_partitions(producer_id, topic_id, partition, first_offset)
 kafgres_acls(principal, resource_type, resource_name, pattern_type, operation, permission)
 ```
 
@@ -150,7 +152,7 @@ SELECT * FROM kafgres_partition_offsets('order-events');
 `high_watermark` is the log end offset; `offset_span` is `high_watermark −
 log_start_offset`, the number of retained records. `high_watermark` is NULL when the
 partition is not currently tracked in shared memory — in practice, a partition that has
-never been written to — which renders as 0, so write `COALESCE(high_watermark, 0)` in
+never been written to, which stands for 0, so write `COALESCE(high_watermark, 0)` in
 monitoring queries.
 
 `kafgres_offsets` replaces `__consumer_offsets`. Clients read group offsets through the

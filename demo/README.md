@@ -30,8 +30,9 @@ deployment:
     notifier
 ```
 
-Separately, `payments.py` inserts a payment row and produces the event in one Postgres
-transaction, so there is no window where the row exists and the event does not.
+Separately, `demo/run.sh payment` inserts a payment row and produces the event in one
+Postgres transaction, so there is no window where the row exists and the event does not.
+A second payment is rolled back, and publishes nothing.
 
 ## Running it
 
@@ -39,6 +40,7 @@ transaction, so there is no window where the row exists and the event does not.
 demo/run.sh setup     # tables, topics, CDC mapping, slot
 demo/run.sh services  # fulfilment, inventory, notifier in the background
 demo/run.sh traffic   # place some orders
+demo/run.sh payment   # one committed and one rolled-back transactional produce
 demo/run.sh show      # what landed where
 demo/run.sh stop
 ```
