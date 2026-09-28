@@ -31,6 +31,14 @@ pub fn handle(
 
     let mut budget = clamp_bytes(req.max_bytes, RESPONSE_CEILING);
 
+    // Both caps: empty topic entries sum to zero partitions, so a partition-only
+    // check would let a large topic list through.
+    if req.topics.len() > MAX_FETCH_PARTITIONS {
+        return Err(HandlerError::TooLarge {
+            what: "fetch topic list",
+            n: req.topics.len(),
+        });
+    }
     let total_partitions: usize = req.topics.iter().map(|t| t.partitions.len()).sum();
     if total_partitions > MAX_FETCH_PARTITIONS {
         return Err(HandlerError::TooLarge {

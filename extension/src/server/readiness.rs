@@ -12,7 +12,9 @@
 use std::time::Duration;
 
 use pgrx::bgworkers::BackgroundWorker;
+use pgrx::pg_sys::pg_try::PgTryBuilder;
 use pgrx::prelude::*;
+use pgrx::PgSqlErrorCode;
 
 /// Position of the first socket in the set: the latch and postmaster death come first.
 const FIRST_SOCKET: usize = 2;
@@ -70,6 +72,9 @@ impl Readiness {
         unsafe {
             if !self.set.is_null() {
                 pg_sys::FreeWaitEventSet(self.set);
+                // Cleared before create: CreateWaitEventSet can raise ERROR (epoll_create1
+                // failure), and Drop would otherwise double-pfree the freed pointer.
+                self.set = std::ptr::null_mut();
             }
             let n = (FIRST_SOCKET + want.len()) as i32;
             self.set = pg_sys::CreateWaitEventSet(pg_sys::TopMemoryContext, n);
@@ -121,7 +126,33 @@ impl Readiness {
                 pg_sys::PG_WAIT_EXTENSION,
             );
             pg_sys::ResetLatch(pg_sys::MyLatch);
-            pg_sys::check_for_interrupts!();
+        }
+        // `check_for_interrupts!` here is outside every `atomically`, so an ERROR from a
+        // statement cancel would reach `#[pg_guard]` and restart the worker, dropping
+        // every client, for something as ordinary as pg_cancel_backend or a stray
+        // lock/statement timeout. There is no statement to cancel here, so it is
+        // swallowed: `ProcessInterrupts` raises ERRCODE_QUERY_CANCELED or
+        // ERRCODE_LOCK_NOT_AVAILABLE and clears QueryCancelPending before raising, so a
+        // caught cancel cannot spin. ProcDiePending raises FATAL, which does not longjmp
+        // to a PG_TRY, so termination is unaffected; any other error rethrows.
+        let swallowed = PgTryBuilder::new(|| {
+            unsafe { pg_sys::check_for_interrupts!() };
+            false
+        })
+        .catch_when(PgSqlErrorCode::ERRCODE_QUERY_CANCELED, |_| true)
+        .catch_when(PgSqlErrorCode::ERRCODE_LOCK_NOT_AVAILABLE, |_| true)
+        .execute();
+
+        if swallowed {
+            log!("kafgres: ignoring a statement cancel in the broker's wait loop");
+            // The cancel path clears InterruptPending on entry and nothing re-sends it,
+            // so a pending ProcSignalBarrier (DROP DATABASE, ALTER ... SET TABLESPACE
+            // waiting on this worker) must be re-armed by hand or it hangs for good.
+            unsafe {
+                if pg_sys::ProcSignalBarrierPending != 0 {
+                    pg_sys::InterruptPending = 1;
+                }
+            }
         }
         !BackgroundWorker::sigterm_received()
     }

@@ -342,6 +342,77 @@ def test_a_partition_append_is_all_or_nothing(topic, conn):
     assert err == 0, f"the corrected resend failed with {err}"
     assert log_rows(topic) == 2
 
+def high_watermark(topic, partition=0):
+    # NULL for an untouched partition; treated as 0.
+    return int(sql(
+        f"""SELECT coalesce(high_watermark, 0) FROM kafgres_partition_offsets('{topic}')
+             WHERE partition = {partition}"""
+    ).strip())
+
+def test_a_failed_partition_appends_nothing_on_either_engine(topic, conn):
+    """`test_a_partition_append_is_all_or_nothing`, for the engine without `kafgres_log`.
+
+    One record per batch, so the high watermark counts batches. The segment engine's
+    append is a file write no savepoint undoes, so the sequence check must run before
+    the first append.
+    """
+    pid = 7850
+    good = record_batch([b"first"], producer_id=pid, producer_epoch=0, base_sequence=0)
+    gap = record_batch([b"second"], producer_id=pid, producer_epoch=0, base_sequence=9)
+
+    _, err, _ = send_produce(conn, topic, good + gap, 8350)
+    assert err == OUT_OF_ORDER_SEQUENCE_NUMBER, f"expected 45, got {err}"
+    assert high_watermark(topic) == 0, "the first batch of a failed partition append was kept"
+
+    ok = record_batch([b"second"], producer_id=pid, producer_epoch=0, base_sequence=1)
+    _, err, _ = send_produce(conn, topic, good + ok, 8351)
+    assert err == 0, f"the corrected resend failed with {err}"
+    assert high_watermark(topic) == 2
+
+def test_one_failed_partition_does_not_replay_its_neighbours(conn):
+    """Two partitions in one request; the second is out of order.
+
+    The first partition must land exactly once and be reported as such.
+    """
+    name = "p4-neighbours"
+    pid = 7860
+    sql(f"SELECT kafgres_drop_topic('{name}')")
+    sql(f"SELECT kafgres_create_topic('{name}', 2)")
+    try:
+        good = record_batch([b"ok"], producer_id=pid, producer_epoch=0, base_sequence=0)
+        bad = record_batch([b"gap"], producer_id=pid, producer_epoch=0, base_sequence=9)
+        # Gives the producer a window row on partition 1, so the out-of-order
+        # batch below is refused against it.
+        seed = record_batch([b"seed"], producer_id=pid, producer_epoch=0, base_sequence=0)
+        header = struct.pack(">hhi", PRODUCE, 3, 8360)
+        header += struct.pack(">h", 6) + b"pytest"
+        frame = header + produce_v3_many(name, [(1, seed)])
+        conn.sock.sendall(struct.pack(">i", len(frame)) + frame)
+        _, results = parse_produce_v3_many(conn.recv())
+        assert results == [(1, 0, 0)], results
+
+        header = struct.pack(">hhi", PRODUCE, 3, 8361)
+        header += struct.pack(">h", 6) + b"pytest"
+        frame = header + produce_v3_many(name, [(0, good), (1, bad)])
+        conn.sock.sendall(struct.pack(">i", len(frame)) + frame)
+        _, results = parse_produce_v3_many(conn.recv())
+        by_partition = {p: (err, base) for p, err, base in results}
+        assert by_partition[0] == (0, 0), results
+        assert by_partition[1][0] == OUT_OF_ORDER_SEQUENCE_NUMBER, results
+        assert high_watermark(name, 0) == 1, "the healthy partition's batch landed more than once"
+        assert high_watermark(name, 1) == 1, "the failed partition kept its batch"
+
+        # The window row survived: the resend is a duplicate.
+        header = struct.pack(">hhi", PRODUCE, 3, 8362)
+        header += struct.pack(">h", 6) + b"pytest"
+        frame = header + produce_v3_many(name, [(0, good)])
+        conn.sock.sendall(struct.pack(">i", len(frame)) + frame)
+        _, results = parse_produce_v3_many(conn.recv())
+        assert results == [(0, 0, 0)], results
+        assert high_watermark(name, 0) == 1, "the resend of an acknowledged batch landed again"
+    finally:
+        sql(f"SELECT kafgres_drop_topic('{name}')")
+
 def test_a_wide_produce_costs_one_subtransaction(conn):
     """The savepoint that makes a partition atomic must not be paid per partition.
 
