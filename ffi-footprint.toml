@@ -1,0 +1,27 @@
+# FFI footprint configuration for kafgres; see tools/ffi-footprint/README.md.
+# Keys not set here come from tools/ffi-footprint/defaults.toml.
+
+[project]
+crate = "extension"
+lib = "kafgres"
+pg = [16]
+features = ["pg{pg}"]
+image = "kafgres-ffi:pg{pg}"
+build = "docker build -q -f docker/Dockerfile --build-arg PG_MAJOR={pg} -t {image} ."
+
+[accepted]
+# Postgres's fsync-failure policy: with data_sync_retry off, fd.c PANICs when a close,
+# writeback or LRU eviction fails, since the kernel may have dropped the dirty pages. The
+# segment store adopts the same policy (Vfd::sync escalates through data_sync_elevel), and
+# no handler can catch a PANIC.
+"ffi-panic-unhandled:File*" = "fd.c's fsync-failure PANIC; the segment store adopts the same policy in Vfd::sync, and a PANIC cannot be handled."
+"ffi-panic-unhandled:PathNameOpenFilePerm" = "Opening a file can evict another VFD; a failed close there is fd.c's fsync-failure PANIC, which the segment store adopts."
+"ffi-panic-unhandled:CreateWaitEventSet" = "Reserving the epoll fd can evict a VFD; a failed close there is fd.c's fsync-failure PANIC."
+# Abort-path cleanup of files a transaction left open (AtEOXact_Files), unhandleable and
+# common to every transaction in every backend.
+"ffi-panic-unhandled:CommitTransactionCommand" = "Abort-path cleanup of leftover files under fd.c's fsync-failure PANIC; common to every transaction."
+"ffi-panic-unhandled:BeginInternalSubTransaction" = "Reaches the same abort-path file cleanup through CommitTransactionCommand; common to every transaction."
+
+[handlers]
+# dbtx::with_subtransaction and dbtx::guarded are inferred from PgTryBuilder::new.
+roots = { "PgTryBuilder::new" = [0], "catch_unwind" = [0] }
