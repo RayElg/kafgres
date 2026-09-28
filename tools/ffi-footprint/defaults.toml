@@ -1,0 +1,174 @@
+# Defaults for pgrx extensions (pgrx 0.16). A project's ffi-footprint.toml overrides any
+# key; tables merge key by key, lists replace.
+
+[project]
+# Crate directory holding src/lib.rs, relative to the project config.
+crate = "."
+# Extension library name, as in `<name>.so`.
+lib = ""
+# Postgres majors to analyze; `--pg` overrides.
+pg = [16]
+# Features for each major; `{pg}` is substituted.
+features = ["pg{pg}"]
+# Image holding the installed extension and the server (with its bitcode), per major.
+image = ""
+# Command that builds `image` for a major; empty means the image must already exist.
+build = ""
+# Server bitcode to analyze. "source" builds the backend at -O0 -g from the upstream
+# source of the installed version (once per image, needs network): every struct field
+# access keeps its type, so function pointers resolve by field, and every call site has a
+# file and line. "package" uses the -O2 JIT bitcode the server ships, which resolves far
+# fewer function pointers and has no source locations.
+bitcode = "source"
+
+[scanner]
+# Paths whose segments include one of these are FFI calls into the server.
+ffi_modules = ["pg_sys"]
+# Calls whose closure argument runs later, from C.
+closure_entries = ["register_xact_callback", "register_subxact_callback"]
+# Macros that raise a Postgres error; "dynamic" reads the level from the tokens.
+raise_macros = { error = "ERROR", FATAL = "FATAL", PANIC = "PANIC", ereport = "dynamic" }
+# Macros that call into the server.
+macro_ffi = { check_for_interrupts = "ProcessInterrupts" }
+panic_macros = ["panic", "unreachable", "todo", "unimplemented", "assert", "assert_eq", "assert_ne"]
+panic_methods = ["unwrap", "expect", "unwrap_err", "expect_err"]
+# cfg flags and key=value pairs that are true; other known target keys are false.
+cfg = ["unix", "target_os=linux", "target_family=unix", "target_pointer_width=64",
+       "target_endian=little", "panic=unwind"]
+
+[handlers]
+# A call matching one of these (path suffix) runs the listed argument positions under a
+# Postgres error handler; functions passing a parameter into one are inferred as wrappers,
+# transitively.
+roots = { "PgTryBuilder::new" = [0], "pg_try" = [0], "catch_unwind" = [0] }
+
+# Entry kinds: how Postgres calls in, and what an escaping ERROR or panic becomes there.
+# severity: 1 transaction-scoped, 2 process restart, 3 server start, 4 PANIC.
+[entry_kinds.sql-function]
+failure = "ERROR: aborts the calling transaction"
+severity = 1
+[entry_kinds.bgworker]
+failure = "FATAL: the worker exits; the postmaster restarts it after bgw_restart_time"
+severity = 2
+[entry_kinds.library-load]
+failure = "FATAL at load: from shared_preload_libraries the server does not start"
+severity = 3
+[entry_kinds.output-plugin]
+failure = "ERROR: ends the decoding session"
+severity = 1
+[entry_kinds.xact-commit-callback]
+failure = "PANIC: an ERROR after the commit record is written cannot abort the transaction"
+severity = 4
+[entry_kinds.xact-abort-callback]
+failure = "PANIC risk: an ERROR during abort processing escalates"
+severity = 4
+[entry_kinds.xact-callback]
+failure = "depends on the event: ERROR before commit, PANIC after the commit record"
+severity = 4
+[entry_kinds.hook]
+failure = "ERROR in whichever backend runs the hook"
+severity = 2
+[entry_kinds.callback]
+failure = "unknown C caller"
+severity = 2
+[entry_kinds.exported]
+failure = "unknown C caller"
+severity = 2
+
+[entries]
+# Exported symbol names with a fixed meaning.
+names = { "_PG_init" = "library-load", "_PG_fini" = "library-load", "_PG_output_plugin_init" = "output-plugin" }
+# Method/function names whose string argument names an exported function Postgres will
+# call, and the kind that function becomes.
+by_string = { set_function = "bgworker" }
+# A function pointer escaping to C: the first regex matching the source line decides its kind.
+escapes = [
+  { match = '_cb\s*=', kind = "output-plugin" },
+  { match = '_hook\s*=', kind = "hook" },
+  { match = 'Register(Sub)?XactCallback', kind = "xact-callback" },
+]
+# Closure registrations: the first pattern matching the registration's other arguments.
+closures = [
+  { match = 'PreCommit|PrePrepare', kind = "xact-callback" },
+  { match = 'Commit', kind = "xact-commit-callback" },
+  { match = 'Abort', kind = "xact-abort-callback" },
+  { match = '.', kind = "xact-callback" },
+]
+
+[exports]
+# Symbols pgrx generates, as patterns over a `#[pg_extern]` function name.
+pg_extern = ["{name}_wrapper", "pg_finfo_{name}_wrapper", "__pgrx_internals_fn_{name}"]
+# Symbols with no source function behind them.
+ignore = ["Pg_magic_func", "__pgrx_marker", "_init", "_fini"]
+ignore_prefixes = ["__pgrx_internals_"]
+
+[server]
+# Overrides for cfx.py's DEFAULTS: effect tables, sinks, elevel functions, cut_edges.
+# Lists replace the default list; see cfx.py.
+
+[pgrx_api]
+# Safe pgrx calls that enter the server, as path suffix -> the C symbols they reach; their
+# effects are the union of those symbols' effects.
+"Spi::run" = ["SPI_connect", "SPI_execute", "SPI_finish"]
+"Spi::run_with_args" = ["SPI_connect", "SPI_execute_with_args", "SPI_finish"]
+"Spi::get_one" = ["SPI_connect", "SPI_execute", "SPI_finish"]
+"Spi::get_one_with_args" = ["SPI_connect", "SPI_execute_with_args", "SPI_finish"]
+"Spi::get_two" = ["SPI_connect", "SPI_execute", "SPI_finish"]
+"Spi::get_two_with_args" = ["SPI_connect", "SPI_execute_with_args", "SPI_finish"]
+"Spi::get_three" = ["SPI_connect", "SPI_execute", "SPI_finish"]
+"Spi::get_three_with_args" = ["SPI_connect", "SPI_execute_with_args", "SPI_finish"]
+"Spi::connect" = ["SPI_connect", "SPI_finish"]
+"Spi::connect_mut" = ["SPI_connect", "SPI_finish"]
+"Spi::explain" = ["SPI_connect", "SPI_execute", "SPI_finish"]
+"BackgroundWorker::transaction" = ["StartTransactionCommand", "CommitTransactionCommand"]
+"BackgroundWorker::connect_worker_to_spi" = ["BackgroundWorkerInitializeConnection"]
+"BackgroundWorker::wait_latch" = ["WaitLatch", "ResetLatch"]
+"BackgroundWorker::attach_signal_handlers" = ["pqsignal"]
+"PgMemoryContexts::switch_to" = ["MemoryContextSwitchTo"]
+"GucRegistry::define_string_guc" = ["DefineCustomStringVariable"]
+"GucRegistry::define_int_guc" = ["DefineCustomIntVariable"]
+"GucRegistry::define_bool_guc" = ["DefineCustomBoolVariable"]
+"GucRegistry::define_enum_guc" = ["DefineCustomEnumVariable"]
+"GucRegistry::define_float_guc" = ["DefineCustomRealVariable"]
+
+[report]
+# Effects at most this many source-module crossings away count as direct: 0 is inside the
+# called function's own module, 1 allows one further subsystem.
+direct_hops = 1
+# An FFI site outside every handler whose PANIC is at most this many crossings away is a finding.
+panic_hops = 1
+# Effects that make such a site a finding. PANIC(io) is a PANIC chosen by an I/O failure
+# (data_sync_elevel); add "PANIC" to also flag invariant PANICs inside the server.
+panic_effects = ["PANIC(io)"]
+# Entries at or above this severity (see entry_kinds) report every raising site reached
+# outside a handler.
+critical_severity = 4
+# Finding kinds that fail `--baseline` when new.
+fail_on = ["unguarded-extern", "unsafe-no-safety", "ffi-panic-unhandled",
+           "critical-entry-error", "critical-entry-panic", "export-unmapped"]
+# Rust-side file I/O worth listing: path segments or method names.
+rust_io_paths = ["fs", "File", "OpenOptions"]
+rust_io_methods = ["sync_all", "sync_data", "set_len", "write_all_at", "read_exact_at"]
+# Method names too common to resolve to crate methods by name alone.
+common_methods = [
+  "new", "len", "is_empty", "get", "get_mut", "insert", "remove", "push", "pop", "clear",
+  "iter", "iter_mut", "into_iter", "next", "map", "and_then", "unwrap_or", "unwrap_or_else",
+  "unwrap_or_default", "ok_or", "ok_or_else", "map_err", "clone", "to_string", "to_owned",
+  "as_str", "as_ref", "as_mut", "from", "into", "try_from", "try_into", "contains",
+  "contains_key", "entry", "extend", "write", "read", "flush", "send", "recv", "lock", "take",
+  "replace", "fmt", "eq", "cmp", "partial_cmp", "hash", "drop", "default", "deref", "split",
+  "join", "parse", "to_vec", "as_slice", "first", "last", "min", "max", "sum", "count",
+  "filter", "find", "position", "any", "all", "retain", "sort", "sort_by", "sort_by_key",
+  "drain", "truncate", "resize", "reserve", "with_capacity", "capacity", "set", "load",
+  "store", "swap", "fetch_add", "fetch_sub", "or_insert", "or_insert_with", "or_default",
+  "keys", "values", "values_mut", "copied", "cloned", "collect", "rev", "zip", "enumerate",
+  "chain", "skip", "step_by", "windows", "chunks", "is_some", "is_none", "is_ok", "is_err",
+  "ok", "err", "expect", "unwrap", "starts_with", "ends_with", "trim", "bytes", "chars",
+  "lines", "extend_from_slice", "copy_from_slice", "fill", "split_at", "get_or_insert_with",
+  "push_str", "push_back", "push_front", "pop_front", "pop_back", "front", "back", "checked_add",
+  "checked_sub", "checked_mul", "saturating_sub", "saturating_add", "wrapping_add", "abs",
+  "elapsed", "duration_since", "as_secs", "as_millis", "to_le_bytes", "to_be_bytes",
+  "from_le_bytes", "from_be_bytes", "as_ptr", "as_mut_ptr", "is_null", "cast", "run", "close",
+  "open", "start", "finish", "reset", "update", "state", "id", "name", "key", "value", "kind",
+  "code", "status", "size", "offset", "flags", "poll", "wait", "notify_one", "notify_all",
+]
