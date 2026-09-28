@@ -2245,7 +2245,12 @@ impl SegmentStore {
 
     /// Release one uncommitted reservation, on both commit and abort: missing it on the abort
     pub fn release_pending(topic: TopicId, partition: i32) {
-        let mut slots = SHARDS[shard_of(topic, partition)].exclusive();
+        // Runs in a commit or abort callback, where a panic is a PANIC: no indexing.
+        let Some(shard) = SHARDS.get(shard_of(topic, partition)) else {
+            pgrx::warning!("kafgres: no lock shard for topic {topic} partition {partition}; reservation not released");
+            return;
+        };
+        let mut slots = shard.exclusive();
         for slot in slots.iter_mut() {
             if slot.topic == topic && slot.partition == partition {
                 slot.pending_count = (slot.pending_count - 1).max(0);
