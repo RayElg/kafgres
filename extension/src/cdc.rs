@@ -234,7 +234,10 @@ fn render_query(
                 LATERAL (SELECT b.e->'ch'->'tables') AS dc(data_collections),
                 LATERAL (SELECT CASE WHEN (b.e->'ch'->>'ts')::bigint > 0
                                      THEN 'epoch'::timestamptz + '946684800 seconds'::interval
-                                          + ((b.e->'ch'->>'ts')::bigint || ' microseconds')::interval
+                                          -- Seconds and remainder separately: PG 13 and 14 reject
+                                          -- a single interval field this large as text input.
+                                          + ((b.e->'ch'->>'ts')::bigint / 1000000) * interval '1 second'
+                                          + ((b.e->'ch'->>'ts')::bigint % 1000000) * interval '1 microsecond'
                                 END) AS c(commit_ts)
           WHERE ({filter})
           ORDER BY b.ord",

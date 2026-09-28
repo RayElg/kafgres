@@ -77,7 +77,13 @@ impl Readiness {
                 self.set = std::ptr::null_mut();
             }
             let n = (FIRST_SOCKET + want.len()) as i32;
-            self.set = pg_sys::CreateWaitEventSet(pg_sys::TopMemoryContext, n);
+            // From PG 17 the first argument is a ResourceOwner; NULL means session lifetime.
+            // The set is still allocated in TopMemoryContext, as before.
+            #[cfg(not(any(feature = "pg17", feature = "pg18")))]
+            let owner = pg_sys::TopMemoryContext;
+            #[cfg(any(feature = "pg17", feature = "pg18"))]
+            let owner = std::ptr::null_mut();
+            self.set = pg_sys::CreateWaitEventSet(owner, n);
             pg_sys::AddWaitEventToSet(
                 self.set,
                 pg_sys::WL_LATCH_SET,
