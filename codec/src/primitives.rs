@@ -78,6 +78,9 @@ pub fn get_uvarint(buf: &mut Bytes) -> Result<u32, CodecError> {
     let mut value: u32 = 0;
     for i in 0..5 {
         let b = get_i8(buf)? as u8;
+        if i == 4 && b & 0x70 != 0 {
+            return Err(CodecError::MalformedVarint);
+        }
         value |= ((b & 0x7f) as u32) << (7 * i);
         if b & 0x80 == 0 {
             return Ok(value);
@@ -100,8 +103,11 @@ fn get_len(buf: &mut Bytes, flexible: bool, wide: bool) -> Result<Option<usize>,
     } else {
         get_i16(buf)? as i64
     };
-    if raw < 0 {
+    if raw == -1 {
         return Ok(None);
+    }
+    if raw < -1 {
+        return Err(CodecError::InvalidLength(raw));
     }
     if raw > MAX_LENGTH {
         return Err(CodecError::InvalidLength(raw));
@@ -341,6 +347,56 @@ mod tests {
     }
 
     #[test]
+    fn uvarint_rejects_fifth_byte_overflow() {
+        for last in [0x10, 0x7f] {
+            let mut r = Bytes::from(vec![0x80, 0x80, 0x80, 0x80, last]);
+            assert_eq!(get_uvarint(&mut r), Err(CodecError::MalformedVarint));
+        }
+    }
+
+    #[test]
+    fn uvarint_keeps_nonminimal_encoding_and_rejects_unfinished_input() {
+        let mut r = Bytes::from_static(&[0x80, 0x00]);
+        assert_eq!(get_uvarint(&mut r), Ok(0));
+        let mut r = Bytes::from_static(&[0x80, 0x80, 0x80, 0x80, 0x00]);
+        assert_eq!(get_uvarint(&mut r), Ok(0));
+        let mut r = Bytes::from_static(&[0x80, 0x80, 0x80, 0x80]);
+        assert_eq!(
+            get_uvarint(&mut r),
+            Err(CodecError::Truncated {
+                needed: 1,
+                available: 0
+            })
+        );
+        let mut r = Bytes::from_static(&[0x80, 0x80, 0x80, 0x80, 0x80]);
+        assert_eq!(get_uvarint(&mut r), Err(CodecError::MalformedVarint));
+    }
+
+    #[test]
+    fn legacy_lengths_below_minus_one_are_invalid() {
+        for raw in [-2_i16, i16::MIN] {
+            let mut r = Bytes::copy_from_slice(&raw.to_be_bytes());
+            assert_eq!(
+                get_nullable_string(&mut r, false),
+                Err(CodecError::InvalidLength(raw as i64))
+            );
+        }
+        for raw in [-2_i32, i32::MIN] {
+            let bytes = raw.to_be_bytes();
+            let mut r = Bytes::copy_from_slice(&bytes);
+            assert_eq!(
+                get_nullable_bytes(&mut r, false),
+                Err(CodecError::InvalidLength(raw as i64))
+            );
+            let mut r = Bytes::copy_from_slice(&bytes);
+            assert_eq!(
+                get_array_len(&mut r, false),
+                Err(CodecError::InvalidLength(raw as i64))
+            );
+        }
+    }
+
+    #[test]
     fn compact_null_is_zero_legacy_is_minus_one() {
         let mut b = BytesMut::new();
         put_nullable_string(&mut b, None, true).unwrap();
@@ -349,6 +405,24 @@ mod tests {
         let mut b = BytesMut::new();
         put_nullable_string(&mut b, None, false).unwrap();
         assert_eq!(&b[..], &[0xff, 0xff]);
+    }
+
+    #[test]
+    fn length_prefixes_preserve_null_empty_and_positive_values() {
+        let mut r = Bytes::from_static(&[0xff, 0xff]);
+        assert_eq!(get_nullable_string(&mut r, false), Ok(None));
+        let mut r = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(get_nullable_bytes(&mut r, false), Ok(None));
+        let mut r = Bytes::from_static(&[0, 0]);
+        assert_eq!(get_nullable_string(&mut r, false), Ok(Some(String::new())));
+        let mut r = Bytes::from_static(&[0, 0, 0, 0]);
+        assert_eq!(get_array_len(&mut r, false), Ok(Some(0)));
+        let mut r = Bytes::from_static(&[0, 0, 0, 3]);
+        assert_eq!(get_array_len(&mut r, false), Ok(Some(3)));
+        let mut r = Bytes::from_static(&[0]);
+        assert_eq!(get_array_len(&mut r, true), Ok(None));
+        let mut r = Bytes::from_static(&[4]);
+        assert_eq!(get_array_len(&mut r, true), Ok(Some(3)));
     }
 
     #[test]
