@@ -4,8 +4,12 @@
 # skips the pgrx/Postgres link step and passes on code that cannot load, which is why
 # this gate exists.
 
-# Pinned for reproducible builds, like `postgresql-server-dev-16` and `cargo-pgrx` below.
+# PostgreSQL major to build for and run, 13 through 18. Default 16 is the release version.
+ARG PG_MAJOR=16
+
+# Pinned for reproducible builds, like `cargo-pgrx` below.
 FROM rust:1.98.0-bookworm AS builder
+ARG PG_MAJOR
 
 RUN apt-get update && apt-get install -y \
     lsb-release \
@@ -18,16 +22,19 @@ RUN apt-get update && apt-get install -y \
     clang \
     gcc \
     libclang-dev \
-    postgresql-server-dev-16 \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Pinned to the version in extension/Cargo.toml.
+# Pinned to the version in extension/Cargo.toml. Installed before the PG headers so
+# this layer is shared across every PG_MAJOR.
 RUN cargo install --locked cargo-pgrx --version 0.16.1
 
+RUN apt-get update && apt-get install -y postgresql-server-dev-${PG_MAJOR} \
+    && rm -rf /var/lib/apt/lists/*
+
 # Use the packaged Postgres rather than compiling one from source.
-RUN cargo pgrx init --pg16 /usr/lib/postgresql/16/bin/pg_config
+RUN cargo pgrx init --pg${PG_MAJOR} /usr/lib/postgresql/${PG_MAJOR}/bin/pg_config
 
 WORKDIR /usr/src/kafgres
 
@@ -58,19 +65,21 @@ WORKDIR /usr/src/kafgres/extension
 # `#[cfg(test)]` code for a long stretch of this project's history. The gate therefore
 # goes in the build the project mandates rather than in a CI job someone has to
 # remember to add.
-RUN cargo check --tests && \
-    cargo pgrx package && \
+RUN cargo check --tests --no-default-features --features pg${PG_MAJOR} && \
+    cargo pgrx package --no-default-features --features pg${PG_MAJOR} \
+        --pg-config /usr/lib/postgresql/${PG_MAJOR}/bin/pg_config && \
     mkdir -p /app/dist && \
-    cp -r target/release/kafgres-pg16/* /app/dist/ && \
+    cp -r target/release/kafgres-pg${PG_MAJOR}/* /app/dist/ && \
     # Only /app/dist is copied onward; Dockerfile.pgrx-test derives from this image, so
     # without this every test run re-extracts the whole build tree from the layer.
     # The tests' own artifacts live in the cargo cache volume, not here.
     rm -rf /usr/src/kafgres/extension/target
 
-FROM postgres:16-bookworm
+FROM postgres:${PG_MAJOR}-bookworm
+ARG PG_MAJOR
 
-COPY --from=builder /app/dist/usr/share/postgresql/16/extension /usr/share/postgresql/16/extension
-COPY --from=builder /app/dist/usr/lib/postgresql/16/lib /usr/lib/postgresql/16/lib
+COPY --from=builder /app/dist/usr/share/postgresql/${PG_MAJOR}/extension /usr/share/postgresql/${PG_MAJOR}/extension
+COPY --from=builder /app/dist/usr/lib/postgresql/${PG_MAJOR}/lib /usr/lib/postgresql/${PG_MAJOR}/lib
 
 # kafgres must be preloaded: background workers can only be registered from _PG_init,
 # which runs at postmaster start.
@@ -82,16 +91,23 @@ RUN echo "shared_preload_libraries = 'kafgres'" >> /usr/share/postgresql/postgre
     # unaffected. Written to the versioned sample as well, for the reason given below
     # the pg_hba lines.
     echo "wal_level = logical" >> /usr/share/postgresql/postgresql.conf.sample && \
+    for f in /usr/share/postgresql/*/postgresql.conf.sample; do \
+        echo "wal_level = logical" >> "$f"; \
+    done && \
     # An output plugin is loaded on behalf of any REPLICATION user, so since 16.15 the
     # library must be allowlisted — otherwise creating the slot fails with "may not be
     # used as an output plugin". The default is `pgoutput, test_decoding`, which is worth
     # noting: the shortcut this project rejected needs no configuration at all.
-    echo "output_plugin_libraries = 'pgoutput, test_decoding, kafgres'" \
-        >> /usr/share/postgresql/postgresql.conf.sample && \
-    for f in /usr/share/postgresql/*/postgresql.conf.sample; do \
-        echo "wal_level = logical" >> "$f"; \
-        echo "output_plugin_libraries = 'pgoutput, test_decoding, kafgres'" >> "$f"; \
-    done && \
+    # PG 13 has no such setting; 14 through 18 do. An unknown setting refuses to start
+    # the server, so write it only where this server reports it.
+    settings="$(gosu postgres postgres --describe-config)" && \
+    if printf '%s\n' "$settings" | grep -q '^output_plugin_libraries'; then \
+        echo "output_plugin_libraries = 'pgoutput, test_decoding, kafgres'" \
+            >> /usr/share/postgresql/postgresql.conf.sample; \
+        for f in /usr/share/postgresql/*/postgresql.conf.sample; do \
+            echo "output_plugin_libraries = 'pgoutput, test_decoding, kafgres'" >> "$f"; \
+        done; \
+    fi && \
     echo "local   all             all                                     trust" >> /usr/share/postgresql/pg_hba.conf.sample && \
     echo "host    all             all             all                     trust" >> /usr/share/postgresql/pg_hba.conf.sample && \
     # The failover rig takes a base backup and streams from here. `all` does not cover

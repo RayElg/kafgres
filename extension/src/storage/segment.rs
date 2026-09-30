@@ -393,6 +393,73 @@ struct Recovered {
     max_timestamp: i64,
 }
 
+/// One `FileWrite`, returning bytes written or -1. Signature differs by version:
+/// `char *`/`int` through 15, `void *`/`size_t` in 16, `FileWriteV` (iovec) from 17.
+#[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+unsafe fn file_write(file: pgrx::pg_sys::File, buf: &[u8], offset: u64, wait: u32) -> isize {
+    let len = buf.len().min(i32::MAX as usize) as i32;
+    pgrx::pg_sys::FileWrite(
+        file,
+        buf.as_ptr() as *mut core::ffi::c_char,
+        len,
+        offset as pgrx::pg_sys::off_t,
+        wait,
+    ) as isize
+}
+
+#[cfg(feature = "pg16")]
+unsafe fn file_write(file: pgrx::pg_sys::File, buf: &[u8], offset: u64, wait: u32) -> isize {
+    pgrx::pg_sys::FileWrite(
+        file,
+        buf.as_ptr() as *const core::ffi::c_void,
+        buf.len(),
+        offset as pgrx::pg_sys::off_t,
+        wait,
+    ) as isize
+}
+
+#[cfg(any(feature = "pg17", feature = "pg18"))]
+unsafe fn file_write(file: pgrx::pg_sys::File, buf: &[u8], offset: u64, wait: u32) -> isize {
+    let iov = pgrx::pg_sys::iovec {
+        iov_base: buf.as_ptr() as *mut core::ffi::c_void,
+        iov_len: buf.len(),
+    };
+    pgrx::pg_sys::FileWriteV(file, &iov, 1, offset as pgrx::pg_sys::off_t, wait)
+}
+
+/// One `FileRead`, returning bytes read, 0 at EOF, or -1. Same version split as `file_write`.
+#[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+unsafe fn file_read(file: pgrx::pg_sys::File, buf: &mut [u8], offset: u64, wait: u32) -> isize {
+    let len = buf.len().min(i32::MAX as usize) as i32;
+    pgrx::pg_sys::FileRead(
+        file,
+        buf.as_mut_ptr() as *mut core::ffi::c_char,
+        len,
+        offset as pgrx::pg_sys::off_t,
+        wait,
+    ) as isize
+}
+
+#[cfg(feature = "pg16")]
+unsafe fn file_read(file: pgrx::pg_sys::File, buf: &mut [u8], offset: u64, wait: u32) -> isize {
+    pgrx::pg_sys::FileRead(
+        file,
+        buf.as_mut_ptr() as *mut core::ffi::c_void,
+        buf.len(),
+        offset as pgrx::pg_sys::off_t,
+        wait,
+    ) as isize
+}
+
+#[cfg(any(feature = "pg17", feature = "pg18"))]
+unsafe fn file_read(file: pgrx::pg_sys::File, buf: &mut [u8], offset: u64, wait: u32) -> isize {
+    let iov = pgrx::pg_sys::iovec {
+        iov_base: buf.as_mut_ptr() as *mut core::ffi::c_void,
+        iov_len: buf.len(),
+    };
+    pgrx::pg_sys::FileReadV(file, &iov, 1, offset as pgrx::pg_sys::off_t, wait)
+}
+
 /// A file opened through Postgres's VFD layer — never raw `open()`: `max_files_per_process`
 struct Vfd {
     file: pgrx::pg_sys::File,
@@ -430,11 +497,10 @@ impl Vfd {
     fn write_all_at(&mut self, mut buf: &[u8], mut offset: u64) -> StoreResult<()> {
         while !buf.is_empty() {
             let n = unsafe {
-                pgrx::pg_sys::FileWrite(
+                file_write(
                     self.file,
-                    buf.as_ptr() as *const core::ffi::c_void,
-                    buf.len(),
-                    offset as pgrx::pg_sys::off_t,
+                    buf,
+                    offset,
                     pgrx::pg_sys::WaitEventIO::WAIT_EVENT_DATA_FILE_WRITE as u32,
                 )
             };
@@ -452,11 +518,10 @@ impl Vfd {
         let mut total = 0;
         while total < buf.len() {
             let n = unsafe {
-                pgrx::pg_sys::FileRead(
+                file_read(
                     self.file,
-                    buf[total..].as_mut_ptr() as *mut core::ffi::c_void,
-                    buf.len() - total,
-                    (offset + total as u64) as pgrx::pg_sys::off_t,
+                    &mut buf[total..],
+                    offset + total as u64,
                     pgrx::pg_sys::WaitEventIO::WAIT_EVENT_DATA_FILE_READ as u32,
                 )
             };

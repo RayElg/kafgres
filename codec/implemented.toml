@@ -204,7 +204,7 @@ DescribeTransactions = "0"
 ListTransactions = "0-2"
 
 # APIs a single embedded broker can only answer one way, served so a client's version probe
-# sees a current broker: franz-go (Redpanda Console, kcat, the Go ecosystem) guesses the
+# sees a current broker: franz-go (Redpanda Console, the Go ecosystem) guesses the
 # cluster version from the *set* of keys advertised, so one absent key from Kafka 1.0 reads
 # the whole cluster as pre-1.0. See handlers/singleton.rs.
 AlterReplicaLogDirs = "1-2"

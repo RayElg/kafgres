@@ -82,14 +82,14 @@ can be backfilled into the same topic with `kafgres_snapshot_mapping`, which app
 same expressions to the table's current contents, so a backfilled record and a streamed
 one are identical by construction.
 
-Two settings are required: `wal_level = logical`, and `kafgres` in
-`output_plugin_libraries`. Both are set in the Docker image. When one is missing, the
-broker logs a line naming the setting.
+Two settings are required: `wal_level = logical`, and, on a server that has the
+setting, `kafgres` in `output_plugin_libraries`. Both are set in the Docker image. When one is missing, the
+CDC worker logs a line naming the setting.
 
 `kafgres_preview_mapping(mapping, predicate)` renders a mapping over the source table's
 current rows before you enable it. The second argument is a SQL predicate spliced into
 the mapping's `WHERE` clause to select the rows to render, e.g.
-`kafgres_preview_mapping('orders', 'new.id = 10')` — not a key or an op. Columns must be
+`kafgres_preview_mapping('orders-cdc', 'new.id = 10')`, not a key or an op. Columns must be
 qualified (`new.id`, not `id`), because `old` is in scope too. `op` binds as `I`,
 matching what the drain emits. `kafgres_cdc_status()` reports the slot's position and
 the WAL it is retaining.
@@ -112,7 +112,8 @@ injection-prone, and because SQL can do things a template over one row cannot:
   expressible, which is a domain event rather than a row diff.
 - **Masking and redaction** are ordinary expressions.
 - **The outbox pattern is one line.** A mapping over an outbox table is
-  `value => new.payload, key => new.key, topic => new.topic`.
+  `value => new.payload, key => new.key`. A mapping's topic is fixed, so an outbox that
+  routes by a topic column takes one mapping per topic, each filtered on `new.topic`.
 
 ### What a mapping has in scope
 

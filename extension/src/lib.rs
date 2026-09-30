@@ -566,7 +566,7 @@ pub extern "C-unwind" fn _PG_init() {
     );
     GucRegistry::define_string_guc(
         c"kafgres.tls_cert_file",
-        c"PEM server certificate chain. TLS is enabled when this and tls_key_file are both set (requires BGW restart)",
+        c"PEM server certificate chain. TLS is enabled when this and tls_key_file are both set (a reload applies to new connections)",
         c"",
         &TLS_CERT_FILE,
         GucContext::Sighup,
@@ -574,7 +574,7 @@ pub extern "C-unwind" fn _PG_init() {
     );
     GucRegistry::define_string_guc(
         c"kafgres.tls_key_file",
-        c"PEM private key for tls_cert_file (requires BGW restart)",
+        c"PEM private key for tls_cert_file (a reload applies to new connections)",
         c"",
         &TLS_KEY_FILE,
         GucContext::Sighup,

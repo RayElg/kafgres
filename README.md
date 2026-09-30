@@ -36,7 +36,7 @@ The following all work today:
 - Consumers truncate rather than read divergent data when an async replica is promoted,
   verified against a real physical standby.
 - The conformance suite drives four real clients against kafgres and a reference Kafka
-  and diffs the observable results; it runs in CI on every commit, and every intended
+  and diffs the observable results; it runs in CI on every pull request, and every intended
   difference is catalogued in [docs/conformance.md](docs/conformance.md).
 - The segment engine (the default) passes the same conformance suite, survives `kill -9`
   with every acknowledged record intact, and replicates its log to a standby out of
@@ -248,8 +248,9 @@ and the ELR columns, which the tool renders as `N/A` against kafgres because it 
 back to `Metadata`. Anything else that differs is treated as a bug, and the script shows
 it rather than absorbing it.
 
-The demo is a summary; `tests/conformance/` is the gate. It runs the same four clients
-in seventeen tests, in CI on every commit.
+The demo is a summary; `tests/conformance/` is the gate. It runs Sarama, kafka-python
+and the Java tooling in seventeen tests, and replays KIP-890 transaction frames against
+both brokers in eighteen more, in CI on every pull request.
 
 ## Documentation
 
@@ -277,14 +278,14 @@ codec/          kafgres-codec, the wire protocol. No pgrx, no Postgres, unit-tes
   src/generated/     emitted by codec-gen and checked in; do not edit
 codec-gen/      the generator. `cargo run -p kafgres-codec-gen`
 extension/      the pgrx extension. Its own workspace on purpose.
-docs/           architecture.md, producing.md, conformance.md
+docs/           architecture.md, producing.md, conformance.md, configuration.md
 ```
 
 ## Build
 
 ```bash
 cargo test                    # codec + generator. No Postgres needed.
-docker compose build          # the only way to verify the extension links and loads
+docker compose build          # links the extension; cargo check does not
 docker compose up -d
 
 docker build -t kafgres-clients tests/clients
@@ -308,6 +309,10 @@ $ kcat -b localhost:9092 -L
 
 `cargo check` does not exercise the pgrx/Postgres link step and passes on code that
 cannot load. Use `docker compose build`.
+
+The image builds against PostgreSQL 16 by default; set `PG_MAJOR` (13 through 18) to
+build against another major, as in `PG_MAJOR=18 docker compose build`. CI builds and
+tests every major from 13 to 18.
 
 ## License
 

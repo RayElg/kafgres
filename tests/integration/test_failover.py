@@ -151,9 +151,9 @@ def promoted_standby():
     """
     subprocess.run(
         ["docker", "compose", "exec", "-T", "postgres", "sh", "-c",
-         "grep -q 'kafgres-failover-rig' /var/lib/postgresql/data/pg_hba.conf || "
+         "grep -q 'kafgres-failover-rig' \"$PGDATA/pg_hba.conf\" || "
          "printf '# kafgres-failover-rig\\nhost replication all all trust\\n"
-         "host all all all trust\\n' >> /var/lib/postgresql/data/pg_hba.conf"],
+         "host all all all trust\\n' >> \"$PGDATA/pg_hba.conf\""],
         capture_output=True, text=True, timeout=60, cwd=REPO,
     )
     sql("SELECT pg_reload_conf()")
@@ -200,8 +200,12 @@ def promoted_standby():
                    capture_output=True, text=True, timeout=180, cwd=REPO)
     deadline = time.time() + 90
     while time.time() < deadline:
-        if sql("SELECT 1").strip() == "1":
-            break
+        # Refused while it recovers: "the database system is starting up".
+        try:
+            if sql("SELECT 1").strip() == "1":
+                break
+        except RuntimeError:
+            pass
         time.sleep(2)
     primary_epoch = sql(
         f"""SELECT leader_epoch FROM kafgres_partitions
