@@ -32,7 +32,7 @@ deployment:
 
 Separately, `demo/run.sh payment` inserts a payment row and produces the event in one
 Postgres transaction, so there is no window where the row exists and the event does not.
-A second payment is rolled back, and publishes nothing.
+A second payment is rolled back, and `read_committed` consumers never see it.
 
 ## Running it
 

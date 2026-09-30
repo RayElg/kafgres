@@ -69,9 +69,13 @@ GRANT INSERT ON kafgres_markers TO order_service;
 SELECT kafgres_add_acl('User:order_service', 'WRITE', 'TOPIC', 'order-events');
 ```
 
-The administrative functions are not executable by `PUBLIC`: topic creation and
-deletion, ACLs, CDC mappings and slots, retention, archiving, restore checks and
-replication each need an explicit `GRANT EXECUTE`.
+Every other kafgres function is administrative and not executable by `PUBLIC` (topic
+creation and deletion, ACLs, CDC mappings and slots, retention, archiving, restore
+checks, replication), so each needs an explicit `GRANT EXECUTE`. The exceptions are
+`kafgres_produce()` itself and the read-only reports: `kafgres_version()`,
+`kafgres_kafka_version()`, `kafgres_partition_offsets()`, `kafgres_archive_status()`,
+`kafgres_cdc_status()`, `kafgres_cdc_snapshots()` and `kafgres_share_state()`. On an
+install upgraded from 0.2.0 this takes effect at `ALTER EXTENSION kafgres UPDATE`.
 
 ### Engines
 

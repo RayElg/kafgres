@@ -40,9 +40,9 @@ The following all work today:
   difference is catalogued in [docs/conformance.md](docs/conformance.md).
 - The segment engine (the default) passes the same conformance suite, survives `kill -9`
   with every acknowledged record intact, and replicates its log to a standby out of
-  band. Measured on the benchmark harness hardware, it produced about 1.5x the table
-  engine's throughput with a lower p99, at about 1% degradation of co-resident pgbench
-  against the table engine's 15%.
+  band. With `kafgres.fsync_before_ack` on, every acknowledged record also survives a
+  host crash. On an i9-13900 with power-loss-protected NVMe it produced about 2.4x the
+  table engine's throughput, 1.8x with `fsync_before_ack` on.
 - `kafgres_produce()` commits atomically with a business write.
 - CDC: a table's changes reach a topic through a logical decoding output plugin shipped
   with the extension, with the mapping written in SQL. See
@@ -141,6 +141,18 @@ $ psql -c "SELECT partition, COALESCE(high_watermark, 0) AS log_end_offset,
 The script uses a local `kcat` if you have one and the test client image otherwise.
 Nothing in it is kafgres-aware: every `kcat` line is one you would run against a real
 broker.
+
+## Upgrading
+
+Install the new build, restart Postgres, then run `ALTER EXTENSION kafgres UPDATE;` in
+the database the broker uses. The broker serves across the restart before the update
+runs; the update changes who may call the administrative functions (see
+[docs/producing.md](docs/producing.md#who-may-produce)) and pins `kafgres_produce()`'s
+search path.
+
+From 0.2.0, the first start on the segment engine removes the log's old-format
+`.timeindex` files. Nothing is lost: timestamp lookups scan the segments written before
+the upgrade instead, and segments written after it are indexed.
 
 ## CDC without Debezium
 
