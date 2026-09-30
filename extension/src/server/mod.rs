@@ -85,6 +85,17 @@ const MAX_CONN_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// Bytes, across all connections, that may sit *above* the per-connection free tier: keeps
 const MAX_OVERSIZE_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 
+/// Bytes of inbound buffer across all connections, free tiers included. The oversize budget
+/// alone bounds only what sits above the tiers; the tiers themselves add up to
+/// `MAX_CONNECTIONS × MAX_CONN_BUFFER_BYTES` = 4 GiB, pinnable by opening every connection
+/// and leaving a frame one byte short on each. A failed allocation aborts the process, so
+/// the aggregate is capped too.
+const MAX_INBOUND_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+
+/// How long a connection may wait for inbound budget before it is closed: a client's default
+/// `request.timeout.ms`. Also breaks a standoff where every holder is waiting for more.
+const MAX_MUTED: Duration = Duration::from_secs(30);
+
 /// Connection ceiling, Kafka's `max.connections`: without it the per-connection buffer cap
 const MAX_CONNECTIONS: usize = 512;
 
@@ -109,6 +120,15 @@ struct Conn {
     inbuf: BytesMut,
     /// Ceiling this connection was granted for the current pass. Set by the read pass and
     frame_cap: usize,
+    /// Since when reads have been paused for lack of inbound budget.
+    muted_since: Option<Instant>,
+    /// Bytes admitted from the front of `inbuf`: whole frames, then possibly one bare prefix.
+    /// Nothing past it is read, so a partial frame can always complete.
+    reserved: usize,
+    /// The last admitted step is a 4-byte prefix whose body is not admitted yet.
+    prefix_pending: bool,
+    /// When bytes last arrived: an admitted frame that stops arriving still holds budget.
+    last_read: Instant,
     outbuf: BytesMut,
 
     next_seq: u64,
@@ -319,16 +339,21 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
     // request may already be decrypted into a transport buffer, which readiness cannot
     // see, and complete frames may be waiting in `inbuf` past the per-tick cap.
     let mut readiness = readiness::Readiness::new();
-    let mut watched: Vec<(i32, i32, bool)> = Vec::new();
+    let mut watched: Vec<(i32, i32, bool, bool)> = Vec::new();
     let mut spin = false;
     let mut next_tick_at = Instant::now();
     loop {
         watched.clear();
         // Write interest only for bytes that may actually go out: a connection held
         // behind the durability barrier would otherwise wake the loop every pass while
-        // a failing fsync is retried.
+        // a failing fsync is retried. Read interest is off while a connection waits for budget.
         watched.extend(srv.conns.iter().map(|(id, c)| {
-            (c.stream.raw_fd(), *id, !c.outbuf.is_empty() && !c.awaiting_sync)
+            (
+                c.stream.raw_fd(),
+                *id,
+                c.muted_since.is_none(),
+                !c.outbuf.is_empty() && !c.awaiting_sync,
+            )
         }));
         watched.sort_unstable_by_key(|w| w.1);
         readiness.sync(listener_fd, &watched);
@@ -351,6 +376,9 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         if srv.ticked {
             srv.tick = srv.tick.wrapping_add(1);
             next_tick_at = now + tick;
+            // Here, not per pass: the loop can spin with a zero wait, and this is the one
+            // point each tick reliably between transactions.
+            crate::dbtx::report_stats();
         }
         // Before anything is served: an unloaded snapshot has `enabled = false`, which
         if !epochs_ready {
@@ -426,6 +454,10 @@ fn accept_new(listener: &TcpListener, srv: &mut Server) {
                         peer: addr.to_string(),
                         inbuf: BytesMut::with_capacity(READ_CHUNK_BYTES),
                         frame_cap: MAX_CONN_BUFFER_BYTES,
+                        muted_since: None,
+                        reserved: 0,
+                        prefix_pending: false,
+                        last_read: Instant::now(),
                         awaiting_sync: false,
                         outbuf: BytesMut::new(),
                         next_seq: 0,
@@ -461,8 +493,9 @@ fn poll_connections(srv: &mut Server, cfg: &ClusterConfig, ready: Option<&HashSe
     let mut oversize_total: usize = srv
         .conns
         .values()
-        .map(|c| c.inbuf.len().saturating_sub(tier))
+        .map(|c| c.claim().saturating_sub(tier))
         .sum();
+    let mut inbound_total: usize = srv.conns.values().map(|c| c.claim()).sum();
 
     for id in ids {
         if let Some(r) = ready {
@@ -488,15 +521,37 @@ fn poll_connections(srv: &mut Server, cfg: &ClusterConfig, ready: Option<&HashSe
                 closed.push(id);
                 continue;
             }
-            // Free tier plus what is left of the shared budget; its own excess is excluded so a connection mid-frame keeps what it holds.
-            let mine = conn.inbuf.len().saturating_sub(tier);
-            let others = oversize_total.saturating_sub(mine);
-            let inbound_cap = tier
+            // Free tier plus what is left of the shared budgets, own claim excluded.
+            let mine = conn.claim();
+            let others = oversize_total.saturating_sub(mine.saturating_sub(tier));
+            let others_total = inbound_total.saturating_sub(mine);
+            // The request limit plus the 4-byte length prefix.
+            let budget = tier
                 .saturating_add(MAX_OVERSIZE_TOTAL_BYTES.saturating_sub(others))
-                .min(requested_cap.max(tier));
-            conn.frame_cap = inbound_cap;
-            let outcome = read_available(conn, inbound_cap);
-            oversize_total = others + conn.inbuf.len().saturating_sub(tier);
+                .min(requested_cap.max(tier).saturating_add(4))
+                .min(MAX_INBOUND_TOTAL_BYTES.saturating_sub(others_total));
+            // Only a frame over the request limit is refused; others wait for budget.
+            conn.frame_cap = requested_cap.max(tier);
+            let outcome = read_admitted(conn, budget);
+            let outcome = match outcome {
+                ReadResult::Ok if conn.muted_since.is_some_and(|t| t.elapsed() > MAX_MUTED) => {
+                    ReadResult::Fatal(format!(
+                        "waited {}s for inbound budget (kafgres.max_request_bytes, or too many \
+                         connections holding partial frames)",
+                        MAX_MUTED.as_secs()
+                    ))
+                }
+                ReadResult::Ok if conn.stalled_in_body() && conn.last_read.elapsed() > MAX_MUTED => {
+                    ReadResult::Fatal(format!(
+                        "no bytes for {}s in the middle of a frame",
+                        MAX_MUTED.as_secs()
+                    ))
+                }
+                other => other,
+            };
+            let mine = conn.claim();
+            oversize_total = others + mine.saturating_sub(tier);
+            inbound_total = others_total + mine;
             // The certificate does not exist until the handshake finishes; read once and cached.
             if !conn.tls_checked && conn.stream.handshake_done() {
                 conn.tls_checked = true;
@@ -553,19 +608,69 @@ enum ReadResult {
     Fatal(String),
 }
 
+impl Conn {
+    /// Bytes counted against the shared inbound budgets.
+    fn claim(&self) -> usize {
+        self.inbuf.len().max(self.reserved)
+    }
+
+    /// Bytes of an admitted body have yet to arrive. Missing bytes that are only the next
+    /// prefix mean the connection is idle between requests.
+    fn stalled_in_body(&self) -> bool {
+        self.inbuf.len() < self.reserved && !(self.prefix_pending && self.inbuf.len() + 4 >= self.reserved)
+    }
+}
+
+/// Read only admitted bytes. A frame is admitted in two steps, its prefix and then its body
+/// once the prefix gives the size, each only within `budget`. A step that does not fit mutes
+/// the connection, which then holds only admitted frames and at most one prefix.
+fn read_admitted(conn: &mut Conn, budget: usize) -> ReadResult {
+    loop {
+        if conn.inbuf.len() < conn.reserved {
+            let before = conn.inbuf.len();
+            match read_available(conn, conn.reserved) {
+                ReadResult::Ok if conn.inbuf.len() == before => return ReadResult::Ok,
+                ReadResult::Ok => continue,
+                other => return other,
+            }
+        }
+        let step = if conn.prefix_pending {
+            let p = &conn.inbuf[conn.reserved - 4..conn.reserved];
+            i32::from_be_bytes([p[0], p[1], p[2], p[3]]).max(0) as usize
+        } else {
+            4
+        };
+        if !admits(conn.reserved, step, budget) {
+            conn.muted_since.get_or_insert_with(Instant::now);
+            return ReadResult::Ok;
+        }
+        conn.muted_since = None;
+        conn.reserved += step;
+        conn.prefix_pending = !conn.prefix_pending;
+    }
+}
+
+/// Whether a step fits `budget`. An oversized declaration never does; the framer refuses
+/// it. An empty body always does: its frame is complete at the prefix, and the framer would
+/// take it while still marked pending.
+fn admits(reserved: usize, step: usize, budget: usize) -> bool {
+    step == 0 || reserved + step <= budget
+}
+
+/// Read until the socket would block or `cap` is reached; the rest stays in the socket.
 fn read_available(conn: &mut Conn, cap: usize) -> ReadResult {
     let mut chunk = [0u8; READ_CHUNK_BYTES];
     loop {
-        if conn.inbuf.len() > cap {
-            return ReadResult::Fatal(format!(
-                "inbound buffer exceeded {cap} bytes without a complete frame \
-                 (kafgres.max_request_bytes, or the per-connection free tier if too many \
-                 connections are already holding large frames)"
-            ));
+        if conn.inbuf.len() >= cap {
+            return ReadResult::Ok;
         }
-        match conn.stream.read(&mut chunk) {
+        let want = (cap - conn.inbuf.len()).min(READ_CHUNK_BYTES);
+        match conn.stream.read(&mut chunk[..want]) {
             Ok(0) => return ReadResult::Closed,
-            Ok(n) => conn.inbuf.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                conn.inbuf.extend_from_slice(&chunk[..n]);
+                conn.last_read = Instant::now();
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return ReadResult::Ok,
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return ReadResult::Fatal(e.to_string()),
@@ -602,7 +707,10 @@ fn serve_frames(srv: &mut Server, id: i32, cfg: &ClusterConfig) -> bool {
             }
             // The same cap the reader used: if they disagree, the reader kills mid-frame a connection the framer would have served.
             match take_frame(&mut conn.inbuf, conn.frame_cap.max(1)) {
-                Ok(Some(f)) => f,
+                Ok(Some(f)) => {
+                    conn.reserved -= 4 + f.len();
+                    f
+                }
                 Ok(None) => return true,
                 Err(FrameError::Oversized { declared, max }) => {
                     log!(
@@ -2508,6 +2616,14 @@ fn flush_all(srv: &mut Server) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_body_is_admitted_past_an_exhausted_budget() {
+        assert!(admits(4, 0, 0));
+        assert!(!admits(4, 1, 4));
+        assert!(admits(4, 4, 8));
+        assert!(!admits(0, 4, 3));
+    }
 
     #[test]
     fn fetch_wait_is_clamped_and_zero_means_now() {

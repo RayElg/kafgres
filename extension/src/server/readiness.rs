@@ -12,7 +12,9 @@
 use std::time::Duration;
 
 use pgrx::bgworkers::BackgroundWorker;
+use pgrx::pg_sys::pg_try::PgTryBuilder;
 use pgrx::prelude::*;
+use pgrx::PgSqlErrorCode;
 
 /// Position of the first socket in the set: the latch and postmaster death come first.
 const FIRST_SOCKET: usize = 2;
@@ -38,20 +40,28 @@ impl Readiness {
     }
 
     /// Bring the set in line with the sockets to watch: `listener`, then one
-    /// `(fd, id, wants_write)` per connection.
-    pub(super) fn sync(&mut self, listener: i32, conns: &[(i32, i32, bool)]) {
-        let mut want = Vec::with_capacity(conns.len() + 1);
+    /// `(fd, id, wants_read, wants_write)` per connection.
+    pub(super) fn sync(&mut self, listener: i32, conns: &[(i32, i32, bool, bool)]) {
+        // Write interest only while there is something to write; level-triggered
+        // writability would otherwise wake every pass. Read interest likewise. A socket
+        // wanting neither is left out: Postgres asserts a socket event waits for something.
+        let watched: Vec<(i32, i32, u32)> = conns
+            .iter()
+            .map(|&(fd, id, wants_read, wants_write)| {
+                let mask = if wants_read { pg_sys::WL_SOCKET_READABLE } else { 0 }
+                    | if wants_write { pg_sys::WL_SOCKET_WRITEABLE } else { 0 };
+                (fd, id, mask)
+            })
+            .filter(|&(_, _, mask)| mask != 0)
+            .collect();
+        let mut want = Vec::with_capacity(watched.len() + 1);
         want.push((listener, -1));
-        want.extend(conns.iter().map(|&(fd, id, _)| (fd, id)));
+        want.extend(watched.iter().map(|&(fd, id, _)| (fd, id)));
         if self.set.is_null() || want != self.members {
             self.rebuild(&want);
         }
-        // Write interest only while there is something to write; level-triggered
-        // writability would otherwise wake every pass.
-        for (i, &(_, _, wants_write)) in conns.iter().enumerate() {
+        for (i, &(_, _, mask)) in watched.iter().enumerate() {
             let pos = i + 1;
-            let mask = pg_sys::WL_SOCKET_READABLE
-                | if wants_write { pg_sys::WL_SOCKET_WRITEABLE } else { 0 };
             if self.masks[pos] != mask {
                 unsafe {
                     pg_sys::ModifyWaitEvent(
@@ -70,6 +80,9 @@ impl Readiness {
         unsafe {
             if !self.set.is_null() {
                 pg_sys::FreeWaitEventSet(self.set);
+                // Cleared before create: CreateWaitEventSet can raise ERROR (epoll_create1
+                // failure), and Drop would otherwise double-pfree the freed pointer.
+                self.set = std::ptr::null_mut();
             }
             let n = (FIRST_SOCKET + want.len()) as i32;
             self.set = pg_sys::CreateWaitEventSet(pg_sys::TopMemoryContext, n);
@@ -121,7 +134,33 @@ impl Readiness {
                 pg_sys::PG_WAIT_EXTENSION,
             );
             pg_sys::ResetLatch(pg_sys::MyLatch);
-            pg_sys::check_for_interrupts!();
+        }
+        // `check_for_interrupts!` here is outside every `atomically`, so an ERROR from a
+        // statement cancel would reach `#[pg_guard]` and restart the worker, dropping
+        // every client, for something as ordinary as pg_cancel_backend or a stray
+        // lock/statement timeout. There is no statement to cancel here, so it is
+        // swallowed: `ProcessInterrupts` raises ERRCODE_QUERY_CANCELED or
+        // ERRCODE_LOCK_NOT_AVAILABLE and clears QueryCancelPending before raising, so a
+        // caught cancel cannot spin. ProcDiePending raises FATAL, which does not longjmp
+        // to a PG_TRY, so termination is unaffected; any other error rethrows.
+        let swallowed = PgTryBuilder::new(|| {
+            unsafe { pg_sys::check_for_interrupts!() };
+            false
+        })
+        .catch_when(PgSqlErrorCode::ERRCODE_QUERY_CANCELED, |_| true)
+        .catch_when(PgSqlErrorCode::ERRCODE_LOCK_NOT_AVAILABLE, |_| true)
+        .execute();
+
+        if swallowed {
+            log!("kafgres: ignoring a statement cancel in the broker's wait loop");
+            // The cancel path clears InterruptPending on entry and nothing re-sends it,
+            // so a pending ProcSignalBarrier (DROP DATABASE, ALTER ... SET TABLESPACE
+            // waiting on this worker) must be re-armed by hand or it hangs for good.
+            unsafe {
+                if pg_sys::ProcSignalBarrierPending != 0 {
+                    pg_sys::InterruptPending = 1;
+                }
+            }
         }
         !BackgroundWorker::sigterm_received()
     }

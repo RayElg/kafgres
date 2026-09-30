@@ -172,7 +172,7 @@ fn window(producer_id: i64, topic_id: u32, partition: i32) -> Result<Vec<Retaine
 }
 
 /// Upstream's `inSequence`, including the wraparound: a long-lived producer really does
-fn in_sequence(last_seq: i32, next_seq: i32) -> bool {
+pub(crate) fn in_sequence(last_seq: i32, next_seq: i32) -> bool {
     next_seq as i64 == last_seq as i64 + 1 || (next_seq == 0 && last_seq == i32::MAX)
 }
 
@@ -270,13 +270,17 @@ pub fn record(
     )?;
 
     // Keep the newest `RETAINED_BATCHES` **by insertion order**. `ORDER BY last_seq DESC`
+    //
+    // Deletes "older than the Nth newest" via a scalar sub-select on `added_idx`,
+    // not `NOT IN (newest N)`. With fewer than N rows the sub-select is NULL,
+    // so nothing is pruned.
     crate::plan::run(
         "DELETE FROM kafgres_producer_batches
           WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3
-            AND added_seq NOT IN (
+            AND added_seq < (
                 SELECT added_seq FROM kafgres_producer_batches
                  WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3
-                 ORDER BY added_seq DESC LIMIT $4)",
+                 ORDER BY added_seq DESC OFFSET $4 - 1 LIMIT 1)",
         &[
             producer_id.into(),
             (topic_id as i32).into(),
@@ -294,6 +298,49 @@ pub fn record(
         &[producer_id.into(), LAST_TS_GRANULARITY_SECS.into()],
     )?;
     Ok(())
+}
+
+/// Stamp the offset a `base_offset = -1` reservation was appended at.
+pub fn stamp(
+    producer_id: i64,
+    topic_id: u32,
+    partition: i32,
+    first_seq: i32,
+    base_offset: i64,
+) -> Result<(), spi::Error> {
+    crate::plan::run(
+        "UPDATE kafgres_producer_batches
+            SET base_offset = $5
+          WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3 AND first_seq = $4",
+        &[
+            producer_id.into(),
+            (topic_id as i32).into(),
+            partition.into(),
+            first_seq.into(),
+            base_offset.into(),
+        ],
+    )
+}
+
+/// Drop a reservation whose batch was never appended, so a resend is not
+/// answered as a duplicate at offset -1.
+pub fn release(
+    producer_id: i64,
+    topic_id: u32,
+    partition: i32,
+    first_seq: i32,
+) -> Result<(), spi::Error> {
+    crate::plan::run(
+        "DELETE FROM kafgres_producer_batches
+          WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3 AND first_seq = $4
+            AND base_offset < 0",
+        &[
+            producer_id.into(),
+            (topic_id as i32).into(),
+            partition.into(),
+            first_seq.into(),
+        ],
+    )
 }
 
 #[derive(Debug, Clone, Copy)]

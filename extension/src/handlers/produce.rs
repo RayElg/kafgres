@@ -1,5 +1,7 @@
 //! `0 Produce`: bytes stored as received — CRC checked, offsets stamped, never re-encoded.
 
+use std::collections::HashMap;
+
 use kafgres_codec::errors::ErrorCode;
 use kafgres_codec::generated::produce_request::ProduceRequest;
 use kafgres_codec::generated::produce_response::{
@@ -15,6 +17,33 @@ use crate::storage::{LogStore, RawBatch, StoreError};
 
 pub const ACKS_NONE: i16 = 0;
 
+thread_local! {
+    /// Batches this request appended, by (topic entry, partition entry, batch): a rollback
+    /// cannot remove them from a segment file. `None` on the table engine, where it does.
+    static LANDED: std::cell::RefCell<Option<HashMap<(usize, usize, usize), i64>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn landed(at: (usize, usize), batch: usize) -> Option<i64> {
+    LANDED.with(|l| l.borrow().as_ref().and_then(|m| m.get(&(at.0, at.1, batch)).copied()))
+}
+
+fn remember_landed(at: (usize, usize), batch: usize, offset: i64) {
+    LANDED.with(|l| {
+        if let Some(m) = l.borrow_mut().as_mut() {
+            m.insert((at.0, at.1, batch), offset);
+        }
+    });
+}
+
+fn any_landed(at: (usize, usize)) -> bool {
+    LANDED.with(|l| {
+        l.borrow()
+            .as_ref()
+            .is_some_and(|m| m.keys().any(|k| (k.0, k.1) == at))
+    })
+}
+
 #[derive(Debug)]
 enum AppendError {
     Store(StoreError),
@@ -26,6 +55,8 @@ enum AppendError {
     NullKeyOnCompacted,
     /// The savepoint around this partition was rolled back; nothing it wrote landed.
     Aborted,
+    /// A resend of a batch whose window row never learned its offset.
+    DuplicateUnknownOffset,
 }
 
 impl AppendError {
@@ -39,6 +70,8 @@ impl AppendError {
             AppendError::FencedEpoch { .. } => ErrorCode::InvalidProducerEpoch,
             AppendError::TooLarge { .. } => ErrorCode::MessageTooLarge,
             AppendError::NullKeyOnCompacted => ErrorCode::InvalidRecord,
+            // Kafka's answer for a duplicate it cannot place; clients treat it as success.
+            AppendError::DuplicateUnknownOffset => ErrorCode::DuplicateSequenceNumber,
         }
     }
 }
@@ -68,6 +101,9 @@ impl std::fmt::Display for AppendError {
                 write!(f, "a compacted topic requires every record to have a key")
             }
             AppendError::Aborted => write!(f, "append aborted (lock or statement timeout)"),
+            AppendError::DuplicateUnknownOffset => {
+                write!(f, "duplicate of a batch whose offset was never recorded")
+            }
         }
     }
 }
@@ -123,6 +159,9 @@ pub fn handle(
         })?;
     }
 
+    let segment = crate::storage_engine_guc() == "segment";
+    LANDED.with(|l| *l.borrow_mut() = segment.then(HashMap::new));
+
     let attempt = crate::dbtx::atomically(
         || build(req, store, authz, Isolation::Shared),
         |_| Abandon::PartitionFailed,
@@ -163,17 +202,66 @@ enum Isolation {
     PerPartition,
 }
 
+/// An idempotent batch's identity in the producer's window.
+#[derive(Clone, Copy)]
+struct Idem {
+    producer_id: i64,
+    epoch: i16,
+    first_seq: i32,
+    last_seq: i32,
+    transactional: bool,
+}
+
+/// What to do with one batch, decided before anything is written.
+enum Decision {
+    /// No producer id or sequence: append, no window entry.
+    Plain,
+    /// New for this producer: reserve a window row, append, stamp the offset in.
+    Append(Idem),
+    /// Exact resend of a retained batch: answer with its original offset.
+    Duplicate { base_offset: i64 },
+    /// Exact resend of a batch earlier in this same request, by its position.
+    DuplicateOf(usize),
+}
+
+struct PartitionPlan {
+    tid: u32,
+    index: i32,
+    batches: Vec<(RecordBatch, Decision)>,
+}
+
+/// A partition still to be written, and where its response goes.
+struct Pending {
+    topic: usize,
+    slot: usize,
+    plan: PartitionPlan,
+}
+
+/// Produce runs in phases across the whole request, not partition by partition, since
+/// `LogStore::append` is a file write no savepoint undoes:
+///
+/// 1. **Plan**: decode and sequence-check every batch. Reads only, so a failed partition
+///    has nothing to undo.
+/// 2. **Reserve**: write the window rows (`base_offset = -1`) and transaction registration
+///    for every partition. If this fails, nothing has been appended.
+/// 3. **Append and stamp**: append each batch, then stamp its offset into its reserved
+///    row. A storage error mid-partition keeps what landed (stamped, so a resend answers
+///    as a duplicate) and drops the reservations of what did not.
+///
+/// A Postgres ERROR in phase 3 (a statement or lock timeout, a cancel, resource
+/// exhaustion) unwinds the savepoint but not a segment file: the redo finds what already
+/// landed in `LANDED` and records it rather than appending it again.
 fn build(
     req: &ProduceRequest,
     store: &mut dyn LogStore,
     authz: &crate::acl::Authz,
     isolation: Isolation,
 ) -> Result<ProduceOutcome, Abandon> {
-    let mut topics = Vec::with_capacity(req.topic_data.len());
-    let mut appended: Vec<(u32, i32)> = Vec::new();
-    let mut wrote_bytes = 0usize;
+    let mut topics: Vec<TopicProduceResponse> = Vec::with_capacity(req.topic_data.len());
+    let mut pending: Vec<Pending> = Vec::new();
+    let mut entries: Vec<((String, i32), (usize, usize))> = Vec::new();
 
-    for topic_data in &req.topic_data {
+    for (ti, topic_data) in req.topic_data.iter().enumerate() {
         // From v13 only `topic_id` is set; name-only resolution rejects modern producers.
         let resolved = meta::resolve_topic(&topic_data.name, &topic_data.topic_id.0)
             .map_err(|e| {
@@ -204,7 +292,8 @@ fn build(
             .err();
 
         let mut partitions = Vec::with_capacity(topic_data.partition_data.len());
-        for pd in &topic_data.partition_data {
+        for (pi, pd) in topic_data.partition_data.iter().enumerate() {
+            entries.push(((name.clone(), pd.index), (ti, pi)));
             if let Some(code) = denied {
                 partitions.push(PartitionProduceResponse {
                     index: pd.index,
@@ -216,7 +305,6 @@ fn build(
                 });
                 continue;
             }
-            // Failure after an earlier batch appended keeps the earlier rows; the resend lands twice.
             let Some(tid) = topic_id else {
                 partitions.push(failed(
                     pd.index,
@@ -225,8 +313,6 @@ fn build(
                 ));
                 continue;
             };
-
-            // Before any append: a mid-append failure would abandon the pass and duplicate records on replay.
             if let Some(err) = oversized(pd.records.as_ref(), max_message_bytes) {
                 partitions.push(failed(pd.index, &err, &name));
                 continue;
@@ -238,36 +324,19 @@ fn build(
                 }
             }
 
-            let result = match isolation {
-                Isolation::PerPartition => crate::dbtx::atomically(
-                    || append_partition(store, tid, pd.index, pd.records.as_ref()),
-                    |_| AppendError::Aborted,
-                ),
-                Isolation::Shared => {
-                    match append_partition(store, tid, pd.index, pd.records.as_ref()) {
-                        Ok(done) => Ok(done),
-                        Err(_) => return Err(Abandon::PartitionFailed),
-                    }
+            // Phase 1: a partition that fails here never reaches the store.
+            match plan_partition(tid, pd.index, pd.records.as_ref()) {
+                Ok(plan) => {
+                    // Phase 3 fills this in.
+                    partitions.push(PartitionProduceResponse::default());
+                    pending.push(Pending {
+                        topic: ti,
+                        slot: pi,
+                        plan,
+                    });
                 }
-            };
-            partitions.push(match result {
-                Ok(done) => {
-                    if done.wrote {
-                        appended.push((tid, pd.index));
-                        wrote_bytes += pd.records.as_ref().map(|r| r.len()).unwrap_or(0);
-                    }
-                    PartitionProduceResponse {
-                        index: pd.index,
-                        error_code: ErrorCode::None.code(),
-                        base_offset: done.base_offset,
-                        // -1 is Kafka's "not set"; we do not rewrite timestamps.
-                        log_append_time_ms: -1,
-                        log_start_offset: store.log_start_offset(tid, pd.index).unwrap_or(0),
-                        ..Default::default()
-                    }
-                }
-                Err(e) => failed(pd.index, &e, &name),
-            });
+                Err(e) => partitions.push(failed(pd.index, &e, &name)),
+            }
         }
 
         topics.push(TopicProduceResponse {
@@ -276,6 +345,65 @@ fn build(
             partition_responses: partitions,
             ..Default::default()
         });
+    }
+
+    // Kafka keys partitions by topic-partition: a repeated one is decided by its last entry,
+    // or both copies of an idempotent batch would pass the window check and land.
+    let mut last: HashMap<&(String, i32), (usize, usize)> = HashMap::new();
+    for (key, at) in &entries {
+        last.insert(key, *at);
+    }
+    let echoes: Vec<((usize, usize), (usize, usize))> = entries
+        .iter()
+        .filter(|(key, at)| last[key] != *at)
+        .map(|(key, at)| (*at, last[key]))
+        .collect();
+    pending.retain(|p| !echoes.iter().any(|(at, _)| *at == (p.topic, p.slot)));
+
+    let mut appended: Vec<(u32, i32)> = Vec::new();
+    let mut wrote_bytes = 0usize;
+
+    match isolation {
+        Isolation::Shared => {
+            // Phase 2 for every partition before phase 3 for any.
+            for p in &pending {
+                if let Err(e) = reserve_partition(&p.plan) {
+                    pgrx::log!("kafgres: produce reservation failed, retrying per partition: {e}");
+                    return Err(Abandon::PartitionFailed);
+                }
+            }
+            for p in pending {
+                let outcome = write_partition(store, &p.plan, (p.topic, p.slot));
+                finish(&mut topics, &mut appended, &mut wrote_bytes, req, &p, store, outcome);
+            }
+        }
+        Isolation::PerPartition => {
+            // One savepoint per partition. Phase 3 answers inside `Ok`: a storage error
+            // must not roll the savepoint back over batches that already landed.
+            for p in pending {
+                let at = (p.topic, p.slot);
+                let attempt = |store: &mut dyn LogStore| {
+                    crate::dbtx::atomically(
+                        || {
+                            reserve_partition(&p.plan)?;
+                            Ok(write_partition(store, &p.plan, at))
+                        },
+                        |_| AppendError::Aborted,
+                    )
+                    .and_then(|inner| inner)
+                };
+                let mut outcome = attempt(store);
+                // Record batches that landed before the ERROR, or a resend appends them again.
+                if matches!(outcome, Err(AppendError::Aborted)) && any_landed(at) {
+                    outcome = attempt(store);
+                }
+                finish(&mut topics, &mut appended, &mut wrote_bytes, req, &p, store, outcome);
+            }
+        }
+    }
+    for ((topic, slot), (kt, ks)) in echoes {
+        let answer = topics[kt].partition_responses[ks].clone();
+        topics[topic].partition_responses[slot] = answer;
     }
 
     // acks=0: the client never reads the reply, so sending one desynchronises the connection.
@@ -298,6 +426,251 @@ fn build(
     })
 }
 
+fn finish(
+    topics: &mut [TopicProduceResponse],
+    appended: &mut Vec<(u32, i32)>,
+    wrote_bytes: &mut usize,
+    req: &ProduceRequest,
+    p: &Pending,
+    store: &mut dyn LogStore,
+    outcome: Result<Appended, AppendError>,
+) {
+    let tid = p.plan.tid;
+    let index = p.plan.index;
+    let response = match outcome {
+        Ok(done) => {
+            if done.wrote {
+                appended.push((tid, index));
+                *wrote_bytes += req.topic_data[p.topic].partition_data[p.slot]
+                    .records
+                    .as_ref()
+                    .map(|r| r.len())
+                    .unwrap_or(0);
+            }
+            PartitionProduceResponse {
+                index,
+                error_code: ErrorCode::None.code(),
+                base_offset: done.base_offset,
+                // -1 is Kafka's "not set"; we do not rewrite timestamps.
+                log_append_time_ms: -1,
+                log_start_offset: store.log_start_offset(tid, index).unwrap_or(0),
+                ..Default::default()
+            }
+        }
+        Err(e) => failed(index, &e, &topics[p.topic].name),
+    };
+    topics[p.topic].partition_responses[p.slot] = response;
+}
+
+/// Phase 1: decode every batch and decide it against the producer's window. Nothing is
+/// written here.
+fn plan_partition(
+    tid: u32,
+    index: i32,
+    records: Option<&kafgres_codec::bytes::Bytes>,
+) -> Result<PartitionPlan, AppendError> {
+    let mut batches: Vec<(RecordBatch, Decision)> = Vec::new();
+    let Some(records) = records.filter(|r| !r.is_empty()) else {
+        return Ok(PartitionPlan {
+            tid,
+            index,
+            batches,
+        });
+    };
+
+    for item in BatchIter::new(records.clone()) {
+        let view = item.map_err(AppendError::Batch)?;
+        let producer_id = view.producer_id();
+        let first_seq = view.base_sequence();
+        if producer_id == NO_PRODUCER_ID || first_seq == NO_SEQUENCE {
+            batches.push((view, Decision::Plain));
+            continue;
+        }
+        let idem = Idem {
+            producer_id,
+            epoch: view.producer_epoch(),
+            first_seq,
+            // Not `first_seq + delta`: the client's sequence counter wraps through zero at int32.
+            last_seq: producer::increment_sequence(first_seq, view.last_offset_delta()),
+            transactional: view.is_transactional() && !view.is_control(),
+        };
+
+        // A batch earlier in this request is not in the window yet; the batch after it is
+        // decided against it here, the way `check` would decide once it was recorded.
+        let prior = batches.iter().enumerate().rev().find_map(|(i, (_, d))| match d {
+            Decision::Append(p) if p.producer_id == producer_id => Some((i, *p)),
+            _ => None,
+        });
+        let decision = match prior {
+            Some((_, prev)) => decide_after(&batches, prev, idem)?,
+            None => match producer::check(
+                producer_id, idem.epoch, idem.first_seq, idem.last_seq, tid, index,
+            )
+            .map_err(|e| AppendError::ProducerState(e.to_string()))?
+            {
+                SequenceCheck::Append => Decision::Append(idem),
+                SequenceCheck::Duplicate { base_offset } if base_offset < 0 => {
+                    return Err(AppendError::DuplicateUnknownOffset)
+                }
+                SequenceCheck::Duplicate { base_offset } => Decision::Duplicate { base_offset },
+                SequenceCheck::OutOfOrder { expected, got } => {
+                    return Err(AppendError::OutOfOrderSequence { expected, got })
+                }
+                SequenceCheck::Fenced { current_epoch } => {
+                    return Err(AppendError::FencedEpoch {
+                        current: current_epoch,
+                    })
+                }
+            },
+        };
+        batches.push((view, decision));
+    }
+
+    Ok(PartitionPlan {
+        tid,
+        index,
+        batches,
+    })
+}
+
+/// `producer::check`'s rules, applied against the newest batch this request already
+/// accepted for the producer rather than against the table.
+fn decide_after(
+    batches: &[(RecordBatch, Decision)],
+    prev: Idem,
+    idem: Idem,
+) -> Result<Decision, AppendError> {
+    if idem.epoch < prev.epoch {
+        return Err(AppendError::FencedEpoch {
+            current: prev.epoch,
+        });
+    }
+    if idem.epoch > prev.epoch {
+        if idem.first_seq != 0 {
+            return Err(AppendError::OutOfOrderSequence {
+                expected: 0,
+                got: idem.first_seq,
+            });
+        }
+        return Ok(Decision::Append(idem));
+    }
+    if let Some(i) = batches.iter().position(|(_, d)| match d {
+        Decision::Append(p) => {
+            p.producer_id == idem.producer_id
+                && p.epoch == idem.epoch
+                && p.first_seq == idem.first_seq
+                && p.last_seq == idem.last_seq
+        }
+        _ => false,
+    }) {
+        return Ok(Decision::DuplicateOf(i));
+    }
+    if producer::in_sequence(prev.last_seq, idem.first_seq) {
+        Ok(Decision::Append(idem))
+    } else {
+        Err(AppendError::OutOfOrderSequence {
+            expected: producer::increment_sequence(prev.last_seq, 1),
+            got: idem.first_seq,
+        })
+    }
+}
+
+/// Phase 2: the window rows and the transaction registration, offsets still unknown.
+fn reserve_partition(plan: &PartitionPlan) -> Result<(), AppendError> {
+    for (_, decision) in &plan.batches {
+        let Decision::Append(idem) = decision else { continue };
+        producer::record(
+            idem.producer_id, idem.epoch, plan.tid, plan.index, idem.first_seq, idem.last_seq, -1,
+        )
+        .map_err(|e| AppendError::ProducerState(e.to_string()))?;
+        if idem.transactional {
+            crate::storage::pmeta::register_txn_partition(
+                idem.producer_id, idem.epoch, plan.tid, plan.index, -1,
+            )
+            .map_err(|e| AppendError::ProducerState(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Phase 3: append, then stamp each batch's offset into the row reserved for it.
+fn write_partition(
+    store: &mut dyn LogStore,
+    plan: &PartitionPlan,
+    at: (usize, usize),
+) -> Result<Appended, AppendError> {
+    let mut base: Option<i64> = None;
+    let mut wrote = false;
+    let mut assigned: Vec<Option<i64>> = vec![None; plan.batches.len()];
+
+    for (i, (view, decision)) in plan.batches.iter().enumerate() {
+        let idem = match decision {
+            Decision::Plain => None,
+            Decision::Append(idem) => Some(idem),
+            Decision::Duplicate { base_offset } => {
+                base.get_or_insert(*base_offset);
+                continue;
+            }
+            Decision::DuplicateOf(j) => {
+                base.get_or_insert(assigned[*j].unwrap_or(-1));
+                continue;
+            }
+        };
+        let offset = match landed(at, i) {
+            Some(offset) => offset,
+            None => match store.append(plan.tid, plan.index, raw_batch(view), None) {
+                Ok(offset) => {
+                    remember_landed(at, i, offset);
+                    offset
+                }
+                Err(e) => {
+                    // Release the rest: reserved with -1, they would answer a resend wrongly.
+                    release_reservations(plan, i)?;
+                    return Err(e.into());
+                }
+            },
+        };
+        assigned[i] = Some(offset);
+        base.get_or_insert(offset);
+        wrote = true;
+        if let Some(idem) = idem {
+            // Appended but unstamped answers a resend as a duplicate, which it is.
+            let stamped = producer::stamp(
+                idem.producer_id, plan.tid, plan.index, idem.first_seq, offset,
+            )
+            .map_err(|e| AppendError::ProducerState(e.to_string()))
+            .and_then(|()| {
+                if idem.transactional {
+                    crate::storage::pmeta::stamp_txn_partition(
+                        idem.producer_id, plan.tid, plan.index, offset,
+                    )?;
+                }
+                Ok(())
+            });
+            if let Err(e) = stamped {
+                release_reservations(plan, i + 1)?;
+                return Err(e);
+            }
+        }
+    }
+
+    match base {
+        Some(b) => Ok(Appended { base_offset: b, wrote }),
+        None => Ok(Appended::nothing(store.high_watermark(plan.tid, plan.index)?)),
+    }
+}
+
+/// Drop the unstamped window rows from batch `from` onward.
+fn release_reservations(plan: &PartitionPlan, from: usize) -> Result<(), AppendError> {
+    for (_, decision) in plan.batches.iter().skip(from) {
+        if let Decision::Append(idem) = decision {
+            producer::release(idem.producer_id, plan.tid, plan.index, idem.first_seq)
+                .map_err(|e| AppendError::ProducerState(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
 fn failed(index: i32, e: &AppendError, topic: &str) -> PartitionProduceResponse {
     pgrx::log!("kafgres: produce to {topic}-{index} failed: {e}");
     PartitionProduceResponse {
@@ -307,76 +680,6 @@ fn failed(index: i32, e: &AppendError, topic: &str) -> PartitionProduceResponse 
         log_append_time_ms: -1,
         log_start_offset: -1,
         ..Default::default()
-    }
-}
-
-fn append_partition(
-    store: &mut dyn LogStore,
-    topic: u32,
-    partition: i32,
-    records: Option<&kafgres_codec::bytes::Bytes>,
-) -> Result<Appended, AppendError> {
-    let records = match records {
-        Some(r) if !r.is_empty() => r,
-        _ => return Ok(Appended::nothing(store.high_watermark(topic, partition)?)),
-    };
-
-    // Offsets are stamped inside `LogStore::append` under the partition lock; a read here could be stale.
-    let mut base: Option<i64> = None;
-    let mut wrote = false;
-    for item in BatchIter::new(records.clone()) {
-        let view = item.map_err(AppendError::Batch)?;
-
-        let producer_id = view.producer_id();
-        let epoch = view.producer_epoch();
-        let first_seq = view.base_sequence();
-        // Not `first_seq + delta`: the client's sequence counter wraps through zero at int32.
-        let last_seq = producer::increment_sequence(first_seq, view.last_offset_delta());
-
-        if producer_id == NO_PRODUCER_ID || first_seq == NO_SEQUENCE {
-            let assigned = store.append(topic, partition, raw_batch(&view), None)?;
-            base.get_or_insert(assigned);
-            wrote = true;
-            continue;
-        }
-
-        match producer::check(producer_id, epoch, first_seq, last_seq, topic, partition)
-            .map_err(|e| AppendError::ProducerState(e.to_string()))?
-        {
-            // A retry: answer with the offset it got the first time, so the resend is a no-op.
-            SequenceCheck::Duplicate { base_offset } => {
-                base.get_or_insert(base_offset);
-            }
-            SequenceCheck::OutOfOrder { expected, got } => {
-                return Err(AppendError::OutOfOrderSequence { expected, got })
-            }
-            SequenceCheck::Fenced { current_epoch } => {
-                return Err(AppendError::FencedEpoch {
-                    current: current_epoch,
-                })
-            }
-            SequenceCheck::Append => {
-                let assigned = store.append(topic, partition, raw_batch(&view), None)?;
-                // Recorded in the same transaction as the append, only after it succeeds.
-                producer::record(
-                    producer_id, epoch, topic, partition, first_seq, last_seq, assigned,
-                )
-                .map_err(|e| AppendError::ProducerState(e.to_string()))?;
-                if view.is_transactional() && !view.is_control() {
-                    crate::storage::pmeta::register_txn_partition(
-                        producer_id, epoch, topic, partition, assigned,
-                    )
-                    .map_err(|e| AppendError::ProducerState(e.to_string()))?;
-                }
-                base.get_or_insert(assigned);
-                wrote = true;
-            }
-        }
-    }
-
-    match base {
-        Some(b) => Ok(Appended { base_offset: b, wrote }),
-        None => Ok(Appended::nothing(store.high_watermark(topic, partition)?)),
     }
 }
 

@@ -1,8 +1,14 @@
 //! Logical decoding output plugin; the plugin name must be `kafgres` because Postgres loads an output plugin by library name.
 
+use pgrx::pg_guard;
 use pgrx::pg_sys;
 
+// Every callback carries `#[pg_guard]`: Postgres calls them from C frames that cannot
+// catch a Rust unwind, so a panic (or a pgrx-reraised Postgres ERROR) would otherwise
+// abort the process. The guard turns it back into an `ereport(ERROR)` instead.
+
 /// `#[no_mangle]` and this exact name are the contract — there is no registration step.
+#[pg_guard]
 #[no_mangle]
 pub unsafe extern "C-unwind" fn _PG_output_plugin_init(cb: *mut pg_sys::OutputPluginCallbacks) {
     let cb = &mut *cb;
@@ -13,6 +19,7 @@ pub unsafe extern "C-unwind" fn _PG_output_plugin_init(cb: *mut pg_sys::OutputPl
     cb.shutdown_cb = Some(shutdown);
 }
 
+#[pg_guard]
 unsafe extern "C-unwind" fn startup(
     _ctx: *mut pg_sys::LogicalDecodingContext,
     opt: *mut pg_sys::OutputPluginOptions,
@@ -22,9 +29,11 @@ unsafe extern "C-unwind" fn startup(
     (*opt).receive_rewrites = false;
 }
 
+#[pg_guard]
 unsafe extern "C-unwind" fn shutdown(_ctx: *mut pg_sys::LogicalDecodingContext) {}
 
 /// Transaction boundaries are emitted so a consumer can group changes by commit.
+#[pg_guard]
 unsafe extern "C-unwind" fn begin(
     ctx: *mut pg_sys::LogicalDecodingContext,
     txn: *mut pg_sys::ReorderBufferTXN,
@@ -32,6 +41,7 @@ unsafe extern "C-unwind" fn begin(
     emit(ctx, &format!(r#"{{"v":2,"op":"B","xid":{}}}"#, (*txn).xid));
 }
 
+#[pg_guard]
 unsafe extern "C-unwind" fn commit(
     ctx: *mut pg_sys::LogicalDecodingContext,
     txn: *mut pg_sys::ReorderBufferTXN,
@@ -40,6 +50,7 @@ unsafe extern "C-unwind" fn commit(
     emit(ctx, &format!(r#"{{"v":2,"op":"C","xid":{}}}"#, (*txn).xid));
 }
 
+#[pg_guard]
 unsafe extern "C-unwind" fn change(
     ctx: *mut pg_sys::LogicalDecodingContext,
     txn: *mut pg_sys::ReorderBufferTXN,
@@ -58,7 +69,7 @@ unsafe extern "C-unwind" fn change(
     let rel = &*relation;
     let desc = rel.rd_att;
     let class = &*rel.rd_rel;
-    let table = pgrx::name_data_to_str(&class.relname).to_string();
+    let table = name_lossy(&class.relname);
 
     // Not tidiness: under the table engine the log is a Postgres table, so every record we
     if table.starts_with("kafgres_") {
@@ -107,7 +118,7 @@ unsafe fn columns_json(desc: pg_sys::TupleDesc) -> String {
             out.push(',');
         }
         first = false;
-        let name = pgrx::name_data_to_str(&(*att).attname);
+        let name = name_lossy(&(*att).attname);
         let ty = pg_sys::format_type_with_typemod((*att).atttypid, (*att).atttypmod);
         let ty = if ty.is_null() {
             "text".to_string()
@@ -115,7 +126,7 @@ unsafe fn columns_json(desc: pg_sys::TupleDesc) -> String {
             std::ffi::CStr::from_ptr(ty).to_string_lossy().into_owned()
         };
         out.push('[');
-        out.push_str(&json_string(name));
+        out.push_str(&json_string(&name));
         out.push(',');
         out.push_str(&json_string(&ty));
         out.push(']');
@@ -139,7 +150,7 @@ unsafe fn tuple_json(buf: *mut pg_sys::ReorderBufferTupleBuf, desc: pg_sys::Tupl
         if (*att).attisdropped || (*att).attnum <= 0 {
             continue;
         }
-        let name = pgrx::name_data_to_str(&(*att).attname);
+        let name = name_lossy(&(*att).attname);
 
         let mut is_null = false;
         let datum = pg_sys::heap_getattr(tuple, (*att).attnum as _, desc, &mut is_null);
@@ -148,7 +159,7 @@ unsafe fn tuple_json(buf: *mut pg_sys::ReorderBufferTupleBuf, desc: pg_sys::Tupl
             out.push(',');
         }
         first = false;
-        out.push_str(&json_string(name));
+        out.push_str(&json_string(&name));
         out.push(':');
 
         if is_null {
@@ -173,6 +184,12 @@ unsafe fn tuple_json(buf: *mut pg_sys::ReorderBufferTupleBuf, desc: pg_sys::Tupl
     }
     out.push('}');
     out
+}
+
+/// Identifiers are bytes in the database encoding, not UTF-8; `pgrx::name_data_to_str` unwraps
+/// the conversion, and a `LATIN1` table name would fail every decode of that transaction forever.
+unsafe fn name_lossy(name: &pg_sys::NameData) -> String {
+    std::ffi::CStr::from_ptr(name.data.as_ptr()).to_string_lossy().into_owned()
 }
 
 /// `VARATT_IS_EXTERNAL_ONDISK` is a C macro, open-coded: `va_header == 0x01` (little-endian) and `va_tag == VARTAG_ONDISK`.

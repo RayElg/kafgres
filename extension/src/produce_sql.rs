@@ -97,7 +97,18 @@ fn kafgres_produce(
         Err(e) => error!("kafgres: produce failed: {e}"),
     };
 
-    // The marker, in the caller's transaction. Everything above already happened; this
+    // Release on both commit and abort, so an aborted reservation does not pin the LSO.
+    // Registered before the marker INSERT: an ERROR there re-raises as a panic at the
+    // FFI boundary, skipping the `Err` branch below, so the release must already be armed.
+    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Commit, move || {
+        crate::storage::release_pending(topic_id, partition);
+    });
+    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Abort, move || {
+        crate::storage::release_pending(topic_id, partition);
+    });
+
+    // Payload is already in the segment; on failure the abort callback above
+    // releases the reservation.
     if let Err(e) = crate::plan::run(
         "INSERT INTO kafgres_markers (topic_id, partition, base_offset, last_offset, bytes)
          VALUES ($1::oid, $2, $3, $4, $5)",
@@ -109,18 +120,8 @@ fn kafgres_produce(
             (bytes.len() as i32).into(),
         ],
     ) {
-        // The payload is already in the segment. Release the reservation so the LSO is
-        crate::storage::release_pending(topic_id, partition);
         error!("kafgres: could not record the commit marker: {e}");
     }
-
-    // Release on **both** outcomes. Registering only the commit callback would leave an
-    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Commit, move || {
-        crate::storage::release_pending(topic_id, partition);
-    });
-    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Abort, move || {
-        crate::storage::release_pending(topic_id, partition);
-    });
 
     base_offset
 }

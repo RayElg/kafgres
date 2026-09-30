@@ -740,6 +740,7 @@ pub unsafe extern "C-unwind" fn kafgres_cdc_worker_main(_arg: pg_sys::Datum) {
     } else {
         interval
     })) {
+        crate::dbtx::report_stats();
         if BackgroundWorker::sighup_received() {
             reload_config();
             interval = cdc_interval();
@@ -808,6 +809,7 @@ pub unsafe extern "C-unwind" fn kafgres_archiver_worker_main(_arg: pg_sys::Datum
     } else {
         interval
     })) {
+        crate::dbtx::report_stats();
         if BackgroundWorker::sighup_received() {
             reload_config();
             interval = archive_interval();
@@ -946,6 +948,7 @@ pub unsafe extern "C-unwind" fn kafgres_follower_worker_main(_arg: pg_sys::Datum
     let mut applied_since_log = 0i64;
     let mut last_log = std::time::Instant::now();
     while BackgroundWorker::wait_latch(Some(delay)) {
+        crate::dbtx::report_stats();
         if BackgroundWorker::sighup_received() {
             reload_config();
             if replicate_from().is_none() {

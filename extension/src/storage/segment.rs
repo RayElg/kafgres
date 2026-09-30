@@ -201,9 +201,61 @@ struct ActiveSeg {
     timeindex: Option<Vfd>,
     /// First byte of the log not yet handed to `FileWriteback`.
     writeback_from: u64,
+    /// The partition directory was fsynced since this segment was opened.
+    dir_synced: bool,
 }
 
 static ACTIVE: Mutex<Option<HashMap<(TopicId, i32), ActiveSeg>>> = Mutex::new(None);
+
+impl ActiveSeg {
+    /// Fsync every directory up to the log root's parent, once per segment: a new entry is
+    /// durable only once its directory is.
+    fn sync_dir(&mut self, topic: TopicId, partition: i32) -> StoreResult<()> {
+        if !self.dir_synced {
+            let root = log_root();
+            let partition_dir = root.join(partition_dir(topic, partition));
+            let mut dirs = vec![partition_dir.clone()];
+            dirs.extend(partition_dir.parent().map(Path::to_path_buf));
+            dirs.push(root.clone());
+            dirs.extend(root.parent().map(Path::to_path_buf));
+            for dir in dirs {
+                sync_dir(&dir)?;
+            }
+            self.dir_synced = true;
+        }
+        Ok(())
+    }
+}
+
+/// fsync a directory as Postgres's `fsync_fname` does: a directory that cannot be opened
+/// (EISDIR, EACCES) or fsynced (EBADF, EINVAL) is skipped; another open failure is retried;
+/// another fsync failure is a PANIC unless `data_sync_retry` is on.
+fn sync_dir(path: &Path) -> StoreResult<()> {
+    let dir = match std::fs::File::open(path) {
+        Ok(d) => d,
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EISDIR | libc::EACCES)) => return Ok(()),
+        Err(e) => return Err(StoreError::Io(format!("open of directory {}: {e}", path.display()))),
+    };
+    let Err(err) = dir.sync_all() else {
+        return Ok(());
+    };
+    if matches!(err.raw_os_error(), Some(libc::EBADF | libc::EINVAL)) {
+        return Ok(());
+    }
+    let retriable = err.raw_os_error() == Some(libc::ENOENT)
+        || unsafe { pgrx::pg_sys::data_sync_elevel(pgrx::PgLogLevel::ERROR as i32) }
+            < pgrx::PgLogLevel::PANIC as i32;
+    if !retriable {
+        pgrx::ereport!(
+            pgrx::PgLogLevel::PANIC,
+            pgrx::PgSqlErrorCode::ERRCODE_DATA_CORRUPTED,
+            format!("kafgres: fsync failed on directory {}: {err}", path.display()),
+            "Retrying fsync is not safe: the kernel may have already discarded the dirty \
+             metadata, so a second call can report success having written nothing."
+        );
+    }
+    Err(StoreError::Io(format!("fsync of directory {}: {err}", path.display())))
+}
 
 /// Drop this process's cached descriptors wherever the files underneath them can go.
 /// Append one entry to a lazily-opened index file; failures are logged and swallowed, since
@@ -269,6 +321,7 @@ fn with_active<T>(
                 index: None,
                 timeindex: None,
                 writeback_from,
+                dir_synced: false,
             },
         );
     }
@@ -433,15 +486,28 @@ impl Vfd {
     }
 
     /// PANIC on fsync failure, deliberately — do not soften into a retry: Linux drops the dirty
-    fn sync(&self) {
+    /// pages, so a second call can report success having written nothing. Two cases instead
+    /// get an ordinary error, matching Postgres's own `sync.c:ProcessSyncRequests` policy:
+    ///
+    /// - `ENOENT`: the reopen `FileSync` does on an LRU-closed VFD failed. A segment
+    ///   unlinked under a cached handle is a storage error, not a kernel that lost data.
+    /// - `data_sync_retry = on`: the operator says their kernel keeps dirty pages across a
+    ///   failed fsync, so `data_sync_elevel` returns ERROR rather than PANIC.
+    fn sync(&self) -> StoreResult<()> {
         let rc = unsafe {
             pgrx::pg_sys::FileSync(
                 self.file,
                 pgrx::pg_sys::WaitEventIO::WAIT_EVENT_DATA_FILE_SYNC as u32,
             )
         };
-        if rc < 0 {
-            let err = std::io::Error::last_os_error();
+        if rc >= 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        let retriable = err.raw_os_error() == Some(libc::ENOENT)
+            || unsafe { pgrx::pg_sys::data_sync_elevel(pgrx::PgLogLevel::ERROR as i32) }
+                < pgrx::PgLogLevel::PANIC as i32;
+        if !retriable {
             pgrx::ereport!(
                 pgrx::PgLogLevel::PANIC,
                 pgrx::PgSqlErrorCode::ERRCODE_DATA_CORRUPTED,
@@ -450,6 +516,10 @@ impl Vfd {
                  dirty pages, so a second call can report success having written nothing."
             );
         }
+        Err(StoreError::Io(format!(
+            "FileSync on {}: {err}",
+            self.path.display()
+        )))
     }
 
     /// Hand a written range to the kernel for writeback without waiting for it.
@@ -647,7 +717,7 @@ impl SegmentStore {
             let mut vfd = Vfd::open(&tmp_path, true)?;
             vfd.truncate(0)?;
             vfd.write_all_at(contents, 0)?;
-            vfd.sync();
+            vfd.sync()?;
         }
 
         let swapped = Self::with_slot(topic, partition, |st, hints| {
@@ -997,8 +1067,8 @@ impl SegmentStore {
             with_active(topic, partition, closing_base, generation, |a| {
                 a.log
                     .writeback(a.writeback_from, closing_bytes.saturating_sub(a.writeback_from));
-                a.log.sync();
-                Ok(())
+                a.log.sync()?;
+                a.sync_dir(topic, partition)
             })?;
             evict_active(topic, partition);
             st.active_base = base_offset;
@@ -1284,11 +1354,15 @@ impl LogStore for SegmentStore {
             // Enumerate from disk, not the hint map: hints are per-process, so a partition appended by
             // TODO: cache the per-Fetch `read_dir`; the list changes only on roll/reclaim.
             let bases_on_disk = Self::segment_bases(topic, partition)?;
-            let committed = match isolation {
+            // The marker load can lower the ceiling: past its cap, reading beyond it would
+            // judge a batch committed on missing evidence.
+            let (committed, ceiling) = match isolation {
                 IsolationLevel::ReadCommitted => {
-                    Some(pmeta::committed_markers(topic, partition, offset, ceiling)?)
+                    let (set, capped) =
+                        pmeta::committed_markers(topic, partition, offset, ceiling)?;
+                    (Some(set), capped)
                 }
-                IsolationLevel::ReadUncommitted => None,
+                IsolationLevel::ReadUncommitted => (None, ceiling),
             };
             // Producer ids Kafka handed out, so a transactional batch from one of them is
             let kafka_producers = if committed.is_some() {
@@ -1911,9 +1985,9 @@ impl LogStore for SegmentStore {
             // Hand the tail to writeback first, as the roll path does.
             a.log
                 .writeback(a.writeback_from, bytes.saturating_sub(a.writeback_from));
-            a.log.sync();
+            a.log.sync()?;
             a.writeback_from = bytes;
-            Ok(())
+            a.sync_dir(topic, partition)
         })
     }
 
@@ -2159,7 +2233,12 @@ impl SegmentStore {
 
     /// Release one uncommitted reservation, on both commit and abort: missing it on the abort
     pub fn release_pending(topic: TopicId, partition: i32) {
-        let mut slots = SHARDS[shard_of(topic, partition)].exclusive();
+        // Runs in a commit or abort callback, where a panic is a PANIC: no indexing.
+        let Some(shard) = SHARDS.get(shard_of(topic, partition)) else {
+            pgrx::warning!("kafgres: no lock shard for topic {topic} partition {partition}; reservation not released");
+            return;
+        };
+        let mut slots = shard.exclusive();
         for slot in slots.iter_mut() {
             if slot.topic == topic && slot.partition == partition {
                 slot.pending_count = (slot.pending_count - 1).max(0);
