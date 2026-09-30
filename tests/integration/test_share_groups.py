@@ -159,7 +159,8 @@ def test_work_held_by_a_dead_consumer_is_redelivered(queue):
 
     sql("UPDATE kafgres_share_inflight SET acquired_until = now() - interval '1 second' "
         "WHERE member_id = 'doomed'")
-    assert int(sql("SELECT kafgres_share_expire()")) >= 1
+    # The broker's own sweep may have released them first.
+    sql("SELECT kafgres_share_expire()")
     assert acquire("m4", "survivor", queue, 2) == [0, 1], "the dead consumer's work was lost"
     assert state_of("m4", queue, 0) == "acquired:2", state_of("m4", queue, 0)
 
