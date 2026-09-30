@@ -899,6 +899,8 @@ fn kafgres_cdc_drop_slot() -> bool {
 /// Do not call in a transaction you might roll back: the slot advance is not transactional,
 #[pg_extern]
 fn kafgres_cdc_drain(max_changes: default!(i32, 10000)) -> i64 {
+    // Before the slot is read: an ERROR later would come after changes were consumed.
+    crate::server::wait_for_epochs();
     match drain_once(max_changes) {
         Ok(n) => n as i64,
         Err(e) => error!("kafgres: {e}"),
@@ -1273,6 +1275,7 @@ fn kafgres_cdc_snapshots() -> TableIterator<
 
 #[pg_extern]
 fn kafgres_cdc_snapshot(max_batches: default!(i32, 10_000)) -> i64 {
+    crate::server::wait_for_epochs();
     let limit = snapshot_batch_rows();
     let mut total = 0i64;
     for _ in 0..max_batches.max(1) {

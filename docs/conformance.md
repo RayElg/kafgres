@@ -182,9 +182,9 @@ from, so a reset moves where the next acquire begins.
   compiles, is refused here with `INVALID_REGULAR_EXPRESSION`. Plain patterns,
   alternation and character classes behave the same on both.
 - **Leader epochs are not consecutive.** Kafka increments the epoch by one per
-  election; kafgres derives it from the Postgres timeline id, so it can jump. The protocol requires
-  monotonicity, not consecutiveness, and a client that assumed `+1` was already broken
-  against real Kafka.
+  election. kafgres takes the next epoch on every broker start, but a promotion jumps to
+  the next Postgres timeline's range, so the epoch leaps from, say, 3 to 65536. The
+  protocol requires monotonicity, not consecutiveness.
 - **Frame and message limits.** `kafgres.max_request_bytes` (SIGHUP-reloadable, default
   32 MiB, range 1 to 100 MiB) bounds a produce request, and Kafka allows up to 100 MB.
   A stock librdkafka producer aggregates a request across partitions until it exceeds

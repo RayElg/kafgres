@@ -24,6 +24,10 @@ pub enum SequenceCheck {
     /// An exact replay of a batch still in the window: answer with the offset it got the
     Duplicate { base_offset: i64 },
     OutOfOrder { expected: i32, got: i32 },
+    /// Out of sequence against a window written before the current leader epoch: the
+    /// broker lost state in a failover or crash. `UNKNOWN_PRODUCER_ID` makes the client
+    /// reset its sequence; `OUT_OF_ORDER_SEQUENCE_NUMBER` is fatal to librdkafka.
+    Stale,
     /// The batch carries an epoch older than the one this producer id has already written
     Fenced { current_epoch: i16 },
 }
@@ -149,16 +153,25 @@ struct Retained {
 }
 
 /// The window in **insertion order**, oldest first. Ordering by `last_seq` is not
-fn window(producer_id: i64, topic_id: u32, partition: i32) -> Result<Vec<Retained>, spi::Error> {
+/// Also the current leader epoch's start offset.
+fn window(
+    producer_id: i64,
+    topic_id: u32,
+    partition: i32,
+) -> Result<(Vec<Retained>, i64), spi::Error> {
     crate::plan::select(
-        "SELECT producer_epoch, first_seq, last_seq, base_offset
+        "SELECT producer_epoch, first_seq, last_seq, base_offset,
+                (SELECT epoch_start_offset FROM kafgres_partitions p
+                  WHERE p.topic_id = $2::oid AND p.partition = $3)
            FROM kafgres_producer_batches
           WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3
           ORDER BY added_seq",
         &[producer_id.into(), (topic_id as i32).into(), partition.into()],
         |rows| {
             let mut out = Vec::new();
+            let mut epoch_start = 0;
             for row in rows {
+                epoch_start = row.get::<i64>(5)?.unwrap_or(0);
                 out.push(Retained {
                     epoch: row.get::<i32>(1)?.unwrap_or(0) as i16,
                     first_seq: row.get::<i32>(2)?.unwrap_or(NO_SEQUENCE),
@@ -166,7 +179,7 @@ fn window(producer_id: i64, topic_id: u32, partition: i32) -> Result<Vec<Retaine
                     base_offset: row.get::<i64>(4)?.unwrap_or(-1),
                 });
             }
-            Ok(out)
+            Ok((out, epoch_start))
         },
     )
 }
@@ -185,7 +198,7 @@ pub fn check(
     topic_id: u32,
     partition: i32,
 ) -> Result<SequenceCheck, spi::Error> {
-    let retained = window(producer_id, topic_id, partition)?;
+    let (retained, epoch_start) = window(producer_id, topic_id, partition)?;
 
     // No state at all: accept whatever sequence arrives — deliberately *not*
     if retained.is_empty() {
@@ -227,6 +240,8 @@ pub fn check(
 
     if in_sequence(current_last, first_seq) {
         Ok(SequenceCheck::Append)
+    } else if newest.base_offset >= 0 && newest.base_offset < epoch_start {
+        Ok(SequenceCheck::Stale)
     } else {
         Ok(SequenceCheck::OutOfOrder {
             expected: increment_sequence(current_last, 1),
@@ -298,6 +313,16 @@ pub fn record(
         &[producer_id.into(), LAST_TS_GRANULARITY_SECS.into()],
     )?;
     Ok(())
+}
+
+/// Drop window rows at or past `end`, which the recovered log does not hold, so a retry is
+/// not acknowledged at a missing offset (I6). Reservations (-1) stay: their fate is unknown.
+pub fn forget_past(topic_id: u32, partition: i32, end: i64) -> Result<(), spi::Error> {
+    crate::plan::run(
+        "DELETE FROM kafgres_producer_batches
+          WHERE topic_id = $1::oid AND partition = $2 AND base_offset >= $3",
+        &[(topic_id as i32).into(), partition.into(), end.into()],
+    )
 }
 
 /// Stamp the offset a `base_offset = -1` reservation was appended at.

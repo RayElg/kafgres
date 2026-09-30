@@ -31,6 +31,7 @@ mod init130;
 mod init140;
 mod init150;
 mod init160;
+mod init170;
 pub mod quota;
 pub mod meta;
 pub mod plan;
@@ -681,6 +682,10 @@ pub extern "C-unwind" fn _PG_init() {
 
     // Registered unconditionally rather than only when `storage_engine=segment`: shared
     crate::storage::segment::init_shmem();
+    {
+        use crate::server::EPOCHS_RAISED;
+        pgrx::pg_shmem_init!(EPOCHS_RAISED);
+    }
 
     // The broker starts at `RecoveryFinished` so a standby never serves partitions; the
     BackgroundWorkerBuilder::new("kafgres_follower")
@@ -783,6 +788,10 @@ pub unsafe extern "C-unwind" fn kafgres_cdc_worker_main(_arg: pg_sys::Datum) {
             interval = cdc_interval();
         }
         if interval.is_zero() {
+            continue;
+        }
+        // Appends wait for the broker's recovery and new leader epochs, as SQL produce does.
+        if !server::EPOCHS_RAISED.get().load(std::sync::atomic::Ordering::Acquire) {
             continue;
         }
 
@@ -901,7 +910,38 @@ pub(crate) fn ensure_tables_exist() {
     init140::init_140();
     init150::init_150();
     init160::init_160();
+    init170::init_170();
 }
+
+pgrx::extension_sql!(
+    r#"
+-- Revoke EXECUTE from PUBLIC on everything but kafgres_produce(), which checks its own
+-- permissions, and the read-only reports, which need table grants anyway.
+DO $$
+DECLARE
+    f regprocedure;
+BEGIN
+    FOR f IN
+        SELECT p.oid::regprocedure
+          FROM pg_depend d
+          JOIN pg_proc p ON p.oid = d.objid
+         WHERE d.classid = 'pg_proc'::regclass
+           AND d.refclassid = 'pg_extension'::regclass
+           AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname = 'kafgres')
+           AND d.deptype = 'e'
+           AND p.proname NOT IN ('kafgres_produce', 'kafgres_version', 'kafgres_kafka_version',
+                                 'kafgres_partition_offsets', 'kafgres_archive_status',
+                                 'kafgres_cdc_status', 'kafgres_cdc_snapshots',
+                                 'kafgres_share_state')
+    LOOP
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', f);
+    END LOOP;
+END
+$$;
+"#,
+    name = "revoke_from_public",
+    finalize
+);
 
 #[pg_extern]
 fn kafgres_kafka_version() -> &'static str {

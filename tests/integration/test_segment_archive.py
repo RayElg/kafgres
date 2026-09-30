@@ -445,20 +445,11 @@ def test_a_rewound_log_is_reported(rig):
     """A restore that lands less log than the node had is a divergence.
 
     Only sealed segments are archived, so the restored log ends short — the routine case,
-    not the disaster case. New produces then re-issue the offsets that were lost. Nothing
-    about this is a promotion, so the timeline does not move and `raise_leader_epochs`
-    leaves the epoch alone; the re-issued offsets get stamped with the same epoch the lost
-    records carried.
+    not the disaster case. New produces then re-issue the offsets that were lost.
 
-    A consumer holding `(epoch, offset)` from before the restore then asks
-    `OffsetForLeaderEpoch`, is told its epoch is still current, and resumes at its old
-    position reading *different records under the same coordinates*, with no error raised
-    anywhere.
-
-    **This test pins the report, not a repair.** The broker deliberately does not mint an
-    epoch for a rewind: epochs are timeline-derived, so a locally computed `current + 1`
-    consumes the number the next promotion needs and silently disarms the real failover
-    bump. What is asserted here is that the condition is *visible* rather than silent.
+    The restart takes a new leader epoch starting at the restored log end, so a consumer
+    validating its position truncates there. The finding is still reported for consumers
+    that do not validate.
     """
     topic = rig
     fill(topic)
@@ -482,22 +473,12 @@ def test_a_rewound_log_is_reported(rig):
 
     detail = sql("SELECT detail FROM kafgres_restore_check() WHERE finding = 'log rewound'")
     assert "re-issue the offsets" in detail, detail
-    assert epoch_of(topic) == before, (
-        "something raised the leader epoch on a rewind; if that was deliberate, check it "
-        "against raise_leader_epochs' timeline arithmetic before keeping it"
-    )
+    assert epoch_of(topic) > before, "the restart over a rewound log kept the old epoch"
 
-def test_an_ordinary_restart_does_not_raise_the_epoch(rig):
-    """The control for the test above, and the one that matters more.
-
-    Nothing may raise the leader epoch on an ordinary restart. If anything did, the epoch
-    would climb every time the broker came back, every consumer would be told to truncate
-    for no reason, and — because epochs are timeline-derived — it would consume the numbers
-    real promotions need. An archived log on an intact node is the case most likely to trip
-    a rewind check into thinking otherwise: the
-    archive holds real rows, and the active segment it does *not* hold is exactly the range
-    a naive check would read as missing.
-    """
+def test_an_ordinary_restart_takes_one_epoch_at_the_log_end(rig):
+    """The control for the test above. On an intact node the new epoch starts exactly at
+    the log end, so no consumer truncates, and the rewind check stays quiet even though
+    the archive lacks the active segment."""
     topic = rig
     fill(topic)
     set_guc("kafgres.segment_archive_command", f"'cp %p {ARCHIVE_DIR}/%f'")
@@ -505,10 +486,16 @@ def test_an_ordinary_restart_does_not_raise_the_epoch(rig):
     assert archived_for(topic), "nothing was archived, so this proves nothing"
 
     before = epoch_of(topic)
+    log_end = int(sql(f"SELECT high_watermark FROM kafgres_partition_offsets('{topic}')"))
     compose("restart", "postgres", timeout=300)
     time.sleep(16)
 
-    assert epoch_of(topic) == before, "an ordinary restart raised the leader epoch"
+    assert epoch_of(topic) == before + 1, "a restart did not take exactly one new epoch"
+    start = sql(f"""SELECT start_offset FROM kafgres_leader_epochs e
+                      JOIN kafgres_topics t USING (topic_id)
+                     WHERE t.name = '{topic}' AND e.partition = 0
+                       AND e.leader_epoch = {before + 1}""")
+    assert int(start) == log_end, f"the new epoch starts at {start}, not the log end {log_end}"
     assert sql("SELECT coalesce(string_agg(finding, ','), '') "
                "FROM kafgres_restore_check()") == ""
 

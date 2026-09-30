@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use pgrx::bgworkers::BackgroundWorker;
@@ -263,6 +264,26 @@ impl Server {
     }
 }
 
+/// Set once the broker has raised the leader epochs since shared memory was created, which
+/// a crash restart does again: appends from SQL and CDC wait on it rather than land before
+/// the torn tail is recovered, under the epoch before the crash.
+pub static EPOCHS_RAISED: pgrx::PgAtomic<AtomicBool> =
+    unsafe { pgrx::PgAtomic::new(c"kafgres_epochs_raised") };
+
+/// Wait up to 30 s for the broker to raise the leader epochs, then raise an ERROR.
+pub fn wait_for_epochs() {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !EPOCHS_RAISED.get().load(Ordering::Acquire) {
+        if Instant::now() >= deadline {
+            error!("kafgres: the broker has not taken leader epochs since the server started");
+        }
+        unsafe {
+            pg_sys::pg_usleep(50_000);
+            pg_sys::check_for_interrupts!();
+        }
+    }
+}
+
 pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
     let mut cfg = cfg;
     crate::storage::bound_compaction_passes();
@@ -281,6 +302,9 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
             log!("kafgres: removed {stale} unfinished compaction file(s) of exited processes");
         }
     }
+    // Before anything that can end `run()` early: SQL produce and CDC wait on it.
+    let mut epochs_ready = raise_leader_epochs();
+
     // Before the listener: a broker that was told to serve TLS and cannot must not come
     let tls = match crate::tls_setup() {
         Ok(Some(setup)) => {
@@ -338,8 +362,6 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
 
     // Load once before the loop, not just on the first tick: the default snapshot is
     refresh_acls(&mut srv);
-
-    let mut epochs_ready = raise_leader_epochs();
 
     // After recovery has truncated any torn tail, and before serving: a marker pointing
     match BackgroundWorker::transaction(|| {
@@ -2247,22 +2269,39 @@ fn expire_producer_state(srv: &mut Server) {
     }
 }
 
-/// Raise every partition to the leader epoch this timeline implies.
+/// Every start takes a new leader epoch for every partition (I5). A restart can lose
+/// unsynced records whose offsets new produces then reuse; the epoch starts at the recovered
+/// log end, so a client that read past it truncates there.
+///
+/// The timeline is the high half: a diverged primary restarting on its old timeline never
+/// reaches the epochs a promotion takes.
 fn raise_leader_epochs() -> bool {
     let result = BackgroundWorker::transaction(|| {
         crate::dbtx::guarded(|| {
-            // The timeline increments on `pg_promote`. Epoch 0 on a cluster that has
-            let timeline: i32 = pgrx::Spi::get_one(
+            // The timeline increments on `pg_promote`.
+            let wal_timeline: i32 = pgrx::Spi::get_one(
                 "SELECT (('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int)",
             )?
             .unwrap_or(1);
-            let epoch = timeline - 1;
+            let timeline = epoch_timeline(wal_timeline)?;
 
             let partitions = crate::meta::all_partitions()?;
             let mut store = crate::storage::open();
             let mut raised = 0usize;
+            let mut highest = 0;
             for (topic_id, partition) in partitions {
                 // No per-partition error arm: a lock or statement timeout in here is a
+                // failure of the whole raise, retried before anything is served.
+                let current = crate::storage::LogStore::leader_epoch(&*store, topic_id, partition)
+                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                let epoch = next_leader_epoch(current, timeline);
+                if epoch == current {
+                    log!(
+                        "kafgres: topic {topic_id} partition {partition} has used every epoch \
+                         of timeline {timeline}; its epoch stays {current} until a promotion"
+                    );
+                }
+                highest = highest.max(epoch);
                 if crate::storage::LogStore::set_leader_epoch(
                     &mut *store, topic_id, partition, epoch,
                 )
@@ -2270,18 +2309,25 @@ fn raise_leader_epochs() -> bool {
                 {
                     raised += 1;
                 }
+                // A crash can leave window rows for batches the recovered log lost.
+                let end = crate::storage::LogStore::high_watermark(&*store, topic_id, partition)
+                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                crate::producer::forget_past(topic_id, partition, end)
+                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
             }
-            Ok((epoch, raised))
+            Ok((highest, raised))
         })
     });
 
     match result {
         Ok((epoch, 0)) => {
             log!("kafgres: leader epoch {epoch} already current for every partition");
+            EPOCHS_RAISED.get().store(true, Ordering::Release);
             true
         }
         Ok((epoch, n)) => {
-            log!("kafgres: promoted to leader epoch {epoch} for {n} partition(s)");
+            log!("kafgres: took a new leader epoch (up to {epoch}) for {n} partition(s)");
+            EPOCHS_RAISED.get().store(true, Ordering::Release);
             true
         }
         Err(e) => {
@@ -2289,6 +2335,58 @@ fn raise_leader_epochs() -> bool {
             false
         }
     }
+}
+
+/// The timeline epochs are taken from: the WAL's plus a bias. When the WAL's goes backwards
+/// (pg_upgrade, pg_resetwal) the bias moves it one past the last, since the old cluster may
+/// still start. With no row yet this may be such a start, so the bias moves past the highest
+/// epoch's timeline; on an ordinary start that costs one skipped timeline, once.
+fn epoch_timeline(wal_timeline: i32) -> Result<i32, HandlerError> {
+    let row: Option<(i32, i32)> = pgrx::Spi::connect(|client| {
+        let mut found = None;
+        for row in client.select("SELECT last_timeline, bias FROM kafgres_timeline", None, &[])? {
+            found = Some((row.get::<i32>(1)?.unwrap_or(1), row.get::<i32>(2)?.unwrap_or(0)));
+        }
+        Ok::<_, pgrx::spi::Error>(found)
+    })?;
+    let bias = match row {
+        Some((last, bias)) if wal_timeline < last => bias + (last - wal_timeline) + 1,
+        Some((_, bias)) => bias,
+        None => {
+            let highest: i32 =
+                pgrx::Spi::get_one("SELECT COALESCE(max(leader_epoch), 0) FROM kafgres_partitions")?
+                    .unwrap_or(0);
+            if highest == 0 {
+                0
+            } else {
+                (highest / EPOCHS_PER_TIMELINE + 2 - wal_timeline).max(0)
+            }
+        }
+    };
+    if row != Some((wal_timeline, bias)) {
+        pgrx::Spi::run_with_args(
+            "INSERT INTO kafgres_timeline (last_timeline, bias) VALUES ($1, $2)
+             ON CONFLICT (only_row) DO UPDATE SET last_timeline = $1, bias = $2",
+            &[wal_timeline.into(), bias.into()],
+        )?;
+    }
+    Ok(wal_timeline.saturating_add(bias))
+}
+
+/// Epochs a timeline can mint: the low half counts starts, the high half is the timeline.
+const EPOCHS_PER_TIMELINE: i32 = 1 << 16;
+
+/// The epoch a start takes after `current`: the next within `timeline`, that timeline's
+/// first if `current` is from an earlier one, or `current` when the timeline is used up.
+fn next_leader_epoch(current: i32, timeline: i32) -> i32 {
+    let base = (timeline - 1).clamp(0, i32::MAX / EPOCHS_PER_TIMELINE) * EPOCHS_PER_TIMELINE;
+    if current < base {
+        return base;
+    }
+    if current % EPOCHS_PER_TIMELINE == EPOCHS_PER_TIMELINE - 1 {
+        return current;
+    }
+    current + 1
 }
 
 /// Reload the ACL table when the cached snapshot has aged out.
@@ -2647,5 +2745,19 @@ mod tests {
         assert_eq!(fetch_wait(-1), Duration::ZERO);
         assert_eq!(fetch_wait(500), Duration::from_millis(500));
         assert_eq!(fetch_wait(i32::MAX), MAX_FETCH_WAIT);
+    }
+
+    #[test]
+    fn a_restart_counts_up_and_a_promotion_jumps_above_it() {
+        // A 0.2.0 node on timeline 1 at epoch 0 restarts, then restarts again.
+        assert_eq!(next_leader_epoch(0, 1), 1);
+        assert_eq!(next_leader_epoch(1, 1), 2);
+        // A promotion starts above anything the old timeline reached.
+        assert_eq!(next_leader_epoch(2, 2), EPOCHS_PER_TIMELINE);
+        assert!(next_leader_epoch(EPOCHS_PER_TIMELINE - 2, 1) < next_leader_epoch(0, 2));
+        // A 0.2.0 epoch on a later timeline was `timeline - 1`, below the new base.
+        assert_eq!(next_leader_epoch(2, 3), 2 * EPOCHS_PER_TIMELINE);
+        // A used-up timeline keeps its epoch rather than taking the next timeline's.
+        assert_eq!(next_leader_epoch(EPOCHS_PER_TIMELINE - 1, 1), EPOCHS_PER_TIMELINE - 1);
     }
 }

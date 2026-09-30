@@ -11,6 +11,7 @@ deduplication has to survive, and no client library will do it on purpose.
 
 import struct
 import subprocess
+import time
 
 import pytest
 
@@ -740,3 +741,52 @@ def test_a_resend_of_an_unstamped_reservation_is_a_duplicate_without_an_offset(t
     _, err, off = send_produce(conn, topic, batch, 8380)
     assert (err, off) == (DUPLICATE_SEQUENCE_NUMBER, -1), (err, off)
     assert high_watermark(topic) == 0, "the resend was appended"
+
+UNKNOWN_PRODUCER_ID = 59
+
+def test_a_window_older_than_the_leader_epoch_answers_unknown_producer(topic, conn):
+    """After a lossy failover the producer window can lag the log. A batch out of sequence
+    against a window older than the current epoch is the broker's lost state, answered
+    UNKNOWN_PRODUCER_ID so the client resets its sequence.
+
+    Simulated by deleting the newest window row and moving the epoch start past the window.
+    """
+    pid = 7700
+    for seq in range(3):
+        batch = record_batch([f"s{seq}".encode()], producer_id=pid, producer_epoch=0,
+                             base_sequence=seq)
+        _, err, _ = send_produce(conn, topic, batch, 4100 + seq)
+        assert err == 0, f"seq {seq}: error {err}"
+    tid = f"(SELECT topic_id FROM kafgres_topics WHERE name = '{topic}')"
+    sql(f"DELETE FROM kafgres_producer_batches WHERE producer_id = {pid} AND first_seq = 2")
+
+    nxt = record_batch([b"s3"], producer_id=pid, producer_epoch=0, base_sequence=3)
+    _, err, _ = send_produce(conn, topic, nxt, 4110)
+    assert err == OUT_OF_ORDER_SEQUENCE_NUMBER, (
+        f"within one epoch a gap is the producer's: expected 45, got {err}"
+    )
+
+    sql(f"UPDATE kafgres_partitions SET epoch_start_offset = 1000 WHERE topic_id = {tid}")
+    _, err, _ = send_produce(conn, topic, nxt, 4111)
+    assert err == UNKNOWN_PRODUCER_ID, f"expected 59 against a stale window, got {err}"
+
+def test_a_restart_forgets_window_rows_past_the_recovered_log(topic):
+    """Window rows commit before the log is fsynced, so a crash can keep a row for a batch
+    the recovered log lost. A retry would then be acknowledged at an offset that does not
+    exist; the broker drops such rows when it takes its epoch at start."""
+    sql(f"""INSERT INTO kafgres_producer_batches
+                (producer_id, topic_id, partition, producer_epoch, first_seq, last_seq, base_offset)
+            SELECT 7890, topic_id, 0, 0, 0, 0, 1000 FROM kafgres_topics WHERE name = '{topic}'""")
+    rows = "SELECT count(*) FROM kafgres_producer_batches WHERE producer_id = 7890"
+    assert sql(rows).strip() == "1"
+    subprocess.run(["docker", "compose", "restart", "postgres"], check=True, timeout=300,
+                   capture_output=True)
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        try:
+            if sql(rows).strip() == "0":
+                return
+        except RuntimeError:
+            pass
+        time.sleep(2)
+    raise AssertionError("a window row past the log end survived the restart")

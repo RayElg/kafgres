@@ -50,6 +50,7 @@ enum AppendError {
     Batch(kafgres_codec::records::BatchError),
     ProducerState(String),
     OutOfOrderSequence { expected: i32, got: i32 },
+    StaleProducerState,
     FencedEpoch { current: i16 },
     TooLarge { bytes: usize, limit: i64 },
     NullKeyOnCompacted,
@@ -67,6 +68,7 @@ impl AppendError {
             // RequestTimedOut, not KAFKA_STORAGE_ERROR: that code tells the client the leader is offline.
             AppendError::ProducerState(_) | AppendError::Aborted => ErrorCode::RequestTimedOut,
             AppendError::OutOfOrderSequence { .. } => ErrorCode::OutOfOrderSequenceNumber,
+            AppendError::StaleProducerState => ErrorCode::UnknownProducerId,
             AppendError::FencedEpoch { .. } => ErrorCode::InvalidProducerEpoch,
             AppendError::TooLarge { .. } => ErrorCode::MessageTooLarge,
             AppendError::NullKeyOnCompacted => ErrorCode::InvalidRecord,
@@ -90,6 +92,9 @@ impl std::fmt::Display for AppendError {
             AppendError::ProducerState(m) => write!(f, "producer state: {m}"),
             AppendError::OutOfOrderSequence { expected, got } => {
                 write!(f, "sequence {got}, expected {expected}")
+            }
+            AppendError::StaleProducerState => {
+                write!(f, "producer state predates the partition's leader epoch")
             }
             AppendError::FencedEpoch { current } => {
                 write!(f, "fenced by producer epoch {current}")
@@ -335,7 +340,7 @@ fn build(
                         plan,
                     });
                 }
-                Err(e) => partitions.push(failed(pd.index, &e, &name)),
+                Err(e) => partitions.push(failed_in(&*store, tid, pd.index, &e, &name)),
             }
         }
 
@@ -457,7 +462,7 @@ fn finish(
                 ..Default::default()
             }
         }
-        Err(e) => failed(index, &e, &topics[p.topic].name),
+        Err(e) => failed_in(&*store, tid, index, &e, &topics[p.topic].name),
     };
     topics[p.topic].partition_responses[p.slot] = response;
 }
@@ -516,6 +521,7 @@ fn plan_partition(
                 SequenceCheck::OutOfOrder { expected, got } => {
                     return Err(AppendError::OutOfOrderSequence { expected, got })
                 }
+                SequenceCheck::Stale => return Err(AppendError::StaleProducerState),
                 SequenceCheck::Fenced { current_epoch } => {
                     return Err(AppendError::FencedEpoch {
                         current: current_epoch,
@@ -681,6 +687,23 @@ fn failed(index: i32, e: &AppendError, topic: &str) -> PartitionProduceResponse 
         log_start_offset: -1,
         ..Default::default()
     }
+}
+
+/// `failed`, with the log start a stale-window refusal needs: given -1, the Java client
+/// retries UNKNOWN_PRODUCER_ID unchanged until the delivery timeout; given the log start,
+/// it bumps its epoch and resets the sequence.
+fn failed_in(
+    store: &dyn LogStore,
+    tid: u32,
+    index: i32,
+    e: &AppendError,
+    topic: &str,
+) -> PartitionProduceResponse {
+    let mut response = failed(index, e, topic);
+    if matches!(e, AppendError::StaleProducerState) {
+        response.log_start_offset = store.log_start_offset(tid, index).unwrap_or(0);
+    }
+    response
 }
 
 /// Header-only: `as_bytes()` includes the 12-byte batch prefix — hence Kafka's default of 1048588.

@@ -369,14 +369,14 @@ fn kafgres_restore_check() -> TableIterator<
                 Some("log rewound".to_string()),
                 Some(format!(
                     "the log ends at {log_end}, but {} — this node is running on less log \
-                     than it had, and new produces will re-issue the offsets above {log_end} \
-                     carrying the same leader epoch as the records they replace. Consumers \
-                     holding a position above {log_end} will read the new records as their \
-                     own, with no error. The broker does not raise the epoch for you — doing \
-                     that from local state would consume the number the next promotion \
-                     needs. Either restore the remaining segments, or treat this node as a \
-                     new leader over a divergent log. Note also that segments re-rolled at \
-                     offsets the archive already holds will not be shipped over them, so \
+                     than it had, and new produces will re-issue the offsets above {log_end}. \
+                     The broker takes a new leader epoch when it starts, so a consumer that \
+                     validates its position is told to truncate to {log_end}; one that does \
+                     not validate (an old client, or a committed offset stored without an \
+                     epoch) reads the new records as its own, with no error. Either restore \
+                     the remaining segments before starting the broker, or treat this node \
+                     as a new leader over a divergent log. Note also that segments re-rolled \
+                     at offsets the archive already holds will not be shipped over them, so \
                      point the archive somewhere new before serving.",
                     evidence.join("; ")
                 )),

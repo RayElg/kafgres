@@ -36,18 +36,25 @@ Failing over to an asynchronous standby can lose committed offsets. A consumer h
 offset 5000 can reconnect to a primary whose log ends at 4800 and, without protection,
 read divergent data.
 
-Every partition therefore persists a `leader_epoch`. The broker raises it to the current
-Postgres timeline id minus one at every start — which is the new timeline's value after a
-promotion — stamps it into each batch's `partitionLeaderEpoch` field, and implements
-`OffsetForLeaderEpoch` (API key 23). Clients use it to detect the divergence and truncate
-back to the last offset they can trust.
+A restart without a failover can do the same on one node: records acknowledged before a
+power cut may have been only in page cache, and new produces then reuse their offsets.
 
-The epoch value is the Postgres timeline id minus one. A freshly initialised cluster
-sits on timeline 1, so its partitions carry epoch 0 from the broker's first start,
-before any promotion; the first promotion moves the cluster to timeline 2, and the next
-raise produces epoch 1, and so on. The protocol requires leader epochs to increase, not
-to increase by exactly one, and the timeline ordering is correct across promotions in a
-way that computing `old + 1` from replicated state may not be.
+Every partition therefore persists a `leader_epoch`, and the broker takes a new one at every
+start, as a Kafka leader does when it comes back. The new epoch begins at the recovered log
+end, is stamped into each batch's `partitionLeaderEpoch` field, and is answered by
+`OffsetForLeaderEpoch` (API key 23). A client that read past the recovered log end is told
+to truncate back to it.
+
+The epoch is `(timeline - 1) * 65536 + starts`: the Postgres timeline in the high 16 bits,
+a count of broker starts in the low 16. A promotion moves the cluster to the next timeline,
+so the new leader takes that timeline's first epoch (65536 for timeline 2), which a
+diverged old primary restarting on its own timeline can never reach. pg_upgrade and
+`pg_resetwal` start the WAL over at timeline 1; kafgres records the last timeline it saw
+and, when the WAL's is lower, carries on from the one after it.
+
+`kafgres_produce()`, `kafgres_cdc_drain()`, `kafgres_cdc_snapshot()`,
+`kafgres_expire_transactions()` and the CDC worker append only once the broker has taken its
+epoch after a start, so nothing lands under the previous epoch past the recovered log end.
 
 ## Storage engines
 

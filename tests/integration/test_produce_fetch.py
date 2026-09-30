@@ -456,6 +456,8 @@ def test_a_held_table_lock_does_not_wedge_the_broker(topic):
     make(topic)
     from conftest import API_VERSIONS, BROKER_HOST, BROKER_PORT, METADATA, Connection
     import socket as _socket
+    # Only this test's log lines: other tests kill the broker on purpose.
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 1))
 
     HOLD = 12.0  # far longer than any timeout, so a wedged broker cannot pass
 
@@ -504,7 +506,8 @@ def test_a_held_table_lock_does_not_wedge_the_broker(topic):
         holder.wait(timeout=30)
 
     logs = subprocess.run(
-        ["docker", "compose", "logs", "postgres"], capture_output=True, text=True, timeout=60
+        ["docker", "compose", "logs", "--since", since, "postgres"],
+        capture_output=True, text=True, timeout=60,
     ).stdout
     assert "query aborted" in logs.lower(), "no lock conflict occurred — test is vacuous"
     deaths = [
