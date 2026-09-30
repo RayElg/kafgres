@@ -105,6 +105,118 @@ impl Survivors {
     }
 }
 
+/// The cleaner's offset map: the latest offset of each key over a stretch of log. Keys are
+/// 128-bit fingerprints, so memory is bounded by key count, not key bytes.
+pub struct OffsetMap {
+    hashers: (std::collections::hash_map::RandomState, std::collections::hash_map::RandomState),
+    latest: HashMap<u128, i64>,
+    /// The last offset the map has seen; nothing above it can be judged.
+    pub end: i64,
+}
+
+impl Default for OffsetMap {
+    fn default() -> Self {
+        OffsetMap {
+            hashers: Default::default(),
+            latest: HashMap::new(),
+            end: -1,
+        }
+    }
+}
+
+impl OffsetMap {
+    pub fn len(&self) -> usize {
+        self.latest.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.latest.is_empty()
+    }
+
+    fn fingerprint(&self, key: &[u8]) -> u128 {
+        use std::hash::BuildHasher;
+        let high = self.hashers.0.hash_one(key) as u128;
+        let low = self.hashers.1.hash_one(key) as u128;
+        (high << 64) | low
+    }
+
+    /// Add every keyed record of `batch`. Returns false, adding nothing, when that would
+    /// pass `max_keys`, unless the map is empty, so a pass always makes progress.
+    pub fn add_batch(&mut self, batch: &RecordBatch, max_keys: usize) -> Result<bool, BatchError> {
+        if batch.is_control() {
+            self.end = self.end.max(batch.last_offset());
+            return Ok(true);
+        }
+        let base = batch.base_offset();
+        let mut found = Vec::new();
+        for record in batch.records_decompressed()? {
+            let record = record?;
+            if let Some(key) = record.key {
+                found.push((self.fingerprint(&key), base + record.offset_delta as i64));
+            }
+        }
+        let new = found.iter().filter(|(f, _)| !self.latest.contains_key(f)).count();
+        if !self.latest.is_empty() && self.latest.len() + new > max_keys {
+            return Ok(false);
+        }
+        for (fingerprint, offset) in found {
+            let latest = self.latest.entry(fingerprint).or_insert(offset);
+            *latest = (*latest).max(offset);
+        }
+        self.end = self.end.max(batch.last_offset());
+        Ok(true)
+    }
+
+    /// Whether a later record of this key is in the map.
+    pub fn superseded(&self, key: &[u8], offset: i64) -> bool {
+        self.latest
+            .get(&self.fingerprint(key))
+            .is_some_and(|latest| *latest > offset)
+    }
+}
+
+/// What a pass keeps of one batch, or `None` when every record survives. Records above
+/// `map.end` and null-keyed records always survive. A tombstone the map has not superseded
+/// goes when `tombstone_goes(offset)` says so.
+pub fn clean_batch(
+    batch: &RecordBatch,
+    map: &OffsetMap,
+    tombstone_goes: &dyn Fn(i64) -> bool,
+) -> Result<Option<Vec<KeptRecord>>, BatchError> {
+    if batch.is_control() || batch.base_offset() > map.end {
+        return Ok(None);
+    }
+    let base = batch.base_offset();
+    let mut kept = Vec::new();
+    let mut dropped = false;
+    for record in batch.records_decompressed()? {
+        let record = record?;
+        let offset = base + record.offset_delta as i64;
+        let timestamp = batch.base_timestamp() + record.timestamp_delta;
+        let goes = offset <= map.end
+            && match &record.key {
+                None => false,
+                Some(key) => {
+                    map.superseded(key, offset)
+                        || (record.value.is_none() && tombstone_goes(offset))
+                }
+            };
+        if goes {
+            dropped = true;
+            continue;
+        }
+        kept.push(KeptRecord {
+            offset,
+            timestamp,
+            key: record.key,
+            value: record.value,
+            headers: record.headers,
+            attributes: record.attributes,
+        });
+    }
+    Ok(dropped.then_some(kept))
+}
+
 /// Rewrite one batch to hold only `kept`, preserving every surviving record's offset.
 pub fn rebuild_batch(source: &RecordBatch, kept: &[KeptRecord]) -> Option<Bytes> {
     use bytes::{BufMut, BytesMut};
@@ -543,5 +655,76 @@ mod tests {
         let s = survivors(&[control]).unwrap();
         assert!(s.keeps_control_batch(0), "a control batch was not retained");
         assert_eq!(s.len(), 0, "a control batch contributed a data survivor");
+    }
+
+    fn offsets_of(batch: &RecordBatch, kept: &Option<Vec<KeptRecord>>) -> Vec<i64> {
+        match kept {
+            None => {
+                let base = batch.base_offset();
+                batch.records().unwrap().map(|r| base + r.unwrap().offset_delta as i64).collect()
+            }
+            Some(k) => k.iter().map(|r| r.offset).collect(),
+        }
+    }
+
+    #[test]
+    fn a_map_built_from_the_head_cleans_a_segment_any_distance_behind_it() {
+        // The version that supersedes `k` is thousands of offsets later.
+        let batches = log(vec![
+            (0, vec![("k", Some("old")), ("a", Some("1")), ("b", Some("1"))]),
+            (5000, vec![("k", Some("new")), ("c", Some("1"))]),
+        ]);
+        let mut map = OffsetMap::default();
+        assert!(map.add_batch(&batches[1], 1 << 20).unwrap());
+        let kept = clean_batch(&batches[0], &map, &|_| false).unwrap();
+        assert_eq!(offsets_of(&batches[0], &kept), vec![1, 2], "the old `k` survived");
+        assert!(
+            clean_batch(&batches[1], &map, &|_| false).unwrap().is_none(),
+            "the latest records were judged superseded by themselves"
+        );
+        let rebuilt = rebuild_batch(&batches[0], &kept.unwrap()).unwrap();
+        let view = RecordBatch::new(rebuilt).unwrap();
+        assert_eq!(view.base_offset(), 1, "survivors were renumbered (I9)");
+    }
+
+    #[test]
+    fn nothing_above_the_map_end_is_judged() {
+        let batches = log(vec![
+            (0, vec![("k", Some("1"))]),
+            (1, vec![("k", Some("2")), ("k", Some("3"))]),
+        ]);
+        let mut map = OffsetMap::default();
+        assert!(map.add_batch(&batches[0], 1 << 20).unwrap());
+        // The map ends at 0, so offsets 1 and 2 are past it and 0 is not superseded.
+        assert!(clean_batch(&batches[0], &map, &|_| false).unwrap().is_none());
+        assert!(clean_batch(&batches[1], &map, &|_| false).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_full_map_refuses_a_batch_whole() {
+        let batches = log(vec![
+            (0, vec![("a", Some("1")), ("b", Some("1"))]),
+            (2, vec![("c", Some("1")), ("a", Some("2"))]),
+        ]);
+        let mut map = OffsetMap::default();
+        assert!(map.add_batch(&batches[0], 2).unwrap(), "the first batch always fits");
+        assert!(!map.add_batch(&batches[1], 2).unwrap(), "a third key was admitted");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.end, 1, "a refused batch moved the map's end");
+        // A batch of known keys only still fits.
+        let known = log(vec![(4, vec![("a", Some("3")), ("b", Some("2"))])]);
+        assert!(map.add_batch(&known[0], 2).unwrap());
+        assert_eq!(map.end, 5);
+    }
+
+    #[test]
+    fn a_tombstone_goes_only_when_the_caller_says() {
+        let batches = log(vec![(0, vec![("a", Some("1")), ("a", None)])]);
+        let mut map = OffsetMap::default();
+        map.add_batch(&batches[0], 1 << 20).unwrap();
+        let young = clean_batch(&batches[0], &map, &|_| false).unwrap();
+        assert_eq!(offsets_of(&batches[0], &young), vec![1], "a kept tombstone went");
+        let old = clean_batch(&batches[0], &map, &|o| o == 1).unwrap();
+        assert_eq!(offsets_of(&batches[0], &old), Vec::<i64>::new());
     }
 }

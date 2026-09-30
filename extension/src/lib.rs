@@ -63,6 +63,10 @@ static STORAGE_ENGINE: GucSetting<Option<CString>> =
 
 static SEGMENT_BYTES: GucSetting<i32> = GucSetting::<i32>::new(64 * 1024 * 1024);
 
+static COMPACTION_PASS_BYTES: GucSetting<i32> = GucSetting::<i32>::new(32 * 1024 * 1024);
+
+static RETENTION_CHECK_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(60_000);
+
 static SEGMENT_LOCK_STRIPES: GucSetting<i32> = GucSetting::<i32>::new(16);
 
 static REPLICATE_FROM: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
@@ -253,6 +257,19 @@ pub fn node_id() -> i32 {
 
 pub fn segment_bytes() -> u64 {
     SEGMENT_BYTES.get().max(1024) as u64
+}
+
+pub fn compaction_pass_bytes() -> i64 {
+    COMPACTION_PASS_BYTES.get().max(65_536) as i64
+}
+
+pub fn retention_check_interval_ms() -> u64 {
+    RETENTION_CHECK_INTERVAL_MS.get().max(1_000) as u64
+}
+
+/// In broker ticks, at least one.
+pub fn retention_check_ticks() -> u64 {
+    (retention_check_interval_ms() / TICK_INTERVAL_MS.get().max(1) as u64).max(1)
 }
 
 pub fn max_request_bytes() -> usize {
@@ -544,6 +561,26 @@ pub extern "C-unwind" fn _PG_init() {
         1,
         16,
         GucContext::Postmaster,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"kafgres.compaction_pass_bytes",
+        c"Bytes one compaction pass reads per partition in the broker; a plan larger than this resumes at the next retention check",
+        c"",
+        &COMPACTION_PASS_BYTES,
+        65_536,
+        i32::MAX,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"kafgres.retention_check_interval_ms",
+        c"How often the broker applies retention and compaction, as Kafka's log.retention.check.interval.ms",
+        c"",
+        &RETENTION_CHECK_INTERVAL_MS,
+        1_000,
+        i32::MAX,
+        GucContext::Sighup,
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(

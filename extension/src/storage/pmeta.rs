@@ -266,18 +266,37 @@ pub fn committed_markers(
     .map_err(spi_err)
 }
 
-/// Producer ids allocated by `InitProducerId`; tells a Kafka transaction's batch from
-pub fn known_producer_ids() -> StoreResult<std::collections::HashSet<i64>> {
+/// Whether a `kafgres_produce()` batch's marker exists, and whether its writer has finished,
+/// in one statement so both see one snapshot.
+pub fn marker_state(topic: TopicId, partition: i32, base: i64, xid: i64) -> StoreResult<(bool, bool)> {
     Spi::connect(|client| {
-        let rows = client.select("SELECT producer_id FROM kafgres_producers", None, &[])?;
-        let mut out = std::collections::HashSet::new();
-        for row in rows {
-            if let Some(id) = row.get::<i64>(1)? {
-                out.insert(id);
-            }
-        }
-        Ok::<_, spi::Error>(out)
+        let row = client
+            .select(
+                "SELECT EXISTS (SELECT 1 FROM kafgres_markers
+                                 WHERE topic_id = $1::oid AND partition = $2
+                                   AND base_offset = $3),
+                        pg_visible_in_snapshot($4::text::xid8, pg_current_snapshot())",
+                Some(1),
+                &[(topic as i32).into(), partition.into(), base.into(), xid.into()],
+            )?
+            .first();
+        Ok::<_, spi::Error>((
+            row.get::<bool>(1)?.unwrap_or(false),
+            row.get::<bool>(2)?.unwrap_or(false),
+        ))
     })
+    .map_err(spi_err)
+}
+
+/// Whether an aborted Kafka transaction of `producer_id` covers `offset`.
+pub fn aborted_at(topic: TopicId, partition: i32, producer_id: i64, offset: i64) -> StoreResult<bool> {
+    Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS (SELECT 1 FROM kafgres_txn_aborted
+                         WHERE topic_id = $1::oid AND partition = $2 AND producer_id = $3
+                           AND first_offset <= $4 AND last_offset >= $4)",
+        &[(topic as i32).into(), partition.into(), producer_id.into(), offset.into()],
+    )
+    .map(|v| v.unwrap_or(false))
     .map_err(spi_err)
 }
 

@@ -239,3 +239,28 @@ def _read_exactly(sock, n):
             raise ConnectionError("peer closed")
         buf += chunk
     return buf
+
+def test_kafkas_dump_tool_reads_the_time_index(big_segments):
+    """The `.timeindex` is Kafka's format: `(max timestamp so far, relative offset)`. Kafka's
+    own dump tool checks each entry against the record at that offset and reports any
+    mismatch."""
+    topic = big_segments
+    for w in range(6):
+        payload = "".join(f"{'y' * 300}-{w}-{i:03d}\n" for i in range(40))
+        assert kcat("-t", topic, "-P", stdin=payload).returncode == 0
+        time.sleep(0.3)
+    tid = sql(f"SELECT topic_id FROM kafgres_topics WHERE name = '{topic}'").strip()
+    container = compose("ps", "-q", "postgres").stdout.strip()
+    # From the server: PGDATA moved in the PG 18 images.
+    base = f"{sql('SHOW data_directory').strip()}/kafgres/{tid}/0/{0:020d}"
+    out = subprocess.run(
+        ["docker", "run", "--rm", "--user", "0", "--volumes-from", container,
+         "apache/kafka:4.1.0", "/opt/kafka/bin/kafka-dump-log.sh",
+         "--files", f"{base}.timeindex"],
+        capture_output=True, text=True, timeout=180,
+    )
+    text = out.stdout + out.stderr
+    entries = [l for l in text.splitlines() if l.startswith("timestamp:")]
+    assert len(entries) >= 2, f"expected several entries: {text[-2000:]}"
+    for bad in ("mismatch", "out of order", "not found", "Exception"):
+        assert bad not in text, f"the dump tool rejected the index ({bad}): {text[-2000:]}"

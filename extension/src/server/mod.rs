@@ -265,6 +265,22 @@ impl Server {
 
 pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
     let mut cfg = cfg;
+    crate::storage::bound_compaction_passes();
+    if crate::storage_engine_guc() == "segment" {
+        match crate::storage::segment::migrate_time_indexes() {
+            Ok(0) => {}
+            Ok(n) => log!(
+                "kafgres: removed {n} pre-0.3.0 .timeindex file(s); timestamp lookups scan \
+                 those segments"
+            ),
+            // Old-format files would answer timestamp lookups wrongly.
+            Err(e) => error!("kafgres: could not remove pre-0.3.0 .timeindex files: {e}"),
+        }
+        let stale = crate::storage::segment::remove_stale_compactions();
+        if stale > 0 {
+            log!("kafgres: removed {stale} unfinished compaction file(s) of exited processes");
+        }
+    }
     // Before the listener: a broker that was told to serve TLS and cannot must not come
     let tls = match crate::tls_setup() {
         Ok(Some(setup)) => {
@@ -2369,8 +2385,7 @@ fn expire_consumer_group_members(srv: &Server) {
 }
 
 fn enforce_retention(srv: &mut Server) {
-    const EVERY_N_TICKS: u64 = 12_000; // ~60s at the default 5ms tick
-    if !srv.due(EVERY_N_TICKS) {
+    if !srv.due(crate::retention_check_ticks()) {
         return;
     }
     if let Err(e) = BackgroundWorker::transaction(|| {
@@ -2380,6 +2395,7 @@ fn enforce_retention(srv: &mut Server) {
     }
 
     let cursor = srv.retention_cursor;
+    crate::storage::reset_compaction_budget();
     match BackgroundWorker::transaction(|| {
         crate::dbtx::guarded(|| crate::retention::sweep(cursor).map_err(Into::into))
     }) {

@@ -39,6 +39,13 @@ restart does.
 | `kafgres.replicate_from` | reload | empty | `host:port` of the leader to pull log from on a standby; empty disables it. The follower reads it when it starts: a reload can clear it, but setting it on a standby that started without it takes an instance restart, and changing the address takes a restart of the follower worker. |
 | `kafgres.allow_transactional_produce` | reload | on | Enable `kafgres_produce()`, the transactional SQL produce path. |
 
+## Retention and compaction
+
+| Setting | Reload | Default | Description |
+|---|---|---|---|
+| `kafgres.retention_check_interval_ms` | reload | `60000` | How often the broker applies retention and compaction, as Kafka's `log.retention.check.interval.ms`. |
+| `kafgres.compaction_pass_bytes` | reload | `32 MiB` | Bytes compaction reads in the broker per retention check, across all partitions; a larger plan resumes at the next check. With the defaults the broker cleans up to about 0.5 MiB/s in total. Raising it lengthens the pause each check takes from serving clients. |
+
 ## CDC
 
 | Setting | Reload | Default | Description |

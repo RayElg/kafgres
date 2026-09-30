@@ -48,6 +48,7 @@ pub fn sweep(cursor: u32) -> Result<Batch, spi::Error> {
     })?;
 
     if topics.is_empty() {
+        crate::storage::finish_rotation();
         return Ok(Batch::nothing(0));
     }
 
