@@ -23,10 +23,10 @@ There, a produce with `acks=all` is durable once the transaction's commit has re
 the standbys `synchronous_commit` asks for, and there is no separate replication
 mechanism to configure or run.
 
-The segment engine keeps the log in files, outside the WAL. `acks=all` returns once the
-records are in the page cache, as it does in Kafka with its default flush settings: they
-survive a crash of Postgres but not of the host. `kafgres.fsync_before_ack` makes each
-produce durable on the local disk before it is acknowledged. A standby's copy is pulled
+The segment engine keeps the log in files, outside the WAL. By default `acks=all`
+returns once the records are fsynced (`kafgres.fsync_before_ack`). With that off it
+returns once they are in the page cache, as Kafka does with its default flush settings:
+they survive a crash of Postgres but not of the host. A standby's copy is pulled
 out of band (see below) and is always asynchronous, since `synchronous_standby_names`
 does not cover files outside the WAL; a failover can lose the newest records, and the
 leader epochs described next make that visible to consumers rather than silent.
@@ -74,10 +74,10 @@ read at startup and does not migrate existing data. The full setting reference i
 | | `table` | `segment` (default) |
 |---|---|---|
 | Where the log lives | rows in `kafgres_log`, one row per record batch | segment files under `kafgres.log_directory`, `$PGDATA/kafgres` by default |
-| An acknowledged produce is | committed, per `synchronous_commit` | in the page cache; on disk with `kafgres.fsync_before_ack` |
+| An acknowledged produce is | committed, per `synchronous_commit` | fsynced; in the page cache with `kafgres.fsync_before_ack` off |
 | Replication to a standby | WAL streaming, no extra configuration | `kafgres.replicate_from`, which pulls segments out of band, asynchronously |
 | Transactional SQL produce | not supported | supported |
-| Relative throughput | baseline | about 2.4x produce throughput on the hardware measured, 1.8x with `fsync_before_ack` on |
+| Relative throughput | baseline | about 2.4x produce throughput on the hardware measured with both durability settings relaxed; the strict defaults cost 3 to 25% (806 MB/s relaxed against 605 MB/s strict, 1 KiB records from 4 producers; table in [configuration.md](configuration.md)) |
 
 The table engine writes every batch as rows. For a 1 MB batch that is roughly 525 TOAST
 chunks with their index entries, WAL for all of it, a dead tuple per batch for autovacuum

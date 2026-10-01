@@ -40,9 +40,11 @@ The following all work today:
   difference is catalogued in [docs/conformance.md](docs/conformance.md).
 - The segment engine (the default) passes the same conformance suite, survives `kill -9`
   with every acknowledged record intact, and replicates its log to a standby out of
-  band. With `kafgres.fsync_before_ack` on, every acknowledged record also survives a
-  host crash. On an i9-13900 with power-loss-protected NVMe it produced about 2.4x the
-  table engine's throughput, 1.8x with `fsync_before_ack` on.
+  band. By default every acknowledged record also survives a host crash. On an i9-13900
+  with power-loss-protected NVMe it produced about 2.4x the table engine's throughput
+  with both durability settings relaxed. The strict defaults cost 3 to 25%: 806 MB/s
+  relaxed against 605 MB/s strict for 1 KiB records from 4 producers (the full table is
+  in [docs/configuration.md](docs/configuration.md)).
 - `kafgres_produce()` commits atomically with a business write.
 - CDC: a table's changes reach a topic through a logical decoding output plugin shipped
   with the extension, with the mapping written in SQL. See

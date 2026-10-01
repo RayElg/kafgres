@@ -72,11 +72,24 @@ restart does.
 |---|---|---|---|
 | `kafgres.max_request_bytes` | reload | `32 MiB` | Largest inbound request frame, as Kafka's `socket.request.max.bytes`. A bounded number of connections may exceed the 8 MiB free tier at a time. |
 | `kafgres.transaction_version` | reload | `2` | Kafka's `transaction.version` feature level, reported in `ApiVersions` and matching what a stock 4.x cluster finalizes. At `2`, `EndTxn` v5 hands the producer a fresh epoch with the result, so its next transaction needs no `InitProducerId` (KIP-890). Set `1` to keep the pre-KIP-890 behaviour. |
-| `kafgres.fsync_before_ack` | reload | `off` | Make record bytes durable before the produce response leaves the broker (segment engine). Without it the log is fsynced only when a segment rolls, so `acks=all` returns while the records are still in the page cache: they survive `kill -9` but not a power cut. The fsync is per produce pass, not per request, so a pipelining client amortises one flush across everything in flight. Wire produce only: `kafgres_produce()` always fsyncs before its transaction commits. No effect on the table engine, whose records are Postgres rows made durable by the commit. |
-| `kafgres.relaxed_produce_commit` | reload | `on` | Let a wire-protocol produce commit without waiting for its WAL flush (segment engine, non-transactional only). Acknowledged records already live in the page cache rather than on the platter, so a synchronous WAL flush of the metadata about them buys durability the records themselves do not have, at one device barrier per request; with it on, that metadata rides the WAL writer's next flush. The cost: after an OS or power failure the idempotent-producer window may be missing its newest entries, so a retried in-flight batch can land twice — at-least-once instead of exactly-once across an unclean shutdown. Never applies to transactional produce, to `kafgres_produce()`, or to the table engine. |
+| `kafgres.fsync_before_ack` | reload | `on` | Make record bytes durable before the produce response leaves the broker (segment engine). One fsync per produce pass, not per request, so a pipelining client shares one flush across everything in flight. Off, the log is fsynced only when a segment rolls, so `acks=all` returns while the records are in the page cache: they survive `kill -9` but not a power cut. Wire produce only: `kafgres_produce()` always fsyncs before its transaction commits. No effect on the table engine. |
+| `kafgres.relaxed_produce_commit` | reload | `off` | Let a wire-protocol produce commit without waiting for its WAL flush (segment engine, non-transactional only). On saves one device barrier per request. The cost: a crash can lose the idempotent-producer window's newest entries. An idempotent producer resending its in-flight batches is then refused as unknown: librdkafka fails the producer, and the Java client starts a new epoch and can write those batches twice. Never applies to transactional produce, to `kafgres_produce()`, or to the table engine. |
 | `kafgres.producer_id_expiration_ms` | reload | `86400000` (24 h) | Drop idempotent-producer state idle this long; `0` disables expiration. |
 | `kafgres.max_producer_ids` | reload | `10000` | Ceiling on retained producer ids; the least recently used are dropped first, `0` disables. |
 | `kafgres.share_record_lock_duration_ms` | reload | `30000` | How long a share-group consumer holds an acquired record before it is offered again. |
+
+Both durability settings are strict by default. Relaxing both (`fsync_before_ack = off`,
+`relaxed_produce_commit = on`) raises produce throughput. Measured on an i9-13900 with
+power-loss-protected NVMe, segment engine, `acks=all`, idempotent Java producers:
+
+| Workload | Relaxed | Strict |
+|---|---|---|
+| 1 KiB records, 256 KiB batches, 1 producer | 635 MB/s | 558 MB/s |
+| 1 KiB records, 256 KiB batches, 4 producers | 806 MB/s | 605 MB/s |
+| 256 KiB records, 1 MiB batches, 1 producer | 728 MB/s | 708 MB/s |
+| 256 KiB records, 1 MiB batches, 4 producers | 937 MB/s | 849 MB/s |
+
+Small records from many producers pay the most. `kafgres_produce()` is always strict.
 
 ## Consumer groups
 

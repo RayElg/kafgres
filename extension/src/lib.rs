@@ -80,9 +80,9 @@ static TRANSACTION_VERSION: GucSetting<i32> = GucSetting::<i32>::new(2);
 
 static ALLOW_ENGINE_MISMATCH: GucSetting<bool> = GucSetting::<bool>::new(false);
 
-static RELAXED_PRODUCE_COMMIT: GucSetting<bool> = GucSetting::<bool>::new(true);
+static RELAXED_PRODUCE_COMMIT: GucSetting<bool> = GucSetting::<bool>::new(false);
 
-static FSYNC_BEFORE_ACK: GucSetting<bool> = GucSetting::<bool>::new(false);
+static FSYNC_BEFORE_ACK: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 static AUTO_CREATE_TOPICS: GucSetting<bool> = GucSetting::<bool>::new(true);
 
@@ -460,7 +460,7 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_bool_guc(
         c"kafgres.fsync_before_ack",
         c"Make record bytes durable before the produce response leaves the broker (segment engine)",
-        c"Without this the segment log is fsynced only when a segment rolls, so acks=all returns while the records are still in the page cache: they survive kill -9 but not a power cut. With it, the loop fsyncs every partition it appended to before releasing that pass's responses. The fsync is per pass, not per request, so a pipelining client amortises one device flush across everything in flight rather than paying one each. Costs throughput in proportion to how little the client pipelines. No effect on the table engine, whose records are Postgres rows made durable by the commit",
+        c"On by default: the loop fsyncs every partition it appended to before releasing that pass's responses, one flush per pass rather than per request. Off, the segment log is fsynced only when a segment rolls, so acks=all returns while the records are still in the page cache: they survive kill -9 but not a power cut. No effect on the table engine, whose records are Postgres rows made durable by the commit",
         &FSYNC_BEFORE_ACK,
         GucContext::Sighup,
         GucFlags::default(),
@@ -468,7 +468,7 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_bool_guc(
         c"kafgres.relaxed_produce_commit",
         c"Let a wire-protocol produce commit without waiting for its WAL flush (segment engine, non-transactional only)",
-        c"The segment engine keeps records in files that are fsynced at segment roll, not per produce, so an acknowledged record already lives in the page cache rather than on the platter. Flushing the WAL synchronously for the *metadata* about those records buys durability the records themselves do not have, at the cost of one device barrier per request. With this on, that metadata rides the WAL writer's next flush instead. What it costs: after an OS or power failure the idempotent-producer window may be missing its newest entries, so an in-flight batch that is retried can land twice — at-least-once instead of exactly-once across an unclean shutdown. Off restores a flush per produce. Never applies to transactional produce, to kafgres_produce(), or to the table engine, where records are in Postgres and the flush is what makes them durable",
+        c"Off by default: each produce's metadata, including the idempotent-producer window, is flushed to the WAL before the ack. On, it rides the WAL writer's next flush, which saves one device barrier per request. The cost: a crash can lose the window's newest entries, after which an idempotent producer resending its in-flight batches is refused as unknown. librdkafka then fails the producer; the Java client starts a new epoch and can write those batches twice. Never applies to transactional produce, to kafgres_produce(), or to the table engine",
         &RELAXED_PRODUCE_COMMIT,
         GucContext::Sighup,
         GucFlags::default(),
