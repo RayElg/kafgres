@@ -23,6 +23,16 @@ pub fn atomically<T, E>(
     // `catch_others` runs across a setjmp, so it wants an `FnMut` that is unwind-safe
     aborted: impl Fn(&str) -> E + std::panic::UnwindSafe + std::panic::RefUnwindSafe,
 ) -> Result<T, E> {
+    atomically_coded(f, move |message, _| aborted(message))
+}
+
+/// `atomically`, handing `aborted` the error's SQLSTATE too: messages are translated.
+pub fn atomically_coded<T, E>(
+    f: impl FnOnce() -> Result<T, E>,
+    aborted: impl Fn(&str, pgrx::PgSqlErrorCode) -> E
+        + std::panic::UnwindSafe
+        + std::panic::RefUnwindSafe,
+) -> Result<T, E> {
     use pgrx::pg_sys::pg_try::PgTryBuilder;
 
     unsafe {
@@ -35,18 +45,18 @@ pub fn atomically<T, E>(
         .catch_others(|caught| {
             // Log what actually happened before substituting the caller's error: `aborted`
             pgrx::log!("kafgres: subtransaction aborted: {caught:?}");
-            let message = match &caught {
+            let (message, code) = match &caught {
                 pgrx::pg_sys::panic::CaughtError::PostgresError(e)
                 | pgrx::pg_sys::panic::CaughtError::ErrorReport(e)
                 | pgrx::pg_sys::panic::CaughtError::RustPanic { ereport: e, .. } => {
-                    e.message().to_string()
+                    (e.message().to_string(), e.sql_error_code())
                 }
             };
             unsafe {
                 pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
             }
             rolled_back_by_pg.store(true, Ordering::Relaxed);
-            Err(aborted(&message))
+            Err(aborted(&message, code))
         })
         .execute();
 

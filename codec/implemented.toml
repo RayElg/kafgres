@@ -157,10 +157,9 @@ AlterUserScramCredentials = "0"
 # advertising it without the reconciliation working is not a degraded experience: it is
 # two consumers holding one partition.
 #
-# v0 only. v1 adds `SubscribedTopicRegex`, which needs the broker to resolve a pattern against
-# the topic list on every heartbeat and to re-resolve it when topics appear; advertising v1
-# without that would silently subscribe a regex consumer to nothing.
-ConsumerGroupHeartbeat = "0"
+# v1 adds `SubscribedTopicRegex`, resolved per heartbeat in Postgres's regex dialect.
+# librdkafka asks for v1 only.
+ConsumerGroupHeartbeat = "0-1"
 # v1 adds the KIP-1099 MemberType field; every member described here arrived over
 # ConsumerGroupHeartbeat.
 ConsumerGroupDescribe = "0-1"

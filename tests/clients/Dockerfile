@@ -27,7 +27,7 @@ RUN apt-get update -qq \
 # kafka-python is a fourth implementation, and different again: pure Python, its own version negotiation, and common in data engineering.
 # `kafka-python-ng` is the maintained fork; the original has not shipped since 2020 and
 # does not know about anything past Kafka 2.6.
-RUN pip3 install --break-system-packages --no-cache-dir "kafka-python-ng==2.2.3"
+RUN pip3 install --break-system-packages --no-cache-dir "kafka-python-ng==2.2.3" "confluent-kafka==2.15.1"
 
 COPY --from=sarama /out/sarama-conformance /usr/local/bin/sarama-conformance
 COPY python/scenarios.py /usr/local/bin/kafka-python-conformance

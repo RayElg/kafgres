@@ -19,6 +19,11 @@ const MAX_FETCH_PARTITIONS: usize = 4096;
 
 const ABORTED_ENTRY_WIRE_BYTES: usize = 24;
 
+/// Upper bounds on the response fields around the records, which count against the cap.
+const PARTITION_ENVELOPE_BYTES: usize = 128;
+const TOPIC_ENVELOPE_BYTES: usize = 320;
+const RESPONSE_ENVELOPE_BYTES: usize = 1024;
+
 pub fn handle(
     req: &FetchRequest,
     store: &dyn LogStore,
@@ -28,8 +33,6 @@ pub fn handle(
         1 => IsolationLevel::ReadCommitted,
         _ => IsolationLevel::ReadUncommitted,
     };
-
-    let mut budget = clamp_bytes(req.max_bytes, RESPONSE_CEILING);
 
     // Both caps: empty topic entries sum to zero partitions, so a partition-only
     // check would let a large topic list through.
@@ -46,6 +49,12 @@ pub fn handle(
             n: total_partitions,
         });
     }
+
+    let envelope = RESPONSE_ENVELOPE_BYTES
+        + req.topics.len() * TOPIC_ENVELOPE_BYTES
+        + total_partitions * PARTITION_ENVELOPE_BYTES;
+    let mut budget = clamp_bytes(req.max_bytes, RESPONSE_CEILING.saturating_sub(envelope));
+    let mut served = false;
 
     let mut responses = Vec::with_capacity(req.topics.len());
     for topic in &req.topics {
@@ -86,7 +95,16 @@ pub fn handle(
                 None => partition_error(p.partition, ErrorCode::UnknownTopicOrPartition),
                 Some(tid) => {
                     match store.read(tid, p.partition, p.fetch_offset, per_partition, isolation) {
-                        Ok(slice) => {
+                        Ok(mut slice) => {
+                            // The store returns at least one whole batch. Only a response's
+                            // first may overshoot, as in Kafka; a later one waits for the next.
+                            if served && slice.bytes.len() > per_partition {
+                                slice.bytes.clear();
+                                slice.aborted.clear();
+                                // Full: later partitions are not read.
+                                budget = 0;
+                            }
+                            served |= !slice.bytes.is_empty();
                             budget = budget.saturating_sub(
                                 slice.bytes.len()
                                     + slice.aborted.len() * ABORTED_ENTRY_WIRE_BYTES,

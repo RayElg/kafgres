@@ -110,10 +110,6 @@ from, so a reset moves where the next acquire begins.
 
 - **`27 WriteTxnMarkers` serves v1, Kafka v1 to v2.** v2 adds a `TransactionVersion` field
   to an inter-broker RPC; there is no peer broker to send it.
-- **`68 ConsumerGroupHeartbeat` serves v0, Kafka v0 to v1.** v1 adds
-  `SubscribedTopicRegex`, which requires resolving a pattern against the topic list on
-  every heartbeat and re-resolving it when topics appear. Advertising it without that
-  would silently match nothing.
 
 ### Served with differences
 
@@ -139,7 +135,13 @@ from, so a reset moves where the next acquire begins.
   `throttle_time_ms` is reported, not enforced by muting: a client that ignores it is
   not slowed.
 - **KIP-848 consumer groups (68, 69).** Server-side assignment, with the classic
-  protocol still available.
+  protocol still available. `SubscribedTopicRegex` (v1) is resolved on each of the
+  member's heartbeats, so a topic created later is assigned within one heartbeat interval,
+  and topics the member may not describe are left out, as in Kafka. The pattern is
+  anchored to the whole name, as Kafka anchors it, but the dialect is Postgres's rather
+  than RE2J: ordinary patterns, and leading options such as `(?i)`, behave the same; one
+  Postgres cannot compile, such as
+  `\p{L}+`, is refused with `INVALID_REGULAR_EXPRESSION` rather than matching nothing.
 - **`ListOffsets` serves the full 1 to 11.** v7's `MAX_TIMESTAMP` (KIP-734) returns the
   offset of the record with the greatest timestamp, decoded from the winning batch rather
   than taken from its base offset; the two differ when a producer stamps timestamps out

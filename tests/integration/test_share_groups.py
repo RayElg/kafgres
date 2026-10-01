@@ -88,6 +88,14 @@ def test_a_share_consumer_reads_the_queue(queue):
     assert len(got) == 20, got[:5]
     assert set(got) == {f"job-{i}" for i in range(20)}
 
+def test_a_batch_accepted_in_full_is_acknowledged_in_full(queue):
+    """The Java client accepts a batch with one acknowledge type for the whole range,
+    which must acknowledge every record in it."""
+    produce(queue, 3000)
+    got = share_consume(queue, "sg-batch-ack", timeout=120)
+    assert len(set(got)) == 3000, f"{len(set(got))} of 3000 delivered"
+    assert len(got) == 3000, f"{len(got) - len(set(got))} delivered twice"
+
 def test_two_consumers_split_one_partition_without_overlap(queue):
     """The property a consumer group cannot provide: two members read the *same*
     partition concurrently and each record goes to exactly one of them.
