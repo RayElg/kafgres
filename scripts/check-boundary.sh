@@ -32,7 +32,10 @@ fi
 
 FS_PATTERN='std::fs|OpenOptions|File::(open|create)'
 FS_PATTERN+='|PathNameOpenFile|FileWrite|FileRead|FileSync|FileTruncate|FileClose'
-fs_hits=$(scan "$FS_PATTERN" | grep -v -E '/storage/segment(\.rs|/)|extension/src/tls\.rs:|/tests?/')
+# The broker's `spare_fd` is a /dev/null descriptor held for refusing clients on EMFILE, not log I/O.
+fs_hits=$(scan "$FS_PATTERN" \
+    | grep -v -E '/storage/segment(\.rs|/)|extension/src/tls\.rs:|/tests?/' \
+    | grep -v -E 'extension/src/server/mod\.rs:[0-9]+:.*spare_fd')
 if [ -n "$fs_hits" ]; then
     violations+="File I/O outside the storage/segment engine:
 $fs_hits

@@ -131,11 +131,14 @@ fn resolve(
         };
     }
 
+    // (offset, timestamp): a lookup by time answers with the record's own timestamp.
     let result = match timestamp {
-        TIMESTAMP_EARLIEST => store.log_start_offset(topic, partition).map(Some),
-        TIMESTAMP_LATEST => store.high_watermark(topic, partition).map(Some),
+        TIMESTAMP_EARLIEST => store.log_start_offset(topic, partition).map(|o| Some((o, -1))),
+        TIMESTAMP_LATEST => store.high_watermark(topic, partition).map(|o| Some((o, -1))),
         // No remote tier, so the local log is the whole log: this is the log start.
-        TIMESTAMP_EARLIEST_LOCAL => store.log_start_offset(topic, partition).map(Some),
+        TIMESTAMP_EARLIEST_LOCAL => {
+            store.log_start_offset(topic, partition).map(|o| Some((o, -1)))
+        }
         // Nothing is tiered or queued for upload, so there is no such offset: -1, no error.
         TIMESTAMP_LATEST_TIERED | TIMESTAMP_EARLIEST_PENDING_UPLOAD => Ok(None),
         ts if ts < 0 => {
@@ -149,12 +152,8 @@ fn resolve(
         Ok(found) => ListOffsetsPartitionResponse {
             partition_index: partition,
             error_code: ErrorCode::None.code(),
-            timestamp: if found.is_some() && timestamp >= 0 {
-                timestamp
-            } else {
-                -1
-            },
-            offset: found.unwrap_or(OFFSET_NOT_FOUND),
+            timestamp: found.map_or(-1, |(_, ts)| ts),
+            offset: found.map_or(OFFSET_NOT_FOUND, |(o, _)| o),
             leader_epoch: epoch,
             ..Default::default()
         },

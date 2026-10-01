@@ -367,6 +367,24 @@ pub fn offset_of_max_timestamp(bytes: kafgres_codec::bytes::Bytes) -> Option<(i6
     Some((base, want))
 }
 
+/// The first record at or after `timestamp` in the batch that reaches it, as Kafka's
+/// `findOffsetByTimestamp` answers; undecodable means the base offset and the batch's maximum.
+pub fn first_at_or_after(bytes: kafgres_codec::bytes::Bytes, timestamp: i64) -> Option<(i64, i64)> {
+    let batch = kafgres_codec::records::RecordBatch::new(bytes).ok()?;
+    let base = batch.base_offset();
+    let base_ts = batch.base_timestamp();
+    if let Ok(records) = batch.records_decompressed() {
+        for record in records {
+            let Ok(record) = record else { break };
+            let ts = base_ts.saturating_add(record.timestamp_delta);
+            if ts >= timestamp {
+                return Some((base + record.offset_delta as i64, ts));
+            }
+        }
+    }
+    Some((base, batch.max_timestamp()))
+}
+
 pub trait LogStore: Send {
     /// Append a batch, assigning offsets; returns the base offset assigned. Offsets
     fn append(
@@ -393,7 +411,7 @@ pub trait LogStore: Send {
         topic: TopicId,
         partition: i32,
         timestamp: i64,
-    ) -> StoreResult<Option<i64>>;
+    ) -> StoreResult<Option<(i64, i64)>>;
 
     /// The offset of the record carrying the partition's greatest timestamp, paired with
     /// that timestamp; `None` for an empty log. Not the winning batch's base offset (KIP-734).

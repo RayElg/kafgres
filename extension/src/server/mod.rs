@@ -255,6 +255,11 @@ struct Server {
     served: u64,
     /// Whether `tick` advanced on this pass; under the spin loop many passes share one value.
     ticked: bool,
+    /// Held so that accept can still drain a client when descriptors run out.
+    spare_fd: Option<std::fs::File>,
+    /// Connections refused for want of a descriptor since the last log line.
+    refused: u64,
+    refused_logged: Option<Instant>,
 }
 
 impl Server {
@@ -286,6 +291,7 @@ pub fn wait_for_epochs() {
 
 pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
     let mut cfg = cfg;
+    raise_fd_limit();
     crate::storage::bound_compaction_passes();
     if crate::storage_engine_guc() == "segment" {
         match crate::storage::segment::migrate_time_indexes() {
@@ -358,6 +364,9 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         sync_failed_passes: 0,
         served: 0,
         ticked: false,
+        spare_fd: std::fs::File::open("/dev/null").ok(),
+        refused: 0,
+        refused_logged: None,
     };
 
     // Load once before the loop, not just on the first tick: the default snapshot is
@@ -512,6 +521,24 @@ fn accept_new(listener: &TcpListener, srv: &mut Server) {
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(ref e) if matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE)) => {
+                // The listener stays readable while a client waits: free the spare, accept, close.
+                srv.spare_fd = None;
+                if let Ok((stream, _)) = listener.accept() {
+                    drop(stream);
+                }
+                srv.spare_fd = std::fs::File::open("/dev/null").ok();
+                srv.refused += 1;
+                if srv.refused_logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+                    log!(
+                        "kafgres: out of file descriptors; refused {} connection(s)",
+                        srv.refused
+                    );
+                    srv.refused = 0;
+                    srv.refused_logged = Some(Instant::now());
+                }
+                break;
+            }
             Err(e) => {
                 log!("kafgres: accept error: {e}");
                 break;
@@ -2269,6 +2296,22 @@ fn expire_producer_state(srv: &mut Server) {
     }
 }
 
+/// Sockets are outside the VFD pool, so a 1024 soft limit runs out near a thousand partitions.
+/// Not `ReserveExternalFD` per socket: the wait set's `AcquireExternalFD` would then fail near
+/// 325 clients.
+fn raise_fd_limit() {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: plain syscalls on a local struct.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < lim.rlim_max {
+            let raised = libc::rlimit { rlim_cur: lim.rlim_max, rlim_max: lim.rlim_max };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) != 0 {
+                log!("kafgres: could not raise the open file limit from {}", lim.rlim_cur);
+            }
+        }
+    }
+}
+
 /// Every start takes a new leader epoch for every partition (I5). A restart can lose
 /// unsynced records whose offsets new produces then reuse; the epoch starts at the recovered
 /// log end, so a client that read past it truncates there.
@@ -2490,6 +2533,19 @@ fn enforce_retention(srv: &mut Server) {
         crate::dbtx::guarded(crate::handlers::txn::expire_stale_transactions)
     }) {
         log!("kafgres: could not expire stale transactions: {e}");
+    }
+
+    if crate::storage_engine_guc() == "segment" {
+        match BackgroundWorker::transaction(|| {
+            crate::dbtx::guarded(|| {
+                crate::storage::segment::forget_dropped()
+                    .map_err(|e| HandlerError::Internal(e.to_string()))
+            })
+        }) {
+            Ok(0) => {}
+            Ok(n) => log!("kafgres: closed the files of {n} partition(s) dropped elsewhere"),
+            Err(e) => log!("kafgres: could not check for dropped partitions: {e}"),
+        }
     }
 
     let cursor = srv.retention_cursor;

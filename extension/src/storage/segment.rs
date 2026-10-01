@@ -289,6 +289,54 @@ fn append_index_entry(slot: &mut Option<Vfd>, path: &Path, entry: &[u8], what: &
     }
 }
 
+/// Forget open files, plans and hints of partitions another process dropped: the dropper
+/// evicts only its own, and deleted segments held open keep their disk space.
+pub fn forget_dropped() -> StoreResult<usize> {
+    let mut held: Vec<(TopicId, i32)> = Vec::new();
+    if let Some(map) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        held.extend(map.keys().copied());
+    }
+    if let Some(map) = PLANS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        held.extend(map.keys().copied());
+    }
+    if let Some(map) = HINTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        held.extend(map.keys().copied());
+    }
+    held.sort_unstable();
+    held.dedup();
+    if held.is_empty() {
+        return Ok(0);
+    }
+    let topics: Vec<i32> = held.iter().map(|(t, _)| *t as i32).collect();
+    let live: std::collections::HashSet<(TopicId, i32)> = Spi::connect(|client| {
+        let rows = client.select(
+            "SELECT topic_id::int, partition FROM kafgres_partitions
+              WHERE topic_id = ANY($1::int[]::oid[])",
+            None,
+            &[topics.into()],
+        )?;
+        let mut out = std::collections::HashSet::new();
+        for r in rows {
+            if let (Some(t), Some(p)) = (r.get::<i32>(1)?, r.get::<i32>(2)?) {
+                out.insert((t as TopicId, p));
+            }
+        }
+        Ok::<_, pgrx::spi::Error>(out)
+    })
+    .map_err(|e| StoreError::Io(e.to_string()))?;
+    let gone: Vec<(TopicId, i32)> = held.into_iter().filter(|k| !live.contains(k)).collect();
+    for &(topic, partition) in &gone {
+        evict_active(topic, partition);
+        if let Some(plans) = PLANS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            plans.remove(&(topic, partition));
+        }
+        if let Some(map) = HINTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            map.remove(&(topic, partition));
+        }
+    }
+    Ok(gone.len())
+}
+
 fn evict_active(topic: TopicId, partition: i32) {
     if let Some(map) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         map.remove(&(topic, partition));
@@ -2099,11 +2147,11 @@ impl LogStore for SegmentStore {
         topic: TopicId,
         partition: i32,
         timestamp: i64,
-    ) -> StoreResult<Option<i64>> {
+    ) -> StoreResult<Option<(i64, i64)>> {
         // -1 latest, -2 earliest: the sentinels ListOffsets uses.
         match timestamp {
-            -1 => return self.high_watermark(topic, partition).map(Some),
-            -2 => return self.log_start_offset(topic, partition).map(Some),
+            -1 => return self.high_watermark(topic, partition).map(|o| Some((o, -1))),
+            -2 => return self.log_start_offset(topic, partition).map(|o| Some((o, -1))),
             _ => {}
         }
 
@@ -2137,7 +2185,10 @@ impl LogStore for SegmentStore {
                             .try_into()
                             .expect("4 bytes"),
                     );
-                    if length <= 0 {
+                    // A length past the data is a corrupt header.
+                    if length <= 0
+                        || pos + (records::LENGTH_OFFSET + 4) as u64 + length as u64 > data_end
+                    {
                         break;
                     }
                     let max_ts = i64::from_be_bytes(
@@ -2146,12 +2197,17 @@ impl LogStore for SegmentStore {
                             .expect("8 bytes"),
                     );
                     if max_ts >= timestamp {
-                        let batch_base = i64::from_be_bytes(
-                            header[records::BASE_OFFSET_OFFSET..records::BASE_OFFSET_OFFSET + 8]
-                                .try_into()
-                                .expect("8 bytes"),
-                        );
-                        return Ok(Some(batch_base));
+                        let mut body = vec![0u8; records::LENGTH_OFFSET + 4 + length as usize];
+                        if vfd.read_at(&mut body, pos)? != body.len() {
+                            return Err(StoreError::Io(format!(
+                                "short read of the batch at {pos} in {}",
+                                path.display()
+                            )));
+                        }
+                        return Ok(super::first_at_or_after(
+                            kafgres_codec::bytes::Bytes::from(body),
+                            timestamp,
+                        ));
                     }
                     pos += records::LENGTH_OFFSET as u64 + 4 + length as u64;
                 }

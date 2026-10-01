@@ -475,15 +475,18 @@ impl LogStore for TableStore {
         topic: TopicId,
         partition: i32,
         timestamp: i64,
-    ) -> StoreResult<Option<i64>> {
-        Spi::get_one_with_args::<i64>(
-            "SELECT (SELECT base_offset FROM kafgres_log
+    ) -> StoreResult<Option<(i64, i64)>> {
+        let blob = Spi::get_one_with_args::<Vec<u8>>(
+            "SELECT (SELECT batch FROM kafgres_log
               WHERE topic_id = $1::oid AND partition = $2 AND max_timestamp >= $3
               ORDER BY base_offset
               LIMIT 1)",
             &[(topic as i32).into(), partition.into(), timestamp.into()],
         )
-        .map_err(spi_err)
+        .map_err(spi_err)?;
+        Ok(blob.and_then(|b| {
+            super::first_at_or_after(kafgres_codec::bytes::Bytes::from(b), timestamp)
+        }))
     }
 
     fn max_timestamp_offset(
