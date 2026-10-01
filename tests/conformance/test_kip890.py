@@ -146,10 +146,10 @@ class Broker:
             r.uvarint()
         return r
 
-    def find_coordinator(self, key):
-        """v2, key_type 1 = transaction. The coordinator is created lazily, so
+    def find_coordinator(self, key, key_type=1):
+        """v2, key_type 0 = group, 1 = transaction. The coordinator is created lazily, so
         COORDINATOR_NOT_AVAILABLE here just means retry."""
-        r = self.call(10, 2, _nstr(key) + bytes([1]), False)
+        r = self.call(10, 2, _nstr(key) + bytes([key_type]), False)
         r.i32()
         err = r.i16()
         r.skip_str()
@@ -209,15 +209,18 @@ def _ensure_topic(bootstrap, topic=TOPIC):
     )
 
 
-def _coordinated(host, port, txn):
+def _coordinated(host, port, txn, group=None):
     """A connection whose transaction coordinator exists. The coordinator is created
     lazily on the reference, so FindCoordinator is retried until it names one; the
-    coordinator may then still be loading, which `_settle` waits out per request."""
+    coordinator may then still be loading, which `_settle` waits out per request.
+    With `group`, the group coordinator too: until one is asked for, a fresh reference
+    has no offsets topic and TxnOffsetCommit answers COORDINATOR_NOT_AVAILABLE."""
     b = Broker(host, port)
-    for _ in range(20):
-        if b.find_coordinator(txn) not in RETRIABLE:
-            break
-        time.sleep(1.5)
+    for key, key_type in [(txn, 1)] + ([(group, 0)] if group else []):
+        for _ in range(20):
+            if b.find_coordinator(key, key_type) not in RETRIABLE:
+                break
+            time.sleep(1.5)
     return b
 
 
@@ -521,7 +524,7 @@ def _fencing_transcript(host, port, label):
     INVALID_PRODUCER_EPOCH throughout."""
     _ensure_topic(f"{host}:{port}")
     txn = f"kip890-fencing-{label}"
-    b = _coordinated(host, port, txn)
+    b = _coordinated(host, port, txn, group="g")
     try:
         assert _settle(lambda: b.init_producer_id_v5(txn))[0] == NONE
         err, pid, epoch = _settle(lambda: b.init_producer_id_v5(txn))

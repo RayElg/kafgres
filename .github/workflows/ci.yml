@@ -52,17 +52,30 @@ jobs:
 
   # `cargo check` skips the pgrx/Postgres link step and passes on code that cannot
   # load. Only a real package build proves the extension is loadable.
+  #
+  # A runner and stack per PG version, engine and shard: the suites restart the broker,
+  # so shards cannot share one. scripts/ci-shard.py splits by file.
   extension:
-    name: Extension (PG ${{ matrix.pg }})
+    name: PG ${{ matrix.pg }} ${{ matrix.engine }} ${{ matrix.shard }}/2
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         pg: [13, 14, 15, 16, 17, 18]
+        engine: [segment, table]
+        shard: [1, 2]
+        # Pull requests run the table engine on the oldest and newest PG only, to stay
+        # within the 20 concurrent jobs. Pushes to main run everything.
+        exclude: >-
+          ${{ github.event_name == 'pull_request' && fromJSON('[
+          {"pg": 14, "engine": "table"}, {"pg": 15, "engine": "table"},
+          {"pg": 16, "engine": "table"}, {"pg": 17, "engine": "table"}]') || fromJSON('[]') }}
     # Passed to the image build; the standby shares the image, so every step below,
-    # including the failover suite, runs on this PG version.
+    # including the failover suite, runs on this PG version. The standby takes the
+    # primary's engine.
     env:
       PG_MAJOR: ${{ matrix.pg }}
+      KAFGRES_ENGINE: ${{ matrix.engine }}
     steps:
       - uses: actions/checkout@v4
       - name: Build image
@@ -89,68 +102,11 @@ jobs:
           docker compose exec -T postgres psql -U postgres -tAc \
             "SELECT count(*) FROM pg_stat_activity WHERE backend_type='kafgres_broker'" | grep -q '^1$'
 
-      # The failover tests need a real physical standby and assert the container
-      # exists rather than skipping, because a failover suite that quietly does not
-      # run is worse than none. The standby shares the primary's image, which
-      # `docker compose build` has already produced; see the comment on the service.
-      # Standby must run the primary's engine: test_replication skips on a mismatch.
-      - name: Failover rig
+      # The broker started on segment and left a log, which a base backup would carry to
+      # the standby. Wipe it as test_engine_switch.wipe_both_logs does, then recreate.
+      - name: Switch to the table engine
+        if: matrix.engine == 'table'
         run: |
-          KAFGRES_ENGINE=segment docker compose --profile failover up -d standby
-          for i in $(seq 1 60); do
-            if docker compose exec -T standby pg_isready -U postgres >/dev/null 2>&1; then break; fi
-            sleep 2
-          done
-          # The loop exits 0 after sixty failures. Without this the step goes green on a
-          # standby that never came up, and the failure surfaces later as a confusing
-          # test error instead of here as "the rig did not start".
-          docker compose exec -T standby pg_isready -U postgres
-
-      # The acceptance criteria are client behaviours, never a code state. This job
-      # is what actually gates a change.
-      - name: Integration tests
-        run: |
-          python3 -m pip install --quiet -r requirements.txt
-          python3 -m pytest tests/integration/ -v
-
-      # Same job as the integration tests
-      # rather than its own, because the pgrx image build dominates CI cost and a
-      # separate job pays for it twice; the step name is what makes a failure legible.
-      - name: Reference broker
-        run: |
-          docker compose --profile conformance up -d kafka
-          for i in $(seq 1 60); do
-            if docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
-                 --bootstrap-server 127.0.0.1:9292 --list >/dev/null 2>&1; then break; fi
-            sleep 2
-          done
-
-      # `tests/conformance/` decides at collection time whether the reference is
-      # reachable and skips the diff half if not. Assert it is, so an unreachable
-      # broker reads as a failure here instead of as sixteen quiet skips.
-      - name: Conformance suite
-        run: |
-          docker run --rm --network host apache/kafka:4.3.1 \
-            /opt/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:9292 --list
-          python3 -m pytest tests/conformance/ -v
-
-      # Everything above ran on the segment engine — the GUC default — so the crash
-      # rig already ran with the integration suite. This runs both suites again on
-      # the table engine, which has no other coverage in CI and carries the engine-A
-      # only tests: the byte-verbatim I2 checks, the idempotent-producer dedup counts
-      # and the phase 6 failover suite, whose tests skip themselves unless the
-      # primary is on `table`, so this step is the only thing that makes the standby
-      # started above earn its build.
-      #
-      # The segment pass left a log in $PGDATA/kafgres, and a base backup would copy
-      # it — a standby promoted later would then hold a log under *both* engines and
-      # refuse to start its broker. Wipe it first, the same dance as
-      # test_engine_switch.wipe_both_logs: the mismatch guard off so the broker starts
-      # while its files vanish, both GUCs, then recreate so the postmaster GUC applies.
-      # Remove the segment standby; rebuilt on `table` from a fresh base backup below.
-      - name: Table engine integration and conformance suite
-        run: |
-          docker compose --profile failover rm -sfv standby
           docker compose exec -T postgres psql -U postgres \
             -c "ALTER SYSTEM SET kafgres.allow_engine_mismatch=on"
           docker compose exec -T postgres bash -c 'rm -rf "$PGDATA"/kafgres/*'
@@ -166,20 +122,50 @@ jobs:
             fi
             sleep 2
           done
-          # Assert rather than trust the loop, which exits 0 after sixty failures —
-          # and which a broker that refused to start over a stranded log also exits.
+          # The loop exits 0 after sixty failures, including a broker refusing a stray log.
           docker compose exec -T postgres psql -U postgres -tAc \
             "SELECT count(*) FROM pg_stat_activity \
              WHERE backend_type='kafgres_broker'" | grep -q '^1$'
           test "$(docker compose exec -T postgres psql -U postgres -tAc \
                     'SHOW kafgres.storage_engine' | tr -d '[:space:]')" = table
-          KAFGRES_ENGINE=table docker compose --profile failover up -d standby
+
+      # The failover tests need a real physical standby and assert the container
+      # exists rather than skipping, because a failover suite that quietly does not
+      # run is worse than none. The standby shares the primary's image, which
+      # `docker compose build` has already produced; see the comment on the service.
+      - name: Failover rig
+        run: |
+          docker compose --profile failover up -d standby
           for i in $(seq 1 60); do
             if docker compose exec -T standby pg_isready -U postgres >/dev/null 2>&1; then break; fi
             sleep 2
           done
+          # The loop exits 0 after sixty failures. Without this the step goes green on a
+          # standby that never came up, and the failure surfaces later as a confusing
+          # test error instead of here as "the rig did not start".
           docker compose exec -T standby pg_isready -U postgres
-          python3 -m pytest tests/integration/ tests/conformance/ -v
+
+      # `tests/conformance/` decides at collection time whether the reference is
+      # reachable and skips the diff half if not. Assert it is, so an unreachable
+      # broker reads as a failure here instead of as sixteen quiet skips.
+      - name: Reference broker
+        run: |
+          docker compose --profile conformance up -d kafka
+          for i in $(seq 1 60); do
+            if docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+                 --bootstrap-server 127.0.0.1:9292 --list >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          docker run --rm --network host apache/kafka:4.3.1 \
+            /opt/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:9292 --list
+
+      # The acceptance criteria are client behaviours, never a code state. This job
+      # is what actually gates a change.
+      - name: Integration and conformance suites
+        run: |
+          python3 -m pip install --quiet -r requirements.txt
+          files=$(python3 scripts/ci-shard.py "$KAFGRES_ENGINE" $(( ${{ matrix.shard }} - 1 )) 2)
+          python3 -m pytest $files -v
 
       - name: Worker logs
         if: always()
