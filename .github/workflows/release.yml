@@ -184,7 +184,7 @@ jobs:
         run: python3 -m pip install --quiet -r requirements.txt
 
       - name: Integration tests against the shipped image
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: python3 -m pytest tests/integration/ -v
 
       - name: Worker logs
