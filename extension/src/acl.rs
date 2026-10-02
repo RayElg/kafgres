@@ -325,6 +325,59 @@ impl AclCache {
     }
 }
 
+thread_local! {
+    /// A backend's snapshot for `kafgres_produce()`, with the broker's staleness bound.
+    static SQL_ACLS: std::cell::RefCell<AclCache> = std::cell::RefCell::new(AclCache::default());
+}
+
+/// Whether a SQL caller may write `topic`, as `User:<role>`. A Postgres superuser passes:
+/// it can rewrite `kafgres_acls` anyway.
+pub fn sql_caller_may_write(role: &str, host: &str, topic: &str) -> Result<bool, spi::Error> {
+    let enabled = crate::acls_enabled();
+    if !enabled || unsafe { pgrx::pg_sys::superuser() } {
+        return Ok(true);
+    }
+    if SQL_ACLS.with(|c| c.borrow().is_stale()) {
+        // Read as the bootstrap superuser: a producing role cannot read the rules.
+        let fresh = {
+            let _owner = AsBootstrapSuperuser::enter();
+            AclCache::load(enabled, &crate::superusers())?
+        };
+        SQL_ACLS.with(|c| *c.borrow_mut() = fresh);
+    }
+    let who = Principal::user(role, host);
+    Ok(SQL_ACLS.with(|c| c.borrow().allows(&who, Operation::Write, ResourceType::Topic, topic)))
+}
+
+/// Switches the current user for one read; restored on drop, including on unwind.
+struct AsBootstrapSuperuser {
+    user: pgrx::pg_sys::Oid,
+    context: std::os::raw::c_int,
+}
+
+impl AsBootstrapSuperuser {
+    fn enter() -> Self {
+        let mut user = pgrx::pg_sys::InvalidOid;
+        let mut context = 0;
+        // SAFETY: called inside a transaction; the pair is restored by Drop or by abort.
+        unsafe {
+            pgrx::pg_sys::GetUserIdAndSecContext(&mut user, &mut context);
+            pgrx::pg_sys::SetUserIdAndSecContext(
+                pgrx::pg_sys::Oid::from(pgrx::pg_sys::BOOTSTRAP_SUPERUSERID),
+                context | pgrx::pg_sys::SECURITY_LOCAL_USERID_CHANGE as std::os::raw::c_int,
+            );
+        }
+        AsBootstrapSuperuser { user, context }
+    }
+}
+
+impl Drop for AsBootstrapSuperuser {
+    fn drop(&mut self) {
+        // SAFETY: restores the pair `enter` read.
+        unsafe { pgrx::pg_sys::SetUserIdAndSecContext(self.user, self.context) };
+    }
+}
+
 pub struct Authz<'a> {
     pub acls: &'a AclCache,
     pub principal: Principal,

@@ -36,13 +36,15 @@ The following all work today:
 - Consumers truncate rather than read divergent data when an async replica is promoted,
   verified against a real physical standby.
 - The conformance suite drives four real clients against kafgres and a reference Kafka
-  and diffs the observable results; it runs in CI on every commit, and every intended
+  and diffs the observable results; it runs in CI on every pull request, and every intended
   difference is catalogued in [docs/conformance.md](docs/conformance.md).
 - The segment engine (the default) passes the same conformance suite, survives `kill -9`
   with every acknowledged record intact, and replicates its log to a standby out of
-  band. Measured on the benchmark harness hardware, it produced about 1.5x the table
-  engine's throughput with a lower p99, at about 1% degradation of co-resident pgbench
-  against the table engine's 15%.
+  band. By default every acknowledged record also survives a host crash. On an i9-13900
+  with power-loss-protected NVMe it produced about 2.4x the table engine's throughput
+  with both durability settings relaxed. The strict defaults cost 3 to 25%: 806 MB/s
+  relaxed against 605 MB/s strict for 1 KiB records from 4 producers (the full table is
+  in [docs/configuration.md](docs/configuration.md)).
 - `kafgres_produce()` commits atomically with a business write.
 - CDC: a table's changes reach a topic through a logical decoding output plugin shipped
   with the extension, with the mapping written in SQL. See
@@ -141,6 +143,18 @@ $ psql -c "SELECT partition, COALESCE(high_watermark, 0) AS log_end_offset,
 The script uses a local `kcat` if you have one and the test client image otherwise.
 Nothing in it is kafgres-aware: every `kcat` line is one you would run against a real
 broker.
+
+## Upgrading
+
+Install the new build, restart Postgres, then run `ALTER EXTENSION kafgres UPDATE;` in
+the database the broker uses. The broker serves across the restart before the update
+runs; the update changes who may call the administrative functions (see
+[docs/producing.md](docs/producing.md#who-may-produce)) and pins `kafgres_produce()`'s
+search path.
+
+From 0.2.0, the first start on the segment engine removes the log's old-format
+`.timeindex` files. Nothing is lost: timestamp lookups scan the segments written before
+the upgrade instead, and segments written after it are indexed.
 
 ## CDC without Debezium
 
@@ -248,8 +262,9 @@ and the ELR columns, which the tool renders as `N/A` against kafgres because it 
 back to `Metadata`. Anything else that differs is treated as a bug, and the script shows
 it rather than absorbing it.
 
-The demo is a summary; `tests/conformance/` is the gate. It runs the same four clients
-in seventeen tests, in CI on every commit.
+The demo is a summary; `tests/conformance/` is the gate. It runs Sarama, kafka-python
+and the Java tooling in seventeen tests, and replays KIP-890 transaction frames against
+both brokers in eighteen more, in CI on every pull request.
 
 ## Documentation
 
@@ -277,14 +292,14 @@ codec/          kafgres-codec, the wire protocol. No pgrx, no Postgres, unit-tes
   src/generated/     emitted by codec-gen and checked in; do not edit
 codec-gen/      the generator. `cargo run -p kafgres-codec-gen`
 extension/      the pgrx extension. Its own workspace on purpose.
-docs/           architecture.md, producing.md, conformance.md
+docs/           architecture.md, producing.md, conformance.md, configuration.md
 ```
 
 ## Build
 
 ```bash
 cargo test                    # codec + generator. No Postgres needed.
-docker compose build          # the only way to verify the extension links and loads
+docker compose build          # links the extension; cargo check does not
 docker compose up -d
 
 docker build -t kafgres-clients tests/clients
@@ -308,6 +323,10 @@ $ kcat -b localhost:9092 -L
 
 `cargo check` does not exercise the pgrx/Postgres link step and passes on code that
 cannot load. Use `docker compose build`.
+
+The image builds against PostgreSQL 16 by default; set `PG_MAJOR` (13 through 18) to
+build against another major, as in `PG_MAJOR=18 docker compose build`. CI builds and
+tests every major from 13 to 18.
 
 ## License
 

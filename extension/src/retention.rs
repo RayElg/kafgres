@@ -48,6 +48,7 @@ pub fn sweep(cursor: u32) -> Result<Batch, spi::Error> {
     })?;
 
     if topics.is_empty() {
+        crate::storage::finish_rotation();
         return Ok(Batch::nothing(0));
     }
 
@@ -177,6 +178,8 @@ fn kafgres_enforce_retention() -> i64 {
 
 #[pg_extern]
 fn kafgres_expire_transactions() -> i64 {
+    // An abort appends control batches.
+    crate::server::wait_for_epochs();
     match crate::dbtx::guarded(crate::handlers::txn::expire_stale_transactions) {
         Ok(n) => n as i64,
         Err(e) => error!("kafgres: expiring stale transactions failed: {e}"),

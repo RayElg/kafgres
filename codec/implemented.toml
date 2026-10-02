@@ -157,10 +157,9 @@ AlterUserScramCredentials = "0"
 # advertising it without the reconciliation working is not a degraded experience: it is
 # two consumers holding one partition.
 #
-# v0 only. v1 adds `SubscribedTopicRegex`, which needs the broker to resolve a pattern against
-# the topic list on every heartbeat and to re-resolve it when topics appear; advertising v1
-# without that would silently subscribe a regex consumer to nothing.
-ConsumerGroupHeartbeat = "0"
+# v1 adds `SubscribedTopicRegex`, resolved per heartbeat in Postgres's regex dialect.
+# librdkafka asks for v1 only.
+ConsumerGroupHeartbeat = "0-1"
 # v1 adds the KIP-1099 MemberType field; every member described here arrived over
 # ConsumerGroupHeartbeat.
 ConsumerGroupDescribe = "0-1"
@@ -204,7 +203,7 @@ DescribeTransactions = "0"
 ListTransactions = "0-2"
 
 # APIs a single embedded broker can only answer one way, served so a client's version probe
-# sees a current broker: franz-go (Redpanda Console, kcat, the Go ecosystem) guesses the
+# sees a current broker: franz-go (Redpanda Console, the Go ecosystem) guesses the
 # cluster version from the *set* of keys advertised, so one absent key from Kafka 1.0 reads
 # the whole cluster as pre-1.0. See handlers/singleton.rs.
 AlterReplicaLogDirs = "1-2"

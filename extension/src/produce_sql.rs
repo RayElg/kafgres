@@ -1,4 +1,7 @@
-//! `kafgres_produce()` — a produce inside the caller's transaction. Kafka structurally
+//! `kafgres_produce()`: a produce that commits or rolls back with the caller's transaction.
+
+use std::cell::RefCell;
+use std::collections::HashSet;
 
 use pgrx::prelude::*;
 
@@ -7,7 +10,9 @@ use kafgres_codec::records::{build_batch_full, NewRecord, RecordBatch};
 use crate::storage::RawBatch;
 
 /// Produce one record, returning the offset it was assigned.
+/// The search path is pinned, `pg_temp` last: the ACL rules are read as a superuser.
 #[pg_extern]
+#[search_path(pg_catalog, @extschema@, pg_temp)]
 fn kafgres_produce(
     topic: &str,
     key: Option<&str>,
@@ -19,9 +24,12 @@ fn kafgres_produce(
 
     // One cached plan for both lookups; this reads the statement's existing snapshot, so a
     // topic created after this transaction's snapshot started is not seen (READ COMMITTED).
-    let found: Option<(i32, i32)> = match crate::plan::select(
+    let found: Option<(i32, i32, bool, String, String)> = match crate::plan::select(
         "SELECT t.topic_id::int,
-                (SELECT count(*)::int FROM kafgres_partitions p WHERE p.topic_id = t.topic_id)
+                (SELECT count(*)::int FROM kafgres_partitions p WHERE p.topic_id = t.topic_id),
+                has_table_privilege('kafgres_markers', 'INSERT'),
+                current_user::text,
+                COALESCE(host(inet_client_addr()), 'localhost')
            FROM kafgres_topics t
           WHERE t.name = $1",
         &[topic.into()],
@@ -30,6 +38,9 @@ fn kafgres_produce(
                 return Ok(Some((
                     row.get::<i32>(1)?.unwrap_or(0),
                     row.get::<i32>(2)?.unwrap_or(0),
+                    row.get::<bool>(3)?.unwrap_or(false),
+                    row.get::<String>(4)?.unwrap_or_default(),
+                    row.get::<String>(5)?.unwrap_or_default(),
                 )));
             }
             Ok(None)
@@ -39,7 +50,7 @@ fn kafgres_produce(
         Err(e) => error!("kafgres: {e}"),
     };
     // No row means no such topic; a row with no partitions is a different failure.
-    let (topic_id, partitions) = match found {
+    let (topic_id, partitions, may_insert_marker, role, host) = match found {
         Some(v) => v,
         None => error!("kafgres: no such topic {topic:?}"),
     };
@@ -48,13 +59,35 @@ fn kafgres_produce(
         error!("kafgres: topic {topic:?} has no partitions");
     }
 
+    // Every check precedes the append: a refused payload left in the segment is readable by
+    // read_uncommitted consumers.
+    if !may_insert_marker {
+        pgrx::ereport!(
+            pgrx::PgLogLevel::ERROR,
+            pgrx::PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
+            format!("kafgres: permission denied to produce to {topic:?}"),
+            "kafgres_produce() needs INSERT on kafgres_markers."
+        );
+    }
+    match crate::acl::sql_caller_may_write(&role, &host, topic) {
+        Ok(true) => {}
+        Ok(false) => pgrx::ereport!(
+            pgrx::PgLogLevel::ERROR,
+            pgrx::PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
+            format!("kafgres: User:{role} is not allowed to WRITE topic {topic:?}"),
+            "kafgres.acls_enabled is on and kafgres_acls grants this role no WRITE on the topic."
+        ),
+        Err(e) => error!("kafgres: could not read kafgres_acls: {e}"),
+    }
+
     // murmur2 on the key, matching what Kafka clients do, so a key produced through SQL
+    // lands on the partition a client would have chosen for it.
     let partition = match key {
         Some(k) => (murmur2(k.as_bytes()) & 0x7fff_ffff) % partitions,
         None => 0,
     };
 
-    // One `producerId` per transaction, taken from the xid: the aborted list is keyed by
+    // One `producerId` per transaction, taken from the xid: the aborted list is keyed by it.
     // What `pg_current_xact_id()` calls, without the SPI round trip; both assign a
     // top-level xid if none. SAFETY: called inside a transaction, which `#[pg_extern]` is.
     let producer_id: i64 = unsafe { pg_sys::GetTopFullTransactionId().value as i64 };
@@ -64,7 +97,7 @@ fn kafgres_produce(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
-    // Stamped so a reader can tell this batch is marker-backed even after a crash —
+    // Stamped transactional, so a reader can tell it is marker-backed after a crash.
     let bytes = build_batch_full(
         &[NewRecord {
             key: key.map(|k| k.as_bytes().to_vec()),
@@ -90,14 +123,29 @@ fn kafgres_produce(
         is_control: false,
     };
 
-    // Through the factory, not a named engine: which engine can do this is the engine's
+    // After a restart the log may still lose a torn tail and take a new epoch.
+    crate::server::wait_for_epochs();
+
+    // Through the factory: whether an engine supports this is the engine's call.
     let mut store = crate::storage::open();
     let (base_offset, last_offset) = match store.append_pending(topic_id, partition, raw) {
         Ok(v) => v,
         Err(e) => error!("kafgres: produce failed: {e}"),
     };
 
-    // The marker, in the caller's transaction. Everything above already happened; this
+    // Release on both commit and abort, so an aborted reservation does not pin the LSO.
+    // Registered before the marker INSERT: an ERROR there re-raises as a panic at the
+    // FFI boundary, skipping the `Err` branch below, so the release must already be armed.
+    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Commit, move || {
+        crate::storage::release_pending(topic_id, partition);
+    });
+    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Abort, move || {
+        crate::storage::release_pending(topic_id, partition);
+    });
+    owe_sync(producer_id, topic_id, partition);
+
+    // Payload is already in the segment; on failure the abort callback above
+    // releases the reservation.
     if let Err(e) = crate::plan::run(
         "INSERT INTO kafgres_markers (topic_id, partition, base_offset, last_offset, bytes)
          VALUES ($1::oid, $2, $3, $4, $5)",
@@ -109,20 +157,57 @@ fn kafgres_produce(
             (bytes.len() as i32).into(),
         ],
     ) {
-        // The payload is already in the segment. Release the reservation so the LSO is
-        crate::storage::release_pending(topic_id, partition);
         error!("kafgres: could not record the commit marker: {e}");
     }
 
-    // Release on **both** outcomes. Registering only the commit callback would leave an
-    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Commit, move || {
-        crate::storage::release_pending(topic_id, partition);
-    });
-    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Abort, move || {
-        crate::storage::release_pending(topic_id, partition);
-    });
-
     base_offset
+}
+
+thread_local! {
+    /// Partitions the current transaction appended to, keyed by its top-level xid.
+    static SYNC_OWED: RefCell<(i64, HashSet<(u32, i32)>)> = RefCell::new((0, HashSet::new()));
+}
+
+/// Fsync the partition at pre-commit, once per partition per transaction. The marker is
+/// durable at commit; without this the payload is only in page cache, so a power cut can
+/// keep the commit and lose the record. Ignores `kafgres.fsync_before_ack`: the commit is
+/// the acknowledgement. A failure aborts the transaction.
+fn owe_sync(xid: i64, topic: u32, partition: i32) {
+    let first = SYNC_OWED.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.0 != xid {
+            *s = (xid, HashSet::new());
+        }
+        let first = s.1.is_empty();
+        s.1.insert((topic, partition));
+        first
+    });
+    if first {
+        pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::PreCommit, move || {
+            sync_owed(xid)
+        });
+        // PREPARE TRANSACTION runs no PreCommit, so its commit would skip the fsync.
+        pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::PrePrepare, || {
+            error!("kafgres_produce() cannot be used in a prepared transaction")
+        });
+    }
+}
+
+fn sync_owed(xid: i64) {
+    let owed = SYNC_OWED.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.0 == xid {
+            std::mem::take(&mut s.1)
+        } else {
+            HashSet::new()
+        }
+    });
+    let mut store = crate::storage::open();
+    for (topic, partition) in owed {
+        if let Err(e) = store.sync_partition(topic, partition) {
+            error!("kafgres: could not make topic {topic} partition {partition} durable before commit: {e}");
+        }
+    }
 }
 
 /// Kafka's `Utils.murmur2`, which is what every client partitions keys with.

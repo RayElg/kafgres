@@ -21,6 +21,161 @@ pub fn release_pending(topic: TopicId, partition: i32) {
     segment::SegmentStore::release_pending(topic, partition);
 }
 
+/// Set in the broker worker only. A backend running `kafgres_enforce_retention()` stalls
+/// only itself, so it runs a plan to the end rather than leave it to die with it.
+static BOUNDED_PASSES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn bound_compaction_passes() {
+    BOUNDED_PASSES.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What is left of the current sweep's budget, shared by every partition it compacts.
+static SWEEP_BUDGET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// At the start of each retention sweep in the broker.
+pub fn reset_compaction_budget() {
+    SWEEP_BUDGET.store(crate::compaction_pass_bytes(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Mapping and rewriting together, for the whole sweep: bounds the worker's pause (I7).
+/// Taken whole until the pass hands the rest back, so a pass that fails spends it all.
+fn compaction_budget() -> i64 {
+    if BOUNDED_PASSES.load(std::sync::atomic::Ordering::Relaxed) {
+        SWEEP_BUDGET.swap(0, std::sync::atomic::Ordering::Relaxed)
+    } else {
+        i64::MAX
+    }
+}
+
+/// Whether a new plan may start: one with no budget to map would only hold a slot.
+fn compaction_budget_left() -> bool {
+    !BOUNDED_PASSES.load(std::sync::atomic::Ordering::Relaxed)
+        || SWEEP_BUDGET.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// Hand back what a pass left of `compaction_budget()`.
+fn spend_compaction_budget(left: i64) {
+    if BOUNDED_PASSES.load(std::sync::atomic::Ordering::Relaxed) {
+        SWEEP_BUDGET.store(left.max(0), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Plans each engine keeps between passes: two at the per-map key cap fill the key budget.
+/// A new plan waits for a slot rather than evict one mid-rewrite.
+const MAX_PLANS: usize = 2;
+
+/// Times the retention sweep has come back to the first topic.
+static ROTATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn finish_rotation() {
+    ROTATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn rotation() -> u64 {
+    ROTATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A plan untouched for a whole rotation gives up its slot: its partition was swept without
+/// a pass, so it may no longer be compacted at all. Counted in rotations, not time, since a
+/// rotation takes longer the more topics there are.
+fn plan_is_idle(touched: u64) -> bool {
+    rotation().saturating_sub(touched) >= 2
+}
+
+/// Per partition, oldest first: offsets at or below `end` have been clean since `at_ms`.
+/// Process-local, so a restart only makes tombstones wait longer.
+static CLEANED: std::sync::Mutex<Option<std::collections::HashMap<(TopicId, i32), Vec<(i64, i64)>>>> =
+    std::sync::Mutex::new(None);
+
+/// Entries kept per partition; dropping the oldest is conservative.
+const CLEANED_HISTORY: usize = 64;
+
+fn record_cleaned(topic: TopicId, partition: i32, end: i64, at_ms: i64) {
+    let mut all = CLEANED.lock().unwrap_or_else(|e| e.into_inner());
+    let history = all
+        .get_or_insert_with(Default::default)
+        .entry((topic, partition))
+        .or_default();
+    history.push((end, at_ms));
+    if history.len() > CLEANED_HISTORY {
+        history.remove(0);
+    }
+}
+
+fn forget_cleaned(topic: TopicId, partition: i32) {
+    if let Some(all) = CLEANED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        all.remove(&(topic, partition));
+    }
+}
+
+/// What a compaction pass may do with a batch, beyond what the offset map says (I10).
+struct Judge {
+    topic: TopicId,
+    partition: i32,
+    /// Offsets below it were cleaned by a finished plan.
+    dirty_from: i64,
+    /// A tombstone clean since before this may go.
+    tombstone_horizon: i64,
+    /// A rewrite in this plan did not land: every tombstone stays.
+    keep_tombstones: bool,
+}
+
+impl Judge {
+    fn new(topic: TopicId, partition: i32, dirty_from: i64, delete_retention_ms: i64) -> StoreResult<Judge> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        Ok(Judge {
+            topic,
+            partition,
+            dirty_from,
+            tombstone_horizon: now.saturating_sub(delete_retention_ms),
+            keep_tombstones: false,
+        })
+    }
+
+    /// Whether the batch's records are committed. Callers stay below the LSO, so nothing is
+    /// still open.
+    fn committed(&self, batch: &RecordBatchView) -> StoreResult<bool> {
+        if !batch.is_transactional() || batch.is_control() {
+            return Ok(true);
+        }
+        let base = batch.base_offset();
+        if segment::is_marker_backed(batch.as_bytes()) {
+            // No marker means aborted only once the snapshot sees the writer finished: the
+            // live LSO can pass a commit a REPEATABLE READ snapshot does not see. The producer
+            // id is the top-level xid; the marker's subtransaction may have rolled back.
+            match pmeta::marker_state(self.topic, self.partition, base, batch.producer_id())? {
+                (true, _) => Ok(true),
+                (false, true) => Ok(false),
+                (false, false) => Err(StoreError::Io(format!(
+                    "transaction {} below the LSO is not yet visible to this snapshot",
+                    batch.producer_id()
+                ))),
+            }
+        } else {
+            Ok(!pmeta::aborted_at(self.topic, self.partition, batch.producer_id(), base)?)
+        }
+    }
+
+    /// Kafka's rule: a tombstone goes after `delete.retention.ms` in the clean section.
+    fn tombstone_goes(&self, offset: i64) -> bool {
+        if self.keep_tombstones || offset >= self.dirty_from {
+            return false;
+        }
+        let all = CLEANED.lock().unwrap_or_else(|e| e.into_inner());
+        let since = all
+            .as_ref()
+            .and_then(|m| m.get(&(self.topic, self.partition)))
+            .and_then(|h| h.iter().find(|(end, _)| *end >= offset))
+            .map(|(_, at)| *at);
+        since.is_some_and(|at| at <= self.tombstone_horizon)
+    }
+}
+
+type RecordBatchView = kafgres_codec::records::RecordBatch;
+
 /// Validate the engine GUC without constructing anything, at worker start: callers of
 pub fn check_engine_name() -> Result<(), String> {
     match crate::storage_engine_guc().as_str() {
@@ -212,6 +367,24 @@ pub fn offset_of_max_timestamp(bytes: kafgres_codec::bytes::Bytes) -> Option<(i6
     Some((base, want))
 }
 
+/// The first record at or after `timestamp` in the batch that reaches it, as Kafka's
+/// `findOffsetByTimestamp` answers; undecodable means the base offset and the batch's maximum.
+pub fn first_at_or_after(bytes: kafgres_codec::bytes::Bytes, timestamp: i64) -> Option<(i64, i64)> {
+    let batch = kafgres_codec::records::RecordBatch::new(bytes).ok()?;
+    let base = batch.base_offset();
+    let base_ts = batch.base_timestamp();
+    if let Ok(records) = batch.records_decompressed() {
+        for record in records {
+            let Ok(record) = record else { break };
+            let ts = base_ts.saturating_add(record.timestamp_delta);
+            if ts >= timestamp {
+                return Some((base + record.offset_delta as i64, ts));
+            }
+        }
+    }
+    Some((base, batch.max_timestamp()))
+}
+
 pub trait LogStore: Send {
     /// Append a batch, assigning offsets; returns the base offset assigned. Offsets
     fn append(
@@ -238,7 +411,7 @@ pub trait LogStore: Send {
         topic: TopicId,
         partition: i32,
         timestamp: i64,
-    ) -> StoreResult<Option<i64>>;
+    ) -> StoreResult<Option<(i64, i64)>>;
 
     /// The offset of the record carrying the partition's greatest timestamp, paired with
     /// that timestamp; `None` for an empty log. Not the winning batch's base offset (KIP-734).

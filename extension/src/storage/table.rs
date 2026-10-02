@@ -1,5 +1,8 @@
 //! Table-backed log storage: the only file permitted to run SQL against the log table
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use pgrx::prelude::*;
 
 use kafgres_codec::records::RecordBatch;
@@ -36,8 +39,6 @@ fn base_seq_of(view: &kafgres_codec::records::RecordBatch) -> Option<i32> {
 
 /// Per-pass cap: the pass runs on the broker's single worker, so its duration freezes every connection.
 const MAX_COMPACT_BATCHES: usize = 1_000;
-
-const MAX_COMPACT_BYTES: usize = 32 * 1024 * 1024;
 
 fn segment_offsets() -> i64 {
     crate::segment_offsets()
@@ -474,15 +475,18 @@ impl LogStore for TableStore {
         topic: TopicId,
         partition: i32,
         timestamp: i64,
-    ) -> StoreResult<Option<i64>> {
-        Spi::get_one_with_args::<i64>(
-            "SELECT (SELECT base_offset FROM kafgres_log
+    ) -> StoreResult<Option<(i64, i64)>> {
+        let blob = Spi::get_one_with_args::<Vec<u8>>(
+            "SELECT (SELECT batch FROM kafgres_log
               WHERE topic_id = $1::oid AND partition = $2 AND max_timestamp >= $3
               ORDER BY base_offset
               LIMIT 1)",
             &[(topic as i32).into(), partition.into(), timestamp.into()],
         )
-        .map_err(spi_err)
+        .map_err(spi_err)?;
+        Ok(blob.and_then(|b| {
+            super::first_at_or_after(kafgres_codec::bytes::Bytes::from(b), timestamp)
+        }))
     }
 
     fn max_timestamp_offset(
@@ -570,34 +574,37 @@ impl LogStore for TableStore {
         self.reclaim(topic, partition, offset).map(|_| ())
     }
 
-    /// One pass over a partition in a single Postgres transaction, so a Fetch never sees it half-rewritten.
+    /// One bounded pass of a compaction plan, as on the segment engine. A pass is one
+    /// transaction; the plan spans passes, which is safe because only compaction rewrites
+    /// a batch below the log end on this engine.
     fn compact(&mut self, topic: TopicId, partition: i32) -> StoreResult<u64> {
-        use kafgres_codec::compaction::{rebuild_batch, survivors_until, KeptRecord};
-        use kafgres_codec::records::RecordBatch;
-
         // Active region = a whole segment of offset headroom, not one batch: one batch is
+        // all a partition written by one idempotent producer ever has.
         let high_watermark = self.high_watermark(topic, partition)?;
         let offset_ceiling = high_watermark - segment_offsets();
 
         let limits = crate::config::compaction_limits(topic);
         let now = now_millis();
-        // $5/$6 stay separate bounds: min-ing them would let a short lag widen the region.
+        // Separate bounds, not a min: a short lag must not widen the region.
         let lag_cutoff = now - limits.min_compaction_lag_ms;
         let age_ceiling = now - crate::config::segment_ms(topic);
-        let tombstone_cutoff = now - limits.delete_retention_ms;
+        // Nothing an open transaction wrote is mapped: it may yet abort.
+        let stable_end = self.last_stable_offset(topic, partition)?;
 
         // Byte arm measured over batches, not the segments table: a small topic's single segment never triggers.
+        // A newest batch over `segment.bytes` is the active region alone, as in Kafka.
         let seg_bytes = crate::config::segment_bytes(topic);
         let byte_ceiling: i64 = Spi::get_one_with_args(
             "SELECT (
-                SELECT COALESCE(MIN(base_offset), 0) FROM (
+                SELECT COALESCE(MIN(base_offset) FILTER (WHERE behind <= $3), MAX(base_offset), 0)
+                  FROM (
                     SELECT base_offset,
                            SUM(length(batch)) OVER (ORDER BY base_offset DESC) AS behind
                       FROM (SELECT base_offset, batch FROM kafgres_log
                              WHERE topic_id = $1::oid AND partition = $2
                              ORDER BY base_offset DESC
                              LIMIT $4) newest_first
-                ) t WHERE behind <= $3)",
+                ) t)",
             &[
                 (topic as i32).into(),
                 partition.into(),
@@ -619,159 +626,69 @@ impl LogStore for TableStore {
             return Ok(0);
         }
 
-        let rows: Vec<(i64, Vec<u8>)> = Spi::connect(|client| {
-            let rows = client.select(
-                "SELECT base_offset, batch FROM kafgres_log
-                  WHERE topic_id = $1::oid AND partition = $2
-                    AND (base_offset < $3 OR append_ts <= $6 OR base_offset < $8)
-                    AND append_ts <= $5
-                    AND base_offset < $7
-                  ORDER BY base_offset
-                  LIMIT $4",
-                None,
-                &[
-                    (topic as i32).into(),
-                    partition.into(),
-                    offset_ceiling.into(),
-                    (MAX_COMPACT_BATCHES as i64).into(),
-                    lag_cutoff.into(),
-                    age_ceiling.into(),
-                    // Never the newest batch: an appender may be about to extend it.
-                    newest.into(),
-                    byte_ceiling.into(),
-                ],
-            )?;
-            let mut out = Vec::new();
-            let mut bytes = 0usize;
-            for row in rows {
-                if let (Some(base), Some(blob)) = (row.get::<i64>(1)?, row.get::<Vec<u8>>(2)?) {
-                    bytes += blob.len();
-                    out.push((base, blob));
-                    if bytes >= MAX_COMPACT_BYTES {
-                        break;
-                    }
-                }
+        let region = Cleanable {
+            topic,
+            partition,
+            offset_ceiling,
+            age_ceiling,
+            byte_ceiling,
+            lag_cutoff,
+            // Never the newest batch: an appender may be about to extend it.
+            newest,
+        };
+
+        // Out of the map for the pass and back in only on success.
+        let key = (topic, partition);
+        let mut cleaner = CLEANERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .remove(&key)
+            .unwrap_or_default();
+        // Forgotten on abort, or a rolled-back rewrite could later let a tombstone go.
+        pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Abort, move || {
+            forget_cleaner(key);
+        });
+        // Likewise a rolled-back savepoint in a committed transaction, as the broker's sweep
+        // is. Ids are assigned in order, so an abort at or below the pass's is its own or an
+        // enclosing subtransaction.
+        let pass_subid = unsafe { pgrx::pg_sys::GetCurrentSubTransactionId() };
+        pgrx::register_subxact_callback(pgrx::PgSubXactCallbackEvent::AbortSub, move |aborted, _| {
+            if aborted <= pass_subid {
+                forget_cleaner(key);
             }
-            Ok::<_, spi::Error>(out)
-        })
-        .map_err(spi_err)?;
-        if rows.is_empty() {
-            return Ok(0);
-        }
+        });
 
-        let batches: Vec<RecordBatch> = rows
-            .iter()
-            .map(|(_, blob)| {
-                RecordBatch::new(kafgres_codec::bytes::Bytes::copy_from_slice(blob))
-                    .map_err(|e| StoreError::Io(format!("compaction decode: {e}")))
-            })
-            .collect::<Result<_, _>>()?;
-
-        let keep = survivors_until(&batches, tombstone_cutoff)
-            .map_err(|e| StoreError::Io(format!("compaction survivors: {e}")))?;
-
-        let mut removed = 0u64;
-        for (row, batch) in rows.iter().zip(batches.iter()) {
-            let (base, _) = row;
-            if batch.is_control() {
-                continue;
+        // A new plan needs a free slot, taken back from an idle plan if need be. Asked only
+        // once the partition is dirty enough, so a clean one evicts nothing.
+        let may_start = || {
+            let mut cleaners = CLEANERS.lock().unwrap_or_else(|e| e.into_inner());
+            let cleaners = cleaners.get_or_insert_with(HashMap::new);
+            let busy = cleaners.values().filter(|c| c.plan.is_some()).count();
+            busy < super::MAX_PLANS || {
+                let idle = cleaners
+                    .iter()
+                    .filter_map(|(k, c)| c.plan.as_ref().map(|p| (*k, p.touched)))
+                    .filter(|(_, t)| super::plan_is_idle(*t))
+                    .min_by_key(|(_, t)| *t)
+                    .map(|(k, _)| k);
+                idle.and_then(|k| cleaners.get_mut(&k)).map(|c| c.plan = None).is_some()
             }
-            let mut kept = Vec::new();
-            let mut total = 0usize;
-            for record in batch
-                .records_decompressed()
-                .map_err(|e| StoreError::Io(format!("compaction records: {e}")))?
-            {
-                let record = record.map_err(|e| StoreError::Io(format!("compaction record: {e}")))?;
-                total += 1;
-                let offset = base + record.offset_delta as i64;
-                if keep.keeps(offset) {
-                    kept.push(KeptRecord {
-                        offset,
-                        timestamp: batch.base_timestamp() + record.timestamp_delta,
-                        key: record.key,
-                        value: record.value,
-                        headers: record.headers,
-                        attributes: record.attributes,
-                    });
-                }
-            }
-            if kept.len() == total {
-                continue;
-            }
-            removed += (total - kept.len()) as u64;
+        };
 
-            // DELETE then INSERT, not UPDATE: the new base offset (first survivor) is the partition key.
-            Spi::run_with_args(
-                "DELETE FROM kafgres_log
-                  WHERE topic_id = $1::oid AND partition = $2 AND base_offset = $3",
-                &[(topic as i32).into(), partition.into(), (*base).into()],
-            )
-            .map_err(spi_err)?;
+        let removed = Self::compact_pass(
+            &region,
+            &mut cleaner,
+            stable_end,
+            limits.delete_retention_ms,
+            may_start,
+        )?;
 
-            let old_bytes = batch.as_bytes().len() as i64;
-            let segment_base = segment_index_of(*base, segment_offsets()) * segment_offsets();
-            Spi::run_with_args(
-                "UPDATE kafgres_log_segments SET bytes = GREATEST(bytes - $4, 0)
-                  WHERE topic_id = $1::oid AND partition = $2 AND base_offset = $3",
-                &[
-                    (topic as i32).into(),
-                    partition.into(),
-                    segment_base.into(),
-                    old_bytes.into(),
-                ],
-            )
-            .map_err(spi_err)?;
-
-            if let Some(rebuilt) = rebuild_batch(batch, &kept) {
-                let view = RecordBatch::new(rebuilt.clone())
-                    .map_err(|e| StoreError::Io(format!("compaction rebuild: {e}")))?;
-                let new_base = view.base_offset();
-                let last = new_base + view.last_offset_delta() as i64;
-                Spi::run_with_args(
-                    "INSERT INTO kafgres_log (topic_id, partition, base_offset, last_offset,
-                                              batch, append_ts, max_timestamp, record_count,
-                                              leader_epoch, producer_id, producer_epoch,
-                                              base_seq, is_txn)
-                     VALUES ($1::oid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
-                    &[
-                        (topic as i32).into(),
-                        partition.into(),
-                        new_base.into(),
-                        last.into(),
-                        rebuilt.to_vec().into(),
-                        // `now`, as `append` uses: time retention reads this column, so client clocks must not steer it.
-                        now_millis().into(),
-                        view.max_timestamp().into(),
-                        (view.record_count()).into(),
-                        view.partition_leader_epoch().into(),
-                        producer_id_of(&view).into(),
-                        producer_epoch_of(&view).into(),
-                        base_seq_of(&view).into(),
-                        view.is_transactional().into(),
-                    ],
-                )
-                .map_err(spi_err)?;
-
-                let new_segment =
-                    segment_index_of(new_base, segment_offsets()) * segment_offsets();
-                Spi::run_with_args(
-                    "UPDATE kafgres_log_segments
-                        SET bytes = bytes + $4,
-                            max_last_offset = GREATEST(max_last_offset, $5)
-                      WHERE topic_id = $1::oid AND partition = $2 AND base_offset = $3",
-                    &[
-                        (topic as i32).into(),
-                        partition.into(),
-                        new_segment.into(),
-                        (rebuilt.len() as i64).into(),
-                        last.into(),
-                    ],
-                )
-                .map_err(spi_err)?;
-            }
-        }
-
+        CLEANERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(key, cleaner);
         Ok(removed)
     }
 
@@ -865,6 +782,8 @@ impl LogStore for TableStore {
     fn drop_partition(&mut self, topic: TopicId, partition: i32) -> StoreResult<()> {
         // Clears txn markers, the abort index, partition registration and leader-epoch
         pmeta::drop_partition(topic, partition)?;
+        // Topic ids are reused; a new topic must not inherit this one's plan.
+        forget_cleaner((topic, partition));
 
         let segments: Vec<String> = Spi::connect(|client| {
             let rows = client.select(
@@ -1069,4 +988,318 @@ mod tests {
         assert_ne!(segment_table(42, 0, 0), segment_table(43, 0, 0));
         assert_ne!(segment_table(42, 0, 0), segment_table(42, 0, 1));
     }
+}
+
+/// Batches read per query in a compaction pass; a batch can be a megabyte.
+const COMPACT_PAGE: i64 = 32;
+/// Keys one offset map holds, about 50 MiB.
+const MAX_COMPACT_KEYS: usize = 1 << 20;
+
+/// Batches outside the active region and past the compaction lag.
+const CLEANABLE: &str = "topic_id = $1::oid AND partition = $2
+    AND (base_offset < $3 OR append_ts <= $4 OR base_offset < $5)
+    AND append_ts <= $6 AND base_offset < $7";
+
+struct Cleanable {
+    topic: TopicId,
+    partition: i32,
+    offset_ceiling: i64,
+    age_ceiling: i64,
+    byte_ceiling: i64,
+    lag_cutoff: i64,
+    newest: i64,
+}
+
+impl Cleanable {
+    fn args(&self) -> Vec<pgrx::datum::DatumWithOid<'static>> {
+        vec![
+            (self.topic as i32).into(),
+            self.partition.into(),
+            self.offset_ceiling.into(),
+            self.age_ceiling.into(),
+            self.byte_ceiling.into(),
+            self.lag_cutoff.into(),
+            self.newest.into(),
+        ]
+    }
+
+    /// Cleanable `(base_offset, batch, append_ts)` in offset order, narrowed by `extra`
+    /// over `$8` and `$9`.
+    fn page(&self, extra: &str, a: i64, b: i64) -> StoreResult<Vec<(i64, Vec<u8>, i64)>> {
+        let sql = format!(
+            "SELECT base_offset, batch, append_ts FROM kafgres_log
+              WHERE {CLEANABLE} {extra}
+              ORDER BY base_offset LIMIT $10"
+        );
+        let mut args = self.args();
+        args.extend([a.into(), b.into(), COMPACT_PAGE.into()]);
+        Spi::connect(|client| {
+            let rows = client.select(&sql, None, &args)?;
+            let mut out = Vec::new();
+            for row in rows {
+                if let (Some(base), Some(blob), Some(ts)) =
+                    (row.get::<i64>(1)?, row.get::<Vec<u8>>(2)?, row.get::<i64>(3)?)
+                {
+                    out.push((base, blob, ts));
+                }
+            }
+            Ok::<_, spi::Error>(out)
+        })
+        .map_err(spi_err)
+    }
+}
+
+/// A compaction plan in progress on one partition.
+struct TablePlan {
+    map: kafgres_codec::compaction::OffsetMap,
+    dirty_from: i64,
+    /// Last base offset mapped; `None` once mapping is done.
+    mapping_after: Option<i64>,
+    /// Last base offset rewritten.
+    rewrite_after: i64,
+    /// Bytes behind the rewrite, for the next plan's dirty-ratio gate.
+    clean_bytes: i64,
+    /// The sweep rotation a pass last advanced it in.
+    touched: u64,
+}
+
+#[derive(Default)]
+struct Cleaner {
+    plan: Option<TablePlan>,
+    /// Start of the dirty section. Process-local: a fresh process starts at 0.
+    dirty_from: i64,
+    clean_bytes: i64,
+}
+
+static CLEANERS: Mutex<Option<HashMap<(TopicId, i32), Cleaner>>> = Mutex::new(None);
+
+/// Drop a partition's compaction state and clean-time history.
+fn forget_cleaner(key: (TopicId, i32)) {
+    if let Some(c) = CLEANERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        c.remove(&key);
+    }
+    super::forget_cleaned(key.0, key.1);
+}
+
+fn decode(blob: &[u8]) -> StoreResult<RecordBatch> {
+    RecordBatch::new(kafgres_codec::bytes::Bytes::copy_from_slice(blob)).map_err(decode_err)
+}
+
+fn decode_err(e: kafgres_codec::records::BatchError) -> StoreError {
+    StoreError::Io(format!("compaction decode: {e:?}"))
+}
+
+impl TableStore {
+    fn compact_pass(
+        region: &Cleanable,
+        cleaner: &mut Cleaner,
+        stable_end: i64,
+        delete_retention_ms: i64,
+        may_start: impl FnOnce() -> bool,
+    ) -> StoreResult<u64> {
+        use kafgres_codec::compaction::{clean_batch, rebuild_batch, OffsetMap};
+
+        let mut plan = match cleaner.plan.take() {
+            Some(p) => p,
+            None => {
+                // Kafka's default `min.cleanable.dirty.ratio` of 0.5, fixed.
+                let mut args = region.args();
+                args.push(cleaner.dirty_from.into());
+                let dirty: i64 = Spi::get_one_with_args(
+                    &format!(
+                        "SELECT COALESCE(SUM(octet_length(batch)), 0)::bigint FROM kafgres_log
+                          WHERE {CLEANABLE} AND base_offset >= $8"
+                    ),
+                    &args,
+                )
+                .map_err(spi_err)?
+                .unwrap_or(0);
+                if dirty == 0
+                    || dirty < cleaner.clean_bytes
+                    || !super::compaction_budget_left()
+                    || !may_start()
+                {
+                    return Ok(0);
+                }
+                TablePlan {
+                    map: OffsetMap::default(),
+                    dirty_from: cleaner.dirty_from,
+                    mapping_after: Some(i64::MIN),
+                    rewrite_after: i64::MIN,
+                    clean_bytes: 0,
+                    touched: super::rotation(),
+                }
+            }
+        };
+
+        let judge = super::Judge::new(
+            region.topic,
+            region.partition,
+            plan.dirty_from,
+            delete_retention_ms,
+        )?;
+        let mut budget = super::compaction_budget();
+        let mut removed = 0u64;
+
+        while let Some(after) = plan.mapping_after {
+            if budget <= 0 {
+                break;
+            }
+            let page =
+                region.page("AND base_offset > $8 AND last_offset >= $9", after, plan.dirty_from)?;
+            if page.is_empty() {
+                plan.mapping_after = None;
+                break;
+            }
+            for (base, blob, _) in &page {
+                budget -= blob.len() as i64;
+                let view = decode(blob)?;
+                if view.last_offset() >= stable_end {
+                    plan.mapping_after = None;
+                    break;
+                }
+                if !judge.committed(&view)? {
+                    plan.map.end = plan.map.end.max(view.last_offset());
+                } else if !plan.map.add_batch(&view, MAX_COMPACT_KEYS).map_err(decode_err)? {
+                    plan.mapping_after = None;
+                    break;
+                }
+                plan.mapping_after = Some(*base);
+            }
+        }
+
+        if plan.mapping_after.is_none() {
+            let mut finished = false;
+            while budget > 0 {
+                let page = region.page(
+                    "AND base_offset > $8 AND base_offset <= $9",
+                    plan.rewrite_after,
+                    plan.map.end,
+                )?;
+                if page.is_empty() {
+                    finished = true;
+                    break;
+                }
+                for (base, blob, append_ts) in &page {
+                    budget -= blob.len() as i64;
+                    let view = decode(blob)?;
+                    // Past the last offset: a rewritten batch starts at its first survivor.
+                    plan.rewrite_after = view.last_offset();
+                    // An aborted batch goes whole, as Kafka's cleaner drops aborted data.
+                    let kept = if judge.committed(&view)? {
+                        clean_batch(&view, &plan.map, &|o| judge.tombstone_goes(o))
+                            .map_err(decode_err)?
+                    } else {
+                        Some(Vec::new())
+                    };
+                    let Some(kept) = kept else {
+                        plan.clean_bytes += blob.len() as i64;
+                        continue;
+                    };
+                    removed +=
+                        (view.record_count().max(0) as u64).saturating_sub(kept.len() as u64);
+                    let rebuilt = rebuild_batch(&view, &kept);
+                    plan.clean_bytes += rebuilt.as_ref().map_or(0, |b| b.len() as i64);
+                    replace_batch(region.topic, region.partition, *base, &view, rebuilt, *append_ts)?;
+                }
+            }
+            if finished {
+                if plan.map.end >= 0 {
+                    cleaner.dirty_from = plan.map.end + 1;
+                    super::record_cleaned(region.topic, region.partition, plan.map.end, now_millis());
+                }
+                cleaner.clean_bytes = plan.clean_bytes;
+                super::spend_compaction_budget(budget);
+                return Ok(removed);
+            }
+        }
+
+        super::spend_compaction_budget(budget);
+        plan.touched = super::rotation();
+        cleaner.plan = Some(plan);
+        Ok(removed)
+    }
+}
+
+/// Replace the batch at `base` with its rewrite, or drop it. DELETE then INSERT: the new
+/// base offset is the partition key. `append_ts` is kept as the records' age.
+fn replace_batch(
+    topic: TopicId,
+    partition: i32,
+    base: i64,
+    old: &RecordBatch,
+    rebuilt: Option<kafgres_codec::bytes::Bytes>,
+    append_ts: i64,
+) -> StoreResult<()> {
+    Spi::run_with_args(
+        "DELETE FROM kafgres_log
+          WHERE topic_id = $1::oid AND partition = $2 AND base_offset = $3",
+        &[(topic as i32).into(), partition.into(), base.into()],
+    )
+    .map_err(spi_err)?;
+
+    let segment_base = segment_index_of(base, segment_offsets()) * segment_offsets();
+    Spi::run_with_args(
+        "UPDATE kafgres_log_segments SET bytes = GREATEST(bytes - $4, 0)
+          WHERE topic_id = $1::oid AND partition = $2 AND base_offset = $3",
+        &[
+            (topic as i32).into(),
+            partition.into(),
+            segment_base.into(),
+            (old.as_bytes().len() as i64).into(),
+        ],
+    )
+    .map_err(spi_err)?;
+
+    let Some(rebuilt) = rebuilt else {
+        return Ok(());
+    };
+    let view = RecordBatch::new(rebuilt.clone())
+        .map_err(|e| StoreError::Io(format!("compaction rebuild: {e}")))?;
+    let new_base = view.base_offset();
+    let last = new_base + view.last_offset_delta() as i64;
+    // The first survivor can fall in an offset range no append ever created.
+    ensure_segment(topic, partition, new_base)?;
+    Spi::run_with_args(
+        "INSERT INTO kafgres_log (topic_id, partition, base_offset, last_offset,
+                                  batch, append_ts, max_timestamp, record_count,
+                                  leader_epoch, producer_id, producer_epoch,
+                                  base_seq, is_txn)
+         VALUES ($1::oid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        &[
+            (topic as i32).into(),
+            partition.into(),
+            new_base.into(),
+            last.into(),
+            rebuilt.to_vec().into(),
+            append_ts.into(),
+            view.max_timestamp().into(),
+            (view.record_count()).into(),
+            view.partition_leader_epoch().into(),
+            producer_id_of(&view).into(),
+            producer_epoch_of(&view).into(),
+            base_seq_of(&view).into(),
+            view.is_transactional().into(),
+        ],
+    )
+    .map_err(spi_err)?;
+
+    let new_segment = segment_index_of(new_base, segment_offsets()) * segment_offsets();
+    Spi::run_with_args(
+        "UPDATE kafgres_log_segments
+            SET bytes = bytes + $4,
+                max_last_offset = GREATEST(max_last_offset, $5),
+                max_append_ts = GREATEST(max_append_ts, $6)
+          WHERE topic_id = $1::oid AND partition = $2 AND base_offset = $3",
+        &[
+            (topic as i32).into(),
+            partition.into(),
+            new_segment.into(),
+            (rebuilt.len() as i64).into(),
+            last.into(),
+            append_ts.into(),
+        ],
+    )
+    .map_err(spi_err)?;
+    Ok(())
 }

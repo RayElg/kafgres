@@ -160,3 +160,33 @@ def test_everything_acked_survives_kill_9():
     )
 
     sql(f"SELECT kafgres_drop_topic('{TOPIC}')")
+
+def test_a_java_idempotent_producer_carries_on_after_sigkill():
+    """A crash can lose the producer window's newest rows. The Java client must recover from
+    the UNKNOWN_PRODUCER_ID answers, not retry until `delivery.timeout.ms` expires them."""
+    import time
+    topic = "crash-java"
+    sql(f"SELECT kafgres_drop_topic('{topic}')")
+    sql(f"SELECT kafgres_create_topic('{topic}', 2)")
+    perf = subprocess.Popen(
+        ["docker", "run", "--rm", "--network", "host", "apache/kafka:4.1.0",
+         "/opt/kafka/bin/kafka-producer-perf-test.sh", "--topic", topic,
+         "--num-records", "600000", "--record-size", "256", "--throughput", "30000",
+         "--producer-props", f"bootstrap.servers={BROKER}", "acks=all",
+         "enable.idempotence=true", "linger.ms=5", "delivery.timeout.ms=60000"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    try:
+        time.sleep(8)
+        compose("kill", "-s", "SIGKILL", "postgres", check=True)
+        compose("up", "-d", "postgres", check=True, timeout=300)
+        assert wait_ready(), "broker did not come back after SIGKILL"
+        out, _ = perf.communicate(timeout=300)
+    finally:
+        perf.kill()
+        sql(f"SELECT kafgres_drop_topic('{topic}')")
+    assert "TimeoutException" not in out, (
+        "records expired retrying; the producer never recovered:\n" + out[-1500:]
+    )
+    summary = [line for line in out.splitlines() if "records sent" in line][-1]
+    assert summary.startswith("600000 records sent"), summary

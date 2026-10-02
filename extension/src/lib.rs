@@ -31,6 +31,8 @@ mod init130;
 mod init140;
 mod init150;
 mod init160;
+mod init170;
+mod init180;
 pub mod quota;
 pub mod meta;
 pub mod plan;
@@ -63,6 +65,10 @@ static STORAGE_ENGINE: GucSetting<Option<CString>> =
 
 static SEGMENT_BYTES: GucSetting<i32> = GucSetting::<i32>::new(64 * 1024 * 1024);
 
+static COMPACTION_PASS_BYTES: GucSetting<i32> = GucSetting::<i32>::new(32 * 1024 * 1024);
+
+static RETENTION_CHECK_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(60_000);
+
 static SEGMENT_LOCK_STRIPES: GucSetting<i32> = GucSetting::<i32>::new(16);
 
 static REPLICATE_FROM: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
@@ -74,9 +80,9 @@ static TRANSACTION_VERSION: GucSetting<i32> = GucSetting::<i32>::new(2);
 
 static ALLOW_ENGINE_MISMATCH: GucSetting<bool> = GucSetting::<bool>::new(false);
 
-static RELAXED_PRODUCE_COMMIT: GucSetting<bool> = GucSetting::<bool>::new(true);
+static RELAXED_PRODUCE_COMMIT: GucSetting<bool> = GucSetting::<bool>::new(false);
 
-static FSYNC_BEFORE_ACK: GucSetting<bool> = GucSetting::<bool>::new(false);
+static FSYNC_BEFORE_ACK: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 static AUTO_CREATE_TOPICS: GucSetting<bool> = GucSetting::<bool>::new(true);
 
@@ -253,6 +259,19 @@ pub fn node_id() -> i32 {
 
 pub fn segment_bytes() -> u64 {
     SEGMENT_BYTES.get().max(1024) as u64
+}
+
+pub fn compaction_pass_bytes() -> i64 {
+    COMPACTION_PASS_BYTES.get().max(65_536) as i64
+}
+
+pub fn retention_check_interval_ms() -> u64 {
+    RETENTION_CHECK_INTERVAL_MS.get().max(1_000) as u64
+}
+
+/// In broker ticks, at least one.
+pub fn retention_check_ticks() -> u64 {
+    (retention_check_interval_ms() / TICK_INTERVAL_MS.get().max(1) as u64).max(1)
 }
 
 pub fn max_request_bytes() -> usize {
@@ -441,7 +460,7 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_bool_guc(
         c"kafgres.fsync_before_ack",
         c"Make record bytes durable before the produce response leaves the broker (segment engine)",
-        c"Without this the segment log is fsynced only when a segment rolls, so acks=all returns while the records are still in the page cache: they survive kill -9 but not a power cut. With it, the loop fsyncs every partition it appended to before releasing that pass's responses. The fsync is per pass, not per request, so a pipelining client amortises one device flush across everything in flight rather than paying one each. Costs throughput in proportion to how little the client pipelines. No effect on the table engine, whose records are Postgres rows made durable by the commit",
+        c"On by default: the loop fsyncs every partition it appended to before releasing that pass's responses, one flush per pass rather than per request. Off, the segment log is fsynced only when a segment rolls, so acks=all returns while the records are still in the page cache: they survive kill -9 but not a power cut. No effect on the table engine, whose records are Postgres rows made durable by the commit",
         &FSYNC_BEFORE_ACK,
         GucContext::Sighup,
         GucFlags::default(),
@@ -449,7 +468,7 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_bool_guc(
         c"kafgres.relaxed_produce_commit",
         c"Let a wire-protocol produce commit without waiting for its WAL flush (segment engine, non-transactional only)",
-        c"The segment engine keeps records in files that are fsynced at segment roll, not per produce, so an acknowledged record already lives in the page cache rather than on the platter. Flushing the WAL synchronously for the *metadata* about those records buys durability the records themselves do not have, at the cost of one device barrier per request. With this on, that metadata rides the WAL writer's next flush instead. What it costs: after an OS or power failure the idempotent-producer window may be missing its newest entries, so an in-flight batch that is retried can land twice — at-least-once instead of exactly-once across an unclean shutdown. Off restores a flush per produce. Never applies to transactional produce, to kafgres_produce(), or to the table engine, where records are in Postgres and the flush is what makes them durable",
+        c"Off by default: each produce's metadata, including the idempotent-producer window, is flushed to the WAL before the ack. On, it rides the WAL writer's next flush, which saves one device barrier per request. The cost: a crash can lose the window's newest entries, after which an idempotent producer resending its in-flight batches is refused as unknown. librdkafka then fails the producer; the Java client starts a new epoch and can write those batches twice. Never applies to transactional produce, to kafgres_produce(), or to the table engine",
         &RELAXED_PRODUCE_COMMIT,
         GucContext::Sighup,
         GucFlags::default(),
@@ -547,6 +566,26 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
+        c"kafgres.compaction_pass_bytes",
+        c"Bytes one compaction pass reads per partition in the broker; a plan larger than this resumes at the next retention check",
+        c"",
+        &COMPACTION_PASS_BYTES,
+        65_536,
+        i32::MAX,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"kafgres.retention_check_interval_ms",
+        c"How often the broker applies retention and compaction, as Kafka's log.retention.check.interval.ms",
+        c"",
+        &RETENTION_CHECK_INTERVAL_MS,
+        1_000,
+        i32::MAX,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
         c"kafgres.segment_bytes",
         c"Bytes a segment file reaches before rolling (segment engine)",
         c"",
@@ -566,7 +605,7 @@ pub extern "C-unwind" fn _PG_init() {
     );
     GucRegistry::define_string_guc(
         c"kafgres.tls_cert_file",
-        c"PEM server certificate chain. TLS is enabled when this and tls_key_file are both set (requires BGW restart)",
+        c"PEM server certificate chain. TLS is enabled when this and tls_key_file are both set (a reload applies to new connections)",
         c"",
         &TLS_CERT_FILE,
         GucContext::Sighup,
@@ -574,7 +613,7 @@ pub extern "C-unwind" fn _PG_init() {
     );
     GucRegistry::define_string_guc(
         c"kafgres.tls_key_file",
-        c"PEM private key for tls_cert_file (requires BGW restart)",
+        c"PEM private key for tls_cert_file (a reload applies to new connections)",
         c"",
         &TLS_KEY_FILE,
         GucContext::Sighup,
@@ -644,6 +683,10 @@ pub extern "C-unwind" fn _PG_init() {
 
     // Registered unconditionally rather than only when `storage_engine=segment`: shared
     crate::storage::segment::init_shmem();
+    {
+        use crate::server::EPOCHS_RAISED;
+        pgrx::pg_shmem_init!(EPOCHS_RAISED);
+    }
 
     // The broker starts at `RecoveryFinished` so a standby never serves partitions; the
     BackgroundWorkerBuilder::new("kafgres_follower")
@@ -740,11 +783,16 @@ pub unsafe extern "C-unwind" fn kafgres_cdc_worker_main(_arg: pg_sys::Datum) {
     } else {
         interval
     })) {
+        crate::dbtx::report_stats();
         if BackgroundWorker::sighup_received() {
             reload_config();
             interval = cdc_interval();
         }
         if interval.is_zero() {
+            continue;
+        }
+        // Appends wait for the broker's recovery and new leader epochs, as SQL produce does.
+        if !server::EPOCHS_RAISED.get().load(std::sync::atomic::Ordering::Acquire) {
             continue;
         }
 
@@ -808,6 +856,7 @@ pub unsafe extern "C-unwind" fn kafgres_archiver_worker_main(_arg: pg_sys::Datum
     } else {
         interval
     })) {
+        crate::dbtx::report_stats();
         if BackgroundWorker::sighup_received() {
             reload_config();
             interval = archive_interval();
@@ -862,7 +911,39 @@ pub(crate) fn ensure_tables_exist() {
     init140::init_140();
     init150::init_150();
     init160::init_160();
+    init170::init_170();
+    init180::init_180();
 }
+
+pgrx::extension_sql!(
+    r#"
+-- Revoke EXECUTE from PUBLIC on everything but kafgres_produce(), which checks its own
+-- permissions, and the read-only reports, which need table grants anyway.
+DO $$
+DECLARE
+    f regprocedure;
+BEGIN
+    FOR f IN
+        SELECT p.oid::regprocedure
+          FROM pg_depend d
+          JOIN pg_proc p ON p.oid = d.objid
+         WHERE d.classid = 'pg_proc'::regclass
+           AND d.refclassid = 'pg_extension'::regclass
+           AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname = 'kafgres')
+           AND d.deptype = 'e'
+           AND p.proname NOT IN ('kafgres_produce', 'kafgres_version', 'kafgres_kafka_version',
+                                 'kafgres_partition_offsets', 'kafgres_archive_status',
+                                 'kafgres_cdc_status', 'kafgres_cdc_snapshots',
+                                 'kafgres_share_state')
+    LOOP
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', f);
+    END LOOP;
+END
+$$;
+"#,
+    name = "revoke_from_public",
+    finalize
+);
 
 #[pg_extern]
 fn kafgres_kafka_version() -> &'static str {
@@ -946,6 +1027,7 @@ pub unsafe extern "C-unwind" fn kafgres_follower_worker_main(_arg: pg_sys::Datum
     let mut applied_since_log = 0i64;
     let mut last_log = std::time::Instant::now();
     while BackgroundWorker::wait_latch(Some(delay)) {
+        crate::dbtx::report_stats();
         if BackgroundWorker::sighup_received() {
             reload_config();
             if replicate_from().is_none() {

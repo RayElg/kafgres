@@ -7,7 +7,7 @@ kafgres.
 | Path | Who writes it | Event shape | Commit-path cost |
 |---|---|---|---|
 | Wire Produce (API key 0) | a Kafka client | whatever the client sends | none |
-| `kafgres_produce()` | application SQL, in its own transaction | application-authored | one marker row |
+| `kafgres_produce()` | application SQL, in its own transaction | application-authored | one marker row, one fsync per partition |
 | CDC mapping | derived from the WAL | defined by a SQL mapping | none |
 
 ## `kafgres_produce()`
@@ -24,10 +24,20 @@ COMMIT;
 record was assigned. `key` and `value` are `text`, so a `jsonb` payload is passed as
 `jsonb_build_object(...)::text`; either may be `NULL`.
 
-The record is visible to consumers exactly when the transaction commits. If the
-transaction rolls back, nothing is consumable. This is the only produce path that can
-promise the event reflects what the transaction saw, because it runs inside the
-transaction.
+The record is visible to `read_committed` consumers exactly when the transaction
+commits, and never if it rolls back. This is the only produce path that can promise the
+event reflects what the transaction saw, because it runs inside the transaction.
+
+Consume with `isolation.level=read_committed`. Most clients, the Java client and
+`kafka-console-consumer` included, default to `read_uncommitted`, which also returns
+records whose transaction rolled back, as it does for an aborted Kafka transaction.
+
+Before the transaction commits, the partitions it produced to are fsynced, whatever
+`kafgres.fsync_before_ack` says, so a commit that survives a power cut keeps its record.
+That costs one fsync per partition per transaction; if it fails, the transaction fails.
+A transaction that produced cannot be prepared (`PREPARE TRANSACTION`), since the fsync
+would not precede its commit. Right after a server start or crash, a call waits up to
+30 seconds for the broker to recover the log and take its new leader epoch, then fails.
 
 Mechanically, `kafgres_produce()` appends the payload to the log and writes a commit
 marker row inside the caller's transaction. Visibility to `read_committed` consumers is
@@ -43,6 +53,31 @@ computed from committed markers. Three properties of that mechanism are worth kn
   so a shared producer id would let one rollback discard later committed records.
 - The last stable offset gates records from transactions that are still in flight, so
   `read_committed` consumers never see records that may yet commit or abort.
+
+### Who may produce
+
+A role needs `SELECT` on `kafgres_topics` and `kafgres_partitions` and `INSERT` on
+`kafgres_markers`. `kafgres_produce()` checks all of these before it writes anything to the log.
+With `kafgres.acls_enabled` on, it also applies `kafgres_acls` to the calling role as
+`User:<role>`, with the client's address as the host (`localhost` over a Unix socket).
+The role needs `WRITE` on the topic, as a Kafka client would. A Postgres superuser is
+not checked against `kafgres_acls`.
+
+```sql
+GRANT SELECT ON kafgres_topics, kafgres_partitions TO order_service;
+GRANT INSERT ON kafgres_markers TO order_service;
+SELECT kafgres_add_acl('User:order_service', 'WRITE', 'TOPIC', 'order-events');
+```
+
+Every other kafgres function is administrative and not executable by `PUBLIC` (topic
+creation and deletion, ACLs, CDC mappings and slots, retention, archiving, restore
+checks, replication), so each needs an explicit `GRANT EXECUTE`. The exceptions are
+`kafgres_produce()` itself and the read-only reports: `kafgres_version()`,
+`kafgres_kafka_version()`, `kafgres_partition_offsets()`, `kafgres_archive_status()`,
+`kafgres_cdc_status()`, `kafgres_cdc_snapshots()` and `kafgres_share_state()`. On an
+install upgraded from 0.2.0 this takes effect at `ALTER EXTENSION kafgres UPDATE`.
+
+### Engines
 
 The feature is available on the segment engine and controlled by
 `kafgres.allow_transactional_produce`. On the table engine it is not supported: offset assignment there
@@ -82,14 +117,14 @@ can be backfilled into the same topic with `kafgres_snapshot_mapping`, which app
 same expressions to the table's current contents, so a backfilled record and a streamed
 one are identical by construction.
 
-Two settings are required: `wal_level = logical`, and `kafgres` in
-`output_plugin_libraries`. Both are set in the Docker image. When one is missing, the
-broker logs a line naming the setting.
+Two settings are required: `wal_level = logical`, and, on a server that has the
+setting, `kafgres` in `output_plugin_libraries`. Both are set in the Docker image. When one is missing, the
+CDC worker logs a line naming the setting.
 
 `kafgres_preview_mapping(mapping, predicate)` renders a mapping over the source table's
 current rows before you enable it. The second argument is a SQL predicate spliced into
 the mapping's `WHERE` clause to select the rows to render, e.g.
-`kafgres_preview_mapping('orders', 'new.id = 10')` — not a key or an op. Columns must be
+`kafgres_preview_mapping('orders-cdc', 'new.id = 10')`, not a key or an op. Columns must be
 qualified (`new.id`, not `id`), because `old` is in scope too. `op` binds as `I`,
 matching what the drain emits. `kafgres_cdc_status()` reports the slot's position and
 the WAL it is retaining.
@@ -112,7 +147,8 @@ injection-prone, and because SQL can do things a template over one row cannot:
   expressible, which is a domain event rather than a row diff.
 - **Masking and redaction** are ordinary expressions.
 - **The outbox pattern is one line.** A mapping over an outbox table is
-  `value => new.payload, key => new.key, topic => new.topic`.
+  `value => new.payload, key => new.key`. A mapping's topic is fixed, so an outbox that
+  routes by a topic column takes one mapping per topic, each filtered on `new.topic`.
 
 ### What a mapping has in scope
 

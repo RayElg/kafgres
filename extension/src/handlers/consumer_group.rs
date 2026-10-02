@@ -84,12 +84,22 @@ struct Member {
     owned: Vec<String>,
     granted: Vec<String>,
     target: Vec<String>,
+    regex: Option<String>,
+    matched: Vec<String>,
+}
+
+impl Member {
+    /// Named topics and the regex's matches together: what the assignor serves.
+    fn wants(&self) -> impl Iterator<Item = &String> {
+        self.subscribed.iter().chain(self.matched.iter())
+    }
 }
 
 fn load_members(group: &str) -> Result<Vec<Member>, HandlerError> {
     Spi::connect(|client| {
         let rows = client.select(
-            "SELECT member_id, member_epoch, subscribed, owned, granted, target
+            "SELECT member_id, member_epoch, subscribed, owned, granted, target,
+                    subscribed_regex, regex_matched
                FROM kafgres_consumer_group_members WHERE group_id = $1 ORDER BY member_id",
             None,
             &[group.into()],
@@ -103,6 +113,8 @@ fn load_members(group: &str) -> Result<Vec<Member>, HandlerError> {
                 owned: r.get::<Vec<String>>(4)?.unwrap_or_default(),
                 granted: r.get::<Vec<String>>(5)?.unwrap_or_default(),
                 target: r.get::<Vec<String>>(6)?.unwrap_or_default(),
+                regex: r.get::<String>(7)?,
+                matched: r.get::<Vec<String>>(8)?.unwrap_or_default(),
             });
         }
         Ok::<_, pgrx::spi::Error>(out)
@@ -113,6 +125,8 @@ fn load_members(group: &str) -> Result<Vec<Member>, HandlerError> {
 struct MemberRow {
     epoch: i32,
     subscribed: Vec<String>,
+    regex: Option<String>,
+    matched: Vec<String>,
     /// Still holding a partition it was told to release, past its own `rebalance.timeout.ms`.
     revoke_expired: bool,
 }
@@ -120,7 +134,7 @@ struct MemberRow {
 fn lookup_member(group: &str, member: &str) -> Result<Option<MemberRow>, HandlerError> {
     Spi::connect(|client| {
         let rows = client.select(
-            "SELECT member_epoch, subscribed,
+            "SELECT member_epoch, subscribed, subscribed_regex, regex_matched,
                     (revoking_since IS NOT NULL
                      AND revoking_since < now() - make_interval(
                              secs => GREATEST(rebalance_timeout_ms, 1000)::double precision / 1000))
@@ -133,7 +147,9 @@ fn lookup_member(group: &str, member: &str) -> Result<Option<MemberRow>, Handler
             return Ok::<_, pgrx::spi::Error>(Some(MemberRow {
                 epoch: r.get::<i32>(1)?.unwrap_or(0),
                 subscribed: r.get::<Vec<String>>(2)?.unwrap_or_default(),
-                revoke_expired: r.get::<bool>(3)?.unwrap_or(false),
+                regex: r.get::<String>(3)?,
+                matched: r.get::<Vec<String>>(4)?.unwrap_or_default(),
+                revoke_expired: r.get::<bool>(5)?.unwrap_or(false),
             }));
         }
         Ok(None)
@@ -209,14 +225,6 @@ pub fn heartbeat(
             ));
         }
     }
-    // Refused, not ignored: a regex silently treated as "subscribed to nothing" is a
-    if req.subscribed_topic_regex.is_some() {
-        return Ok(err_hb(
-            ErrorCode::InvalidRequest,
-            "regex subscriptions require ConsumerGroupHeartbeat v1, which this broker does not advertise",
-        ));
-    }
-
     // Leaving: `-1` is a plain leave, `-2` a static member leaving temporarily. Handled
     if req.member_epoch < 0 {
         if req.member_id.is_empty() {
@@ -380,6 +388,34 @@ pub fn heartbeat(
     };
     let subs: Option<Vec<String>> = req.subscribed_topic_names.clone();
 
+    // v1: `None` keeps the stored pattern, "" drops it. Resolved per heartbeat, under its ACLs.
+    let regex: Option<String> = match req.subscribed_topic_regex.as_deref() {
+        None => existing.as_ref().and_then(|r| r.regex.clone()),
+        Some("") => None,
+        Some(p) => Some(p.to_string()),
+    };
+    let matched: Vec<String> = match &regex {
+        None => Vec::new(),
+        Some(p) => match regex_topics(p, authz)? {
+            Some(names) if names.len() > MAX_SUBSCRIBED_TOPICS => {
+                return Ok(err_hb(
+                    ErrorCode::InvalidRequest,
+                    "the subscribed topic regex matches more topics than a member may subscribe to",
+                ))
+            }
+            Some(names) => names,
+            None => {
+                return Ok(err_hb(
+                    ErrorCode::InvalidRegularExpression,
+                    "the subscribed topic regex does not compile in Postgres's regex dialect",
+                ))
+            }
+        },
+    };
+    let regex_changed = existing
+        .as_ref()
+        .is_some_and(|row| row.regex != regex || row.matched != matched);
+
     // Computed before the upsert overwrites the stored value; afterwards it would compare
     let subscription_changed = match (&subs, &existing) {
         (Some(new), Some(row)) => {
@@ -390,8 +426,16 @@ pub fn heartbeat(
         _ => false,
     };
 
-    upsert_member(&req.group_id, &member_id, req, subs.as_deref(), owned.as_deref())?;
-    if existing.is_none() || subscription_changed {
+    upsert_member(
+        &req.group_id,
+        &member_id,
+        req,
+        subs.as_deref(),
+        owned.as_deref(),
+        regex.as_deref(),
+        &matched,
+    )?;
+    if existing.is_none() || subscription_changed || regex_changed {
         bump_epoch(&req.group_id)?;
     }
 
@@ -532,17 +576,13 @@ fn recompute_target(
     group: &str,
     members: &[Member],
 ) -> Result<BTreeMap<String, BTreeSet<String>>, HandlerError> {
-    let all_names: BTreeSet<String> = members.iter().flat_map(|m| m.subscribed.clone()).collect();
+    let all_names: BTreeSet<String> = members.iter().flat_map(|m| m.wants().cloned()).collect();
     let (partitions_of, oid_of_name) = subscribed_partitions(&all_names)?;
 
     let by_oid: BTreeMap<String, BTreeSet<String>> = members
         .iter()
         .map(|m| {
-            let oids = m
-                .subscribed
-                .iter()
-                .filter_map(|n| oid_of_name.get(n).cloned())
-                .collect();
+            let oids = m.wants().filter_map(|n| oid_of_name.get(n).cloned()).collect();
             (m.member_id.clone(), oids)
         })
         .collect();
@@ -591,13 +631,15 @@ fn upsert_member(
     req: &ConsumerGroupHeartbeatRequest,
     subs: Option<&[String]>,
     owned: Option<&[String]>,
+    regex: Option<&str>,
+    matched: &[String],
 ) -> Result<(), HandlerError> {
     Spi::run_with_args(
         "INSERT INTO kafgres_consumer_group_members
               (group_id, member_id, instance_id, rack_id, rebalance_timeout_ms,
-               subscribed, owned, static_departed, last_seen)
+               subscribed, owned, static_departed, last_seen, subscribed_regex, regex_matched)
          VALUES ($1, $2, $3, $4, COALESCE(NULLIF($5, -1), 300000),
-                 COALESCE($6::text[], '{}'), COALESCE($7::text[], '{}'), false, now())
+                 COALESCE($6::text[], '{}'), COALESCE($7::text[], '{}'), false, now(), $8, $9)
          ON CONFLICT (group_id, member_id) DO UPDATE SET
               instance_id = COALESCE($3, kafgres_consumer_group_members.instance_id),
               rack_id = COALESCE($4, kafgres_consumer_group_members.rack_id),
@@ -606,7 +648,9 @@ fn upsert_member(
               subscribed = COALESCE($6::text[], kafgres_consumer_group_members.subscribed),
               owned = COALESCE($7::text[], kafgres_consumer_group_members.owned),
               static_departed = false,
-              last_seen = now()",
+              last_seen = now(),
+              subscribed_regex = $8,
+              regex_matched = $9",
         &[
             group.into(),
             member.into(),
@@ -615,6 +659,8 @@ fn upsert_member(
             req.rebalance_timeout_ms.into(),
             subs.map(|s| s.to_vec()).into(),
             owned.map(|o| o.to_vec()).into(),
+            regex.into(),
+            matched.to_vec().into(),
         ],
     )
     .map_err(|e| HandlerError::Internal(e.to_string()))?;
@@ -660,6 +706,71 @@ pub fn expire_members() -> Result<usize, HandlerError> {
         }
     }
     Ok(seen.len())
+}
+
+/// Whether `pattern` compiles; only SQLSTATE 2201B means invalid, other errors propagate.
+fn regex_compiles(pattern: &str) -> Result<bool, HandlerError> {
+    let outcome = crate::dbtx::atomically_coded(
+        || {
+            Spi::get_one_with_args::<bool>("SELECT ''::text ~ $1", &[pattern.into()])
+                .map(|_| ())
+                .map_err(|e| (e.to_string(), None))
+        },
+        |message, code| (message.to_string(), Some(code)),
+    );
+    match outcome {
+        Ok(()) => Ok(true),
+        Err((_, Some(pgrx::PgSqlErrorCode::ERRCODE_INVALID_REGULAR_EXPRESSION))) => Ok(false),
+        Err((m, _)) => Err(HandlerError::Internal(m)),
+    }
+}
+
+/// Topics `pattern` matches as a whole name, less those this member may not describe;
+/// `None` if it does not compile.
+fn regex_topics(
+    pattern: &str,
+    authz: &crate::acl::Authz,
+) -> Result<Option<Vec<String>>, HandlerError> {
+    // Compiled alone first: `a)|(.*` compiles once wrapped and would escape the anchors.
+    if !regex_compiles(pattern)? {
+        return Ok(None);
+    }
+    // Anchored. Leading options such as `(?i)` are valid only first, so they precede `^`.
+    let (options, body) = match pattern.strip_prefix("(?").and_then(|r| r.split_once(')')) {
+        Some((flags, rest)) if !flags.is_empty() && flags.chars().all(|c| c.is_ascii_alphabetic()) => {
+            (&pattern[..flags.len() + 3], rest)
+        }
+        _ => ("", pattern),
+    };
+    let anchored = format!("{options}^(?:{body})$");
+    if !regex_compiles(&anchored)? {
+        return Ok(None);
+    }
+    let names: Vec<String> = Spi::connect(|client| {
+        let rows = client.select(
+            "SELECT name FROM kafgres_topics WHERE name ~ $1 ORDER BY name",
+            None,
+            &[anchored.as_str().into()],
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            if let Some(n) = r.get::<String>(1)? {
+                out.push(n);
+            }
+        }
+        Ok::<_, pgrx::spi::Error>(out)
+    })
+    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    Ok(Some(
+        names
+            .into_iter()
+            .filter(|n| {
+                authz
+                    .check(crate::acl::Operation::Describe, crate::acl::ResourceType::Topic, n)
+                    .is_ok()
+            })
+            .collect(),
+    ))
 }
 
 /// Kafka's member ids are UUIDs. Only uniqueness matters; the format is what tooling expects.
@@ -789,6 +900,7 @@ pub fn describe(
                 member_id: m.member_id.clone(),
                 member_epoch: m.epoch,
                 subscribed_topic_names: m.subscribed.clone(),
+                subscribed_topic_regex: m.regex.clone(),
                 // What the member reports holding, not what it was granted: `--describe`
                 assignment: to_assignment(&m.owned, &uuids),
                 target_assignment: to_assignment(&m.target, &uuids),

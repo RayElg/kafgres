@@ -94,12 +94,16 @@ pub struct Slot {
     segment_bytes: i64,
     /// Bumped when a segment's byte layout changes: per-process seek hints name byte positions and must drop.
     layout_generation: u64,
-    /// Where the next compaction pass starts; wraps so boundary-crossing supersessions are caught.
+    /// Start of the dirty section: the first offset no finished compaction plan has mapped.
     compact_cursor: i64,
     /// Cached here because epoch and `next_offset` must be decided in one critical section, and
     leader_epoch: i32,
     /// Max timestamp over **every** batch: an index entry `(ts, pos)` claims nothing before `pos`
     max_timestamp_so_far: i64,
+    /// Last offset of the batch that set `max_timestamp_so_far`, or `-1`.
+    max_timestamp_offset: i64,
+    /// Timestamp of the active segment's last time-index entry; entries only grow.
+    time_indexed_ts: i64,
 }
 
 impl Default for Slot {
@@ -119,6 +123,8 @@ impl Default for Slot {
             compact_cursor: 0,
             leader_epoch: -1,
             max_timestamp_so_far: i64::MIN,
+            max_timestamp_offset: -1,
+            time_indexed_ts: i64::MIN,
         }
     }
 }
@@ -201,9 +207,61 @@ struct ActiveSeg {
     timeindex: Option<Vfd>,
     /// First byte of the log not yet handed to `FileWriteback`.
     writeback_from: u64,
+    /// The partition directory was fsynced since this segment was opened.
+    dir_synced: bool,
 }
 
 static ACTIVE: Mutex<Option<HashMap<(TopicId, i32), ActiveSeg>>> = Mutex::new(None);
+
+impl ActiveSeg {
+    /// Fsync every directory up to the log root's parent, once per segment: a new entry is
+    /// durable only once its directory is.
+    fn sync_dir(&mut self, topic: TopicId, partition: i32) -> StoreResult<()> {
+        if !self.dir_synced {
+            let root = log_root();
+            let partition_dir = root.join(partition_dir(topic, partition));
+            let mut dirs = vec![partition_dir.clone()];
+            dirs.extend(partition_dir.parent().map(Path::to_path_buf));
+            dirs.push(root.clone());
+            dirs.extend(root.parent().map(Path::to_path_buf));
+            for dir in dirs {
+                sync_dir(&dir)?;
+            }
+            self.dir_synced = true;
+        }
+        Ok(())
+    }
+}
+
+/// fsync a directory as Postgres's `fsync_fname` does: a directory that cannot be opened
+/// (EISDIR, EACCES) or fsynced (EBADF, EINVAL) is skipped; another open failure is retried;
+/// another fsync failure is a PANIC unless `data_sync_retry` is on.
+fn sync_dir(path: &Path) -> StoreResult<()> {
+    let dir = match std::fs::File::open(path) {
+        Ok(d) => d,
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EISDIR | libc::EACCES)) => return Ok(()),
+        Err(e) => return Err(StoreError::Io(format!("open of directory {}: {e}", path.display()))),
+    };
+    let Err(err) = dir.sync_all() else {
+        return Ok(());
+    };
+    if matches!(err.raw_os_error(), Some(libc::EBADF | libc::EINVAL)) {
+        return Ok(());
+    }
+    let retriable = err.raw_os_error() == Some(libc::ENOENT)
+        || unsafe { pgrx::pg_sys::data_sync_elevel(pgrx::PgLogLevel::ERROR as i32) }
+            < pgrx::PgLogLevel::PANIC as i32;
+    if !retriable {
+        pgrx::ereport!(
+            pgrx::PgLogLevel::PANIC,
+            pgrx::PgSqlErrorCode::ERRCODE_DATA_CORRUPTED,
+            format!("kafgres: fsync failed on directory {}: {err}", path.display()),
+            "Retrying fsync is not safe: the kernel may have already discarded the dirty \
+             metadata, so a second call can report success having written nothing."
+        );
+    }
+    Err(StoreError::Io(format!("fsync of directory {}: {err}", path.display())))
+}
 
 /// Drop this process's cached descriptors wherever the files underneath them can go.
 /// Append one entry to a lazily-opened index file; failures are logged and swallowed, since
@@ -229,6 +287,54 @@ fn append_index_entry(slot: &mut Option<Vfd>, path: &Path, entry: &[u8], what: &
     if let Err(e) = vfd.write_all_at(entry, at) {
         log!("kafgres: could not write {what} entry (harmless, costs a scan): {e}");
     }
+}
+
+/// Forget open files, plans and hints of partitions another process dropped: the dropper
+/// evicts only its own, and deleted segments held open keep their disk space.
+pub fn forget_dropped() -> StoreResult<usize> {
+    let mut held: Vec<(TopicId, i32)> = Vec::new();
+    if let Some(map) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        held.extend(map.keys().copied());
+    }
+    if let Some(map) = PLANS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        held.extend(map.keys().copied());
+    }
+    if let Some(map) = HINTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        held.extend(map.keys().copied());
+    }
+    held.sort_unstable();
+    held.dedup();
+    if held.is_empty() {
+        return Ok(0);
+    }
+    let topics: Vec<i32> = held.iter().map(|(t, _)| *t as i32).collect();
+    let live: std::collections::HashSet<(TopicId, i32)> = Spi::connect(|client| {
+        let rows = client.select(
+            "SELECT topic_id::int, partition FROM kafgres_partitions
+              WHERE topic_id = ANY($1::int[]::oid[])",
+            None,
+            &[topics.into()],
+        )?;
+        let mut out = std::collections::HashSet::new();
+        for r in rows {
+            if let (Some(t), Some(p)) = (r.get::<i32>(1)?, r.get::<i32>(2)?) {
+                out.insert((t as TopicId, p));
+            }
+        }
+        Ok::<_, pgrx::spi::Error>(out)
+    })
+    .map_err(|e| StoreError::Io(e.to_string()))?;
+    let gone: Vec<(TopicId, i32)> = held.into_iter().filter(|k| !live.contains(k)).collect();
+    for &(topic, partition) in &gone {
+        evict_active(topic, partition);
+        if let Some(plans) = PLANS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            plans.remove(&(topic, partition));
+        }
+        if let Some(map) = HINTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            map.remove(&(topic, partition));
+        }
+    }
+    Ok(gone.len())
 }
 
 fn evict_active(topic: TopicId, partition: i32) {
@@ -269,6 +375,7 @@ fn with_active<T>(
                 index: None,
                 timeindex: None,
                 writeback_from,
+                dir_synced: false,
             },
         );
     }
@@ -322,7 +429,9 @@ fn slot_for(slots: &mut [Slot; SLOTS_PER_SHARD], topic: TopicId, partition: i32)
         compact_cursor: 0,
         leader_epoch: -1,
         // From the recovery just scanned: `i64::MIN` would claim an empty-timestamp segment.
-        max_timestamp_so_far: recovered.max_timestamp,
+        max_timestamp_so_far: recovered.max_timestamp.0,
+        max_timestamp_offset: recovered.max_timestamp.1,
+        time_indexed_ts: recovered.time_indexed_ts,
     };
     HINTS
         .lock()
@@ -337,7 +446,76 @@ struct Recovered {
     active_base: i64,
     active_bytes: u64,
     index: HashMap<i64, Vec<(i64, u64)>>,
-    max_timestamp: i64,
+    /// The active segment's max timestamp and the last offset of the batch holding it.
+    max_timestamp: (i64, i64),
+    time_indexed_ts: i64,
+}
+
+/// One `FileWrite`, returning bytes written or -1. Signature differs by version:
+/// `char *`/`int` through 15, `void *`/`size_t` in 16, `FileWriteV` (iovec) from 17.
+#[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+unsafe fn file_write(file: pgrx::pg_sys::File, buf: &[u8], offset: u64, wait: u32) -> isize {
+    let len = buf.len().min(i32::MAX as usize) as i32;
+    pgrx::pg_sys::FileWrite(
+        file,
+        buf.as_ptr() as *mut core::ffi::c_char,
+        len,
+        offset as pgrx::pg_sys::off_t,
+        wait,
+    ) as isize
+}
+
+#[cfg(feature = "pg16")]
+unsafe fn file_write(file: pgrx::pg_sys::File, buf: &[u8], offset: u64, wait: u32) -> isize {
+    pgrx::pg_sys::FileWrite(
+        file,
+        buf.as_ptr() as *const core::ffi::c_void,
+        buf.len(),
+        offset as pgrx::pg_sys::off_t,
+        wait,
+    ) as isize
+}
+
+#[cfg(any(feature = "pg17", feature = "pg18"))]
+unsafe fn file_write(file: pgrx::pg_sys::File, buf: &[u8], offset: u64, wait: u32) -> isize {
+    let iov = pgrx::pg_sys::iovec {
+        iov_base: buf.as_ptr() as *mut core::ffi::c_void,
+        iov_len: buf.len(),
+    };
+    pgrx::pg_sys::FileWriteV(file, &iov, 1, offset as pgrx::pg_sys::off_t, wait)
+}
+
+/// One `FileRead`, returning bytes read, 0 at EOF, or -1. Same version split as `file_write`.
+#[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+unsafe fn file_read(file: pgrx::pg_sys::File, buf: &mut [u8], offset: u64, wait: u32) -> isize {
+    let len = buf.len().min(i32::MAX as usize) as i32;
+    pgrx::pg_sys::FileRead(
+        file,
+        buf.as_mut_ptr() as *mut core::ffi::c_char,
+        len,
+        offset as pgrx::pg_sys::off_t,
+        wait,
+    ) as isize
+}
+
+#[cfg(feature = "pg16")]
+unsafe fn file_read(file: pgrx::pg_sys::File, buf: &mut [u8], offset: u64, wait: u32) -> isize {
+    pgrx::pg_sys::FileRead(
+        file,
+        buf.as_mut_ptr() as *mut core::ffi::c_void,
+        buf.len(),
+        offset as pgrx::pg_sys::off_t,
+        wait,
+    ) as isize
+}
+
+#[cfg(any(feature = "pg17", feature = "pg18"))]
+unsafe fn file_read(file: pgrx::pg_sys::File, buf: &mut [u8], offset: u64, wait: u32) -> isize {
+    let iov = pgrx::pg_sys::iovec {
+        iov_base: buf.as_mut_ptr() as *mut core::ffi::c_void,
+        iov_len: buf.len(),
+    };
+    pgrx::pg_sys::FileReadV(file, &iov, 1, offset as pgrx::pg_sys::off_t, wait)
 }
 
 /// A file opened through Postgres's VFD layer — never raw `open()`: `max_files_per_process`
@@ -377,11 +555,10 @@ impl Vfd {
     fn write_all_at(&mut self, mut buf: &[u8], mut offset: u64) -> StoreResult<()> {
         while !buf.is_empty() {
             let n = unsafe {
-                pgrx::pg_sys::FileWrite(
+                file_write(
                     self.file,
-                    buf.as_ptr() as *const core::ffi::c_void,
-                    buf.len(),
-                    offset as pgrx::pg_sys::off_t,
+                    buf,
+                    offset,
                     pgrx::pg_sys::WaitEventIO::WAIT_EVENT_DATA_FILE_WRITE as u32,
                 )
             };
@@ -399,11 +576,10 @@ impl Vfd {
         let mut total = 0;
         while total < buf.len() {
             let n = unsafe {
-                pgrx::pg_sys::FileRead(
+                file_read(
                     self.file,
-                    buf[total..].as_mut_ptr() as *mut core::ffi::c_void,
-                    buf.len() - total,
-                    (offset + total as u64) as pgrx::pg_sys::off_t,
+                    &mut buf[total..],
+                    offset + total as u64,
                     pgrx::pg_sys::WaitEventIO::WAIT_EVENT_DATA_FILE_READ as u32,
                 )
             };
@@ -433,15 +609,28 @@ impl Vfd {
     }
 
     /// PANIC on fsync failure, deliberately — do not soften into a retry: Linux drops the dirty
-    fn sync(&self) {
+    /// pages, so a second call can report success having written nothing. Two cases instead
+    /// get an ordinary error, matching Postgres's own `sync.c:ProcessSyncRequests` policy:
+    ///
+    /// - `ENOENT`: the reopen `FileSync` does on an LRU-closed VFD failed. A segment
+    ///   unlinked under a cached handle is a storage error, not a kernel that lost data.
+    /// - `data_sync_retry = on`: the operator says their kernel keeps dirty pages across a
+    ///   failed fsync, so `data_sync_elevel` returns ERROR rather than PANIC.
+    fn sync(&self) -> StoreResult<()> {
         let rc = unsafe {
             pgrx::pg_sys::FileSync(
                 self.file,
                 pgrx::pg_sys::WaitEventIO::WAIT_EVENT_DATA_FILE_SYNC as u32,
             )
         };
-        if rc < 0 {
-            let err = std::io::Error::last_os_error();
+        if rc >= 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        let retriable = err.raw_os_error() == Some(libc::ENOENT)
+            || unsafe { pgrx::pg_sys::data_sync_elevel(pgrx::PgLogLevel::ERROR as i32) }
+                < pgrx::PgLogLevel::PANIC as i32;
+        if !retriable {
             pgrx::ereport!(
                 pgrx::PgLogLevel::PANIC,
                 pgrx::PgSqlErrorCode::ERRCODE_DATA_CORRUPTED,
@@ -450,6 +639,10 @@ impl Vfd {
                  dirty pages, so a second call can report success having written nothing."
             );
         }
+        Err(StoreError::Io(format!(
+            "FileSync on {}: {err}",
+            self.path.display()
+        )))
     }
 
     /// Hand a written range to the kernel for writeback without waiting for it.
@@ -629,32 +822,226 @@ impl SegmentStore {
     }
 }
 
-const MAX_COMPACT_SEGMENTS: usize = 16;
-const MAX_COMPACT_BYTES: usize = 32 * 1024 * 1024;
+/// Keys one offset map holds, about 50 MiB.
+const MAX_COMPACT_KEYS: usize = 1 << 20;
+
+/// A compaction in progress: an offset map over the dirty section, then a rewrite of every
+/// cleanable segment up to the map's end. Kept between passes; valid while the layout
+/// generation is unchanged.
+struct CleanPlan {
+    map: kafgres_codec::compaction::OffsetMap,
+    /// The cursor this plan started from.
+    dirty_from: i64,
+    /// Where mapping resumes, as (segment base, byte position); `None` once it is done.
+    mapping_at: Option<(i64, u64)>,
+    /// Next segment base to rewrite.
+    rewrite_from: i64,
+    /// The segment being rewritten, when a pass ran out of budget inside it.
+    rewriting: Option<Rewrite>,
+    generation: u64,
+    /// A rewrite did not land: keep tombstones for the rest of the plan (the value one
+    /// deletes may still be on disk) and leave the cursor where it was.
+    abandoned: bool,
+    /// The sweep rotation a pass last advanced it in.
+    touched: u64,
+}
+
+/// One segment's rewrite, resumable at any batch: a scan for the first batch that loses a
+/// record, then the write of the replacement. Both are charged to the pass budget.
+struct Rewrite {
+    info: SegInfo,
+    pos: u64,
+    written: u64,
+    removed: u64,
+    writing: bool,
+    /// This process's replacement file, removed when the rewrite is dropped unfinished.
+    tmp: PathBuf,
+}
+
+impl Drop for Rewrite {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.tmp);
+    }
+}
+
+static PLANS: Mutex<Option<HashMap<(TopicId, i32), CleanPlan>>> = Mutex::new(None);
+
+enum Cleaned {
+    Unchanged,
+    /// Records removed, and the new layout generation.
+    Swapped(u64, u64),
+    Abandoned,
+}
+
+/// A sealed segment read one batch at a time.
+struct BatchReader {
+    vfd: Vfd,
+    size: u64,
+    pos: u64,
+}
+
+impl BatchReader {
+    /// `None` when the segment was reclaimed since it was listed.
+    fn open(topic: TopicId, partition: i32, base: i64, pos: u64) -> StoreResult<Option<BatchReader>> {
+        let path = data_path(&segment_path(topic, partition, base, "log"));
+        let Ok(vfd) = Vfd::open(&path, false) else {
+            return Ok(None);
+        };
+        let size = vfd.size()?;
+        Ok(Some(BatchReader { vfd, size, pos }))
+    }
+
+    /// The next batch and its position. A sealed segment was fsynced at roll, so a partial
+    /// batch is corruption.
+    fn next(&mut self) -> StoreResult<Option<(u64, RecordBatch)>> {
+        if self.pos >= self.size {
+            return Ok(None);
+        }
+        let head = records::LENGTH_OFFSET + 4;
+        let mut prefix = [0u8; records::LENGTH_OFFSET + 4];
+        if self.pos + head as u64 > self.size || self.vfd.read_at(&mut prefix, self.pos)? != head {
+            return Err(self.corrupt("a batch header runs past the end"));
+        }
+        let length = i32::from_be_bytes(
+            prefix[records::LENGTH_OFFSET..head].try_into().expect("4 bytes"),
+        );
+        let total = head as u64 + length.max(0) as u64;
+        if length <= 0 || self.pos + total > self.size {
+            return Err(self.corrupt("a batch length runs past the end"));
+        }
+        let mut whole = vec![0u8; total as usize];
+        if self.vfd.read_at(&mut whole, self.pos)? != whole.len() {
+            return Err(self.corrupt("a short read"));
+        }
+        let view = RecordBatch::new(kafgres_codec::bytes::Bytes::from(whole))
+            .map_err(|e| self.corrupt(&format!("{e:?}")))?;
+        let at = self.pos;
+        self.pos += total;
+        Ok(Some((at, view)))
+    }
+
+    fn corrupt(&self, what: &str) -> StoreError {
+        StoreError::Io(format!("{} at {}: {what}", self.vfd.path.display(), self.pos))
+    }
+}
 
 impl SegmentStore {
-    /// Verify nothing moved, then replace the segment. Runs under the shard lock; the re-stat
+    /// Continue `rw` until the segment is done, or `None` when `budget` runs out.
+    fn clean_step(
+        topic: TopicId,
+        partition: i32,
+        rw: &mut Rewrite,
+        map: &kafgres_codec::compaction::OffsetMap,
+        judge: &super::Judge,
+        generation: u64,
+        budget: &mut i64,
+    ) -> StoreResult<Option<Cleaned>> {
+        use kafgres_codec::compaction::{clean_batch, rebuild_batch, KeptRecord};
+
+        // What survives of a batch, `None` for all of it; an aborted batch goes whole.
+        let judge_batch = |view: &RecordBatch| -> StoreResult<Option<Vec<KeptRecord>>> {
+            if view.base_offset() > map.end {
+                return Ok(None);
+            }
+            if !judge.committed(view)? {
+                return Ok(Some(Vec::new()));
+            }
+            clean_batch(view, map, &|o| judge.tombstone_goes(o))
+                .map_err(|e| StoreError::Io(format!("compaction records: {e:?}")))
+        };
+
+        let tmp_path = compacting_path(topic, partition, rw.info.base);
+        let Some(mut reader) = BatchReader::open(topic, partition, rw.info.base, rw.pos)? else {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Ok(Some(Cleaned::Unchanged));
+        };
+
+        if !rw.writing {
+            loop {
+                if *budget <= 0 {
+                    rw.pos = reader.pos;
+                    return Ok(None);
+                }
+                let Some((_, view)) = reader.next()? else {
+                    return Ok(Some(Cleaned::Unchanged));
+                };
+                *budget -= view.len() as i64;
+                if view.base_offset() > map.end {
+                    return Ok(Some(Cleaned::Unchanged));
+                }
+                if judge_batch(&view)?.is_some() {
+                    break;
+                }
+            }
+            rw.writing = true;
+            rw.pos = 0;
+            let tmp = Vfd::open(&tmp_path, true)?;
+            tmp.truncate(0)?;
+            reader = match BatchReader::open(topic, partition, rw.info.base, 0)? {
+                Some(r) => r,
+                None => return Ok(Some(Cleaned::Unchanged)),
+            };
+        }
+
+        let mut out = Vfd::open(&tmp_path, false)?;
+        let written_from = rw.written;
+        loop {
+            if *budget <= 0 {
+                rw.pos = reader.pos;
+                // Start writeback now so the final fsync has little left.
+                out.writeback(written_from, rw.written - written_from);
+                return Ok(None);
+            }
+            let Some((_, view)) = reader.next()? else {
+                break;
+            };
+            *budget -= view.len() as i64;
+            match judge_batch(&view)? {
+                None => {
+                    out.write_all_at(view.as_bytes(), rw.written)?;
+                    rw.written += view.len() as u64;
+                }
+                Some(kept) => {
+                    rw.removed +=
+                        (view.record_count().max(0) as u64).saturating_sub(kept.len() as u64);
+                    if let Some(bytes) = rebuild_batch(&view, &kept) {
+                        out.write_all_at(&bytes, rw.written)?;
+                        rw.written += bytes.len() as u64;
+                    }
+                }
+            }
+        }
+        out.sync()?;
+        drop(out);
+        Ok(Some(
+            match Self::swap_segment(topic, partition, &rw.info, rw.written == 0, generation)? {
+                Some(generation) => Cleaned::Swapped(rw.removed, generation),
+                None => Cleaned::Abandoned,
+            },
+        ))
+    }
+
+    /// Under the shard lock, replace the segment with the rewrite, or remove it when
+    /// `empty`. Refused (`None`) if the segment or the layout generation moved.
     fn swap_segment(
         topic: TopicId,
         partition: i32,
         info: &SegInfo,
-        contents: &[u8],
-    ) -> StoreResult<bool> {
+        empty: bool,
+        generation: u64,
+    ) -> StoreResult<Option<u64>> {
         let final_path = data_path(&segment_path(topic, partition, info.base, "log"));
-        let tmp_path = data_path(&segment_path(topic, partition, info.base, "log.compacting"));
-
-        if !contents.is_empty() {
-            let mut vfd = Vfd::open(&tmp_path, true)?;
-            vfd.truncate(0)?;
-            vfd.write_all_at(contents, 0)?;
-            vfd.sync();
-        }
+        let tmp_path = compacting_path(topic, partition, info.base);
 
         let swapped = Self::with_slot(topic, partition, |st, hints| {
+            // Any other layout change, a truncation included, voids the map.
+            if st.layout_generation != generation {
+                return Ok(None);
+            }
             let current = match std::fs::metadata(&final_path) {
                 Ok(m) => m,
                 // Reclaimed while we were rebuilding it; that is the better outcome.
-                Err(_) => return Ok(false),
+                Err(_) => return Ok(None),
             };
             let mtime = current
                 .modified()
@@ -663,16 +1050,23 @@ impl SegmentStore {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             if current.len() != info.bytes || mtime != info.mtime_ms {
-                return Ok(false);
+                return Ok(None);
             }
-            // Never the active segment: a roll since the window was chosen would make this one active,
+            // Never the active segment, which a roll since the listing can make it.
             if st.active_base == info.base {
-                return Ok(false);
+                return Ok(None);
             }
 
-            if contents.is_empty() {
+            // Indexes first, as in Kafka: a crash must not leave old positions by the new log.
+            for ext in ["index", "timeindex"] {
+                let _ = std::fs::remove_file(data_path(&segment_path(
+                    topic, partition, info.base, ext,
+                )));
+            }
+            if empty {
                 let _ = std::fs::remove_file(&final_path);
             } else {
+                // Keep the mtime: retention and the lag gate read it as the records' age.
                 let original = std::time::UNIX_EPOCH
                     + std::time::Duration::from_millis(info.mtime_ms.max(0) as u64);
                 if let Ok(f) = std::fs::File::options().write(true).open(&tmp_path) {
@@ -681,34 +1075,215 @@ impl SegmentStore {
                 std::fs::rename(&tmp_path, &final_path).map_err(|e| {
                     StoreError::Io(format!("swapping {}: {e}", final_path.display()))
                 })?;
-                // fsync the directory after the rename, as Postgres's `durable_rename` does: the rename
-                if let Some(dir) = final_path.parent() {
-                    if let Ok(d) = std::fs::File::open(dir) {
-                        let _ = d.sync_all();
-                    }
-                }
-            }
-
-            for ext in ["index", "timeindex"] {
-                let _ = std::fs::remove_file(data_path(&segment_path(
-                    topic, partition, info.base, ext,
-                )));
             }
             hints.remove(&info.base);
             // And the cross-process half: every other backend drops its hints for this
+            // partition when it next sees the generation move.
             st.layout_generation = st.layout_generation.wrapping_add(1);
-            Ok(true)
+            // One directory fsync for the unlinks and the rename, as `durable_rename` does.
+            if let Some(dir) = final_path.parent() {
+                if let Err(e) = sync_dir(dir) {
+                    pgrx::log!("kafgres: {e}");
+                }
+            }
+            Ok(Some(st.layout_generation))
         })?;
 
-        if !swapped {
+        if swapped.is_none() || empty {
             let _ = std::fs::remove_file(&tmp_path);
-        } else {
+        }
+        if swapped.is_some() {
             // The archived row vouches for pre-compaction bytes; drop it so the archiver re-ships.
             if let Err(e) = crate::archive::forget_segment(topic, partition, info.base) {
                 pgrx::log!("kafgres: could not clear the archive row after compaction: {e}");
             }
         }
         Ok(swapped)
+    }
+
+    /// One bounded pass of this partition's plan, starting one if warranted. Nothing at or
+    /// above `stable_end` (the LSO) is mapped. Returns records removed.
+    fn compact_pass(topic: TopicId, partition: i32, stable_end: i64) -> StoreResult<u64> {
+        let limits = crate::config::compaction_limits(topic);
+        let now = now_millis();
+        let lag_cutoff = now - limits.min_compaction_lag_ms;
+
+        // Cleanable: sealed and past the lag, paired with the next segment's base.
+        let infos = Self::segment_infos(topic, partition)?;
+        let sealed = infos.len().saturating_sub(1);
+        let cleanable: Vec<(SegInfo, i64)> = (0..sealed)
+            .take_while(|&i| infos[i].mtime_ms <= lag_cutoff)
+            .map(|i| (infos[i].clone(), infos[i + 1].base))
+            .collect();
+        if cleanable.is_empty() {
+            return Ok(0);
+        }
+
+        let (generation, cursor, log_end) = Self::with_slot(topic, partition, |st, _| {
+            Ok((st.layout_generation, st.compact_cursor, st.next_offset))
+        })?;
+        // A truncation can leave the cursor above the log end.
+        let dirty_from = if cursor > log_end { 0 } else { cursor };
+
+        let mut plans = PLANS.lock().unwrap_or_else(|e| e.into_inner());
+        let plans = plans.get_or_insert_with(HashMap::new);
+        let mut plan = match plans.remove(&(topic, partition)) {
+            Some(p) if p.generation == generation => p,
+            _ => {
+                // Kafka's default `min.cleanable.dirty.ratio` of 0.5, fixed: a plan reads the
+                // whole cleanable log up to its map's end.
+                let (clean, dirty) = cleanable.iter().fold((0u64, 0u64), |(c, d), (s, end)| {
+                    if *end <= dirty_from { (c + s.bytes, d) } else { (c, d + s.bytes) }
+                });
+                if dirty == 0 || dirty < clean || !super::compaction_budget_left() {
+                    return Ok(0);
+                }
+                if plans.len() >= super::MAX_PLANS {
+                    let idle = plans
+                        .iter()
+                        .filter(|(_, p)| super::plan_is_idle(p.touched))
+                        .min_by_key(|(_, p)| p.touched)
+                        .map(|(k, _)| *k);
+                    match idle {
+                        Some(k) => drop(plans.remove(&k)),
+                        None => return Ok(0),
+                    }
+                }
+                let first = cleanable
+                    .iter()
+                    .find(|(_, end)| *end > dirty_from)
+                    .map(|(s, _)| (s.base, 0));
+                CleanPlan {
+                    map: Default::default(),
+                    dirty_from,
+                    mapping_at: first,
+                    rewrite_from: i64::MIN,
+                    rewriting: None,
+                    generation,
+                    abandoned: false,
+                    touched: super::rotation(),
+                }
+            }
+        };
+        let mut judge = super::Judge::new(topic, partition, plan.dirty_from, limits.delete_retention_ms)?;
+
+        let mut budget = super::compaction_budget();
+        let mut removed = 0u64;
+
+        if let Some((from, pos)) = plan.mapping_at {
+            let mut resume = None;
+            'segments: for (seg, _) in cleanable.iter().filter(|(s, _)| s.base >= from) {
+                let start = if seg.base == from { pos } else { 0 };
+                let Some(mut reader) = BatchReader::open(topic, partition, seg.base, start)? else {
+                    continue;
+                };
+                loop {
+                    if budget <= 0 {
+                        resume = Some((seg.base, reader.pos));
+                        break 'segments;
+                    }
+                    let view = match reader.next() {
+                        Ok(Some((_, v))) => v,
+                        Ok(None) => break,
+                        Err(e) => {
+                            // Keep what was mapped; the cursor stays.
+                            pgrx::log!("kafgres: compaction stopped mapping: {e}");
+                            plan.abandoned = true;
+                            break 'segments;
+                        }
+                    };
+                    budget -= view.len() as i64;
+                    if view.last_offset() < plan.dirty_from {
+                        continue;
+                    }
+                    if view.last_offset() >= stable_end {
+                        break 'segments;
+                    }
+                    if !judge.committed(&view)? {
+                        plan.map.end = plan.map.end.max(view.last_offset());
+                        continue;
+                    }
+                    match plan.map.add_batch(&view, MAX_COMPACT_KEYS) {
+                        Ok(true) => {}
+                        Ok(false) => break 'segments,
+                        Err(e) => {
+                            pgrx::log!("kafgres: compaction stopped mapping: {}", reader.corrupt(&format!("{e:?}")));
+                            plan.abandoned = true;
+                            break 'segments;
+                        }
+                    }
+                }
+            }
+            plan.mapping_at = resume;
+        }
+
+        if plan.mapping_at.is_none() {
+            let finished = loop {
+                if plan.rewriting.is_none() {
+                    let (from, end) = (plan.rewrite_from, plan.map.end);
+                    match cleanable.iter().find(|(s, _)| s.base >= from && s.base <= end) {
+                        None => break true,
+                        Some((s, _)) => {
+                            plan.rewriting = Some(Rewrite {
+                                info: s.clone(),
+                                pos: 0,
+                                written: 0,
+                                removed: 0,
+                                writing: false,
+                                tmp: compacting_path(topic, partition, s.base),
+                            })
+                        }
+                    }
+                }
+                if budget <= 0 {
+                    break false;
+                }
+                judge.keep_tombstones = plan.abandoned;
+                let rw = plan.rewriting.as_mut().expect("set above");
+                let step = Self::clean_step(
+                    topic, partition, rw, &plan.map, &judge, plan.generation, &mut budget,
+                );
+                let base = rw.info.base;
+                match step {
+                    Ok(None) => break false,
+                    Ok(Some(Cleaned::Unchanged)) => {}
+                    Ok(Some(Cleaned::Swapped(n, generation))) => {
+                        removed += n;
+                        plan.generation = generation;
+                    }
+                    Ok(Some(Cleaned::Abandoned)) => plan.abandoned = true,
+                    Err(e) => {
+                        pgrx::log!("kafgres: compaction skipped segment {base}: {e}");
+                        plan.abandoned = true;
+                    }
+                }
+                plan.rewriting = None;
+                plan.rewrite_from = base + 1;
+            };
+            if finished {
+                if !plan.abandoned && plan.map.end >= 0 {
+                    let (from, to) = (plan.dirty_from, plan.map.end + 1);
+                    let moved = Self::with_slot(topic, partition, |st, _| {
+                        // Only if nothing else moved it since the plan started.
+                        if st.compact_cursor == from || st.compact_cursor > st.next_offset {
+                            st.compact_cursor = to;
+                            return Ok(true);
+                        }
+                        Ok(false)
+                    })?;
+                    if moved {
+                        super::record_cleaned(topic, partition, plan.map.end, now_millis());
+                    }
+                }
+                super::spend_compaction_budget(budget);
+                return Ok(removed);
+            }
+        }
+
+        super::spend_compaction_budget(budget);
+        plan.touched = super::rotation();
+        plans.insert((topic, partition), plan);
+        Ok(removed)
     }
 }
 
@@ -741,13 +1316,15 @@ fn now_millis() -> i64 {
 const INDEX_ENTRY: usize = 8;
 
 impl SegmentStore {
-    /// Where to start scanning for the first batch at or after `timestamp`: the last indexed
+    /// Where to start scanning for the first batch at or after `timestamp`. Entries are
+    /// Kafka's `(max timestamp so far, relative offset)`: nothing up to the last entry below
+    /// `timestamp` can match, and the offset index gives that offset's position.
     fn time_index_seek(
         topic: TopicId,
         partition: i32,
         base: i64,
-        data_end: u64,
         timestamp: i64,
+        index: Option<&Vec<(i64, u64)>>,
     ) -> u64 {
         let path = data_path(&segment_path(topic, partition, base, "timeindex"));
         let vfd = match Vfd::open(&path, false) {
@@ -755,7 +1332,7 @@ impl SegmentStore {
             Err(_) => return 0,
         };
         let size = vfd.size().unwrap_or(0);
-        let mut start = 0u64;
+        let mut below: Option<i64> = None;
         let mut buf = [0u8; TIME_INDEX_ENTRY];
         let mut at = 0u64;
         while at + TIME_INDEX_ENTRY as u64 <= size {
@@ -763,40 +1340,47 @@ impl SegmentStore {
                 break;
             }
             let ts = i64::from_be_bytes(buf[..8].try_into().expect("8 bytes"));
-            let pos = u32::from_be_bytes(buf[8..].try_into().expect("4 bytes")) as u64;
-            if pos >= data_end {
-                break;
-            }
             if ts >= timestamp {
                 break;
             }
-            start = pos;
+            below = Some(base + u32::from_be_bytes(buf[8..].try_into().expect("4 bytes")) as i64);
             at += TIME_INDEX_ENTRY as u64;
         }
-        start
+        let (Some(offset), Some(index)) = (below, index) else {
+            return 0;
+        };
+        index
+            .iter()
+            .take_while(|(o, _)| *o <= offset)
+            .last()
+            .map_or(0, |(_, pos)| *pos)
     }
 
-    fn truncate_time_index(topic: TopicId, partition: i32, base: i64, data_end: u64) {
+    /// Drop time-index entries at or past `next_offset`. Returns the last kept timestamp.
+    fn truncate_time_index(topic: TopicId, partition: i32, base: i64, next_offset: i64) -> i64 {
         let path = data_path(&segment_path(topic, partition, base, "timeindex"));
-        let Ok(mut vfd) = Vfd::open(&path, false) else {
-            return;
+        let Ok(vfd) = Vfd::open(&path, false) else {
+            return i64::MIN;
         };
         let size = vfd.size().unwrap_or(0);
         let mut buf = [0u8; TIME_INDEX_ENTRY];
         let mut at = 0u64;
+        let mut last = i64::MIN;
         while at + TIME_INDEX_ENTRY as u64 <= size {
             if vfd.read_at(&mut buf, at).unwrap_or(0) != TIME_INDEX_ENTRY {
                 break;
             }
-            let pos = u32::from_be_bytes(buf[8..].try_into().expect("4 bytes")) as u64;
-            if pos >= data_end {
+            let offset = base + u32::from_be_bytes(buf[8..].try_into().expect("4 bytes")) as i64;
+            if offset >= next_offset {
                 break;
             }
+            last = i64::from_be_bytes(buf[..8].try_into().expect("8 bytes"));
             at += TIME_INDEX_ENTRY as u64;
         }
         if at < size {
             let _ = vfd.truncate(at);
         }
+        last
     }
 
     fn read_index(
@@ -852,12 +1436,12 @@ impl SegmentStore {
         topic: TopicId,
         partition: i32,
         base: i64,
-    ) -> StoreResult<(Vec<(i64, u64)>, u64, i64, i64)> {
+    ) -> StoreResult<(Vec<(i64, u64)>, u64, i64, (i64, i64))> {
         let path = data_path(&segment_path(topic, partition, base, "log"));
         let vfd = Vfd::open(&path, false)?;
         let size = vfd.size()?;
 
-        let mut max_timestamp = i64::MIN;
+        let mut max_timestamp = (i64::MIN, -1i64);
         let mut index = Vec::new();
         let mut pos = 0u64;
         let mut next_offset = base;
@@ -912,7 +1496,9 @@ impl SegmentStore {
                 index.push((batch_base, pos));
             }
             if let Some(ts) = max_timestamp_of(&whole) {
-                max_timestamp = max_timestamp.max(ts);
+                if ts > max_timestamp.0 {
+                    max_timestamp = (ts, batch_base + last_delta as i64);
+                }
             }
             next_offset = batch_base + last_delta as i64 + 1;
             pos += total;
@@ -926,7 +1512,7 @@ impl SegmentStore {
         topic: TopicId,
         partition: i32,
         base: i64,
-    ) -> StoreResult<(Vec<(i64, u64)>, u64, i64, i64)> {
+    ) -> StoreResult<(Vec<(i64, u64)>, u64, i64, (i64, i64))> {
         let (index, pos, next_offset, max_timestamp) = Self::read_segment(topic, partition, base)?;
         let path = data_path(&segment_path(topic, partition, base, "log"));
         let vfd = Vfd::open(&path, false)?;
@@ -947,7 +1533,8 @@ impl SegmentStore {
         let mut next_offset = 0i64;
         let mut active_base = 0i64;
         let mut active_bytes = 0u64;
-        let mut max_timestamp = i64::MIN;
+        let mut max_timestamp = (i64::MIN, -1i64);
+        let mut time_indexed_ts = i64::MIN;
 
         // Only the active segment is scanned: rolled segments are immutable and indexed.
         for (i, base) in bases.iter().enumerate() {
@@ -964,11 +1551,16 @@ impl SegmentStore {
             active_bytes = end;
             next_offset = next;
             max_timestamp = max_ts;
-
-            // Drop `.timeindex` entries the recovered log does not reach: a stale position then sits
-            Self::truncate_time_index(topic, partition, *base, end);
+            time_indexed_ts = Self::truncate_time_index(topic, partition, *base, next);
         }
-        Ok(Recovered { next_offset, active_base, active_bytes, index, max_timestamp })
+        Ok(Recovered {
+            next_offset,
+            active_base,
+            active_bytes,
+            index,
+            max_timestamp,
+            time_indexed_ts,
+        })
     }
 
     /// Place already-stamped bytes: roll if needed, write, index. Does not stamp or advance the
@@ -997,8 +1589,8 @@ impl SegmentStore {
             with_active(topic, partition, closing_base, generation, |a| {
                 a.log
                     .writeback(a.writeback_from, closing_bytes.saturating_sub(a.writeback_from));
-                a.log.sync();
-                Ok(())
+                a.log.sync()?;
+                a.sync_dir(topic, partition)
             })?;
             evict_active(topic, partition);
             st.active_base = base_offset;
@@ -1006,6 +1598,8 @@ impl SegmentStore {
             // A new segment is empty: carrying the previous maximum forward would poison its
             // first time-index entry.
             st.max_timestamp_so_far = i64::MIN;
+            st.max_timestamp_offset = -1;
+            st.time_indexed_ts = i64::MIN;
             st.active_since_ms = now_millis();
             hints.insert(base_offset, Vec::new());
         }
@@ -1015,7 +1609,13 @@ impl SegmentStore {
 
         let pos = st.active_bytes;
         let active_base = st.active_base;
-        let max_timestamp_so_far = st.max_timestamp_so_far;
+        // Kafka's entry is written after the batch, with the maximum including it.
+        let (max_ts, max_offset) = match max_timestamp_of(bytes) {
+            Some(ts) if ts > st.max_timestamp_so_far => (ts, base_offset + last_offset_delta_of(bytes)),
+            _ => (st.max_timestamp_so_far, st.max_timestamp_offset),
+        };
+        let time_entry = (max_ts > st.time_indexed_ts && max_offset >= active_base)
+            .then_some((max_ts, max_offset));
 
         let entries = hints.entry(active_base).or_default();
         let indexable = match entries.last() {
@@ -1044,18 +1644,17 @@ impl SegmentStore {
                     &entry,
                     "index",
                 );
-
-                // Pairs the max over everything *before* this batch with this batch's position,
-                // so a time lookup lands at or before the first record that can match.
-                let mut tentry = [0u8; TIME_INDEX_ENTRY];
-                tentry[..8].copy_from_slice(&max_timestamp_so_far.to_be_bytes());
-                tentry[8..].copy_from_slice(&(pos as u32).to_be_bytes());
-                append_index_entry(
-                    &mut a.timeindex,
-                    &data_path(&segment_path(topic, partition, active_base, "timeindex")),
-                    &tentry,
-                    "time index",
-                );
+                if let Some((ts, offset)) = time_entry {
+                    let mut tentry = [0u8; TIME_INDEX_ENTRY];
+                    tentry[..8].copy_from_slice(&ts.to_be_bytes());
+                    tentry[8..].copy_from_slice(&((offset - active_base) as u32).to_be_bytes());
+                    append_index_entry(
+                        &mut a.timeindex,
+                        &data_path(&segment_path(topic, partition, active_base, "timeindex")),
+                        &tentry,
+                        "time index",
+                    );
+                }
             }
             Ok(())
         })?;
@@ -1067,10 +1666,13 @@ impl SegmentStore {
             entries.push((base_offset, pos));
         }
 
-        // Every batch, not only indexed ones — the entries above claim to dominate them. From the
-        // batch header, so a compressed batch costs nothing to read here.
-        if let Some(ts) = max_timestamp_of(bytes) {
-            st.max_timestamp_so_far = st.max_timestamp_so_far.max(ts);
+        // Every batch, not only indexed ones, from the batch header.
+        st.max_timestamp_so_far = max_ts;
+        st.max_timestamp_offset = max_offset;
+        if indexable {
+            if let Some((ts, _)) = time_entry {
+                st.time_indexed_ts = ts;
+            }
         }
         st.active_bytes += bytes.len() as u64;
         Ok(())
@@ -1195,6 +1797,101 @@ impl SegmentStore {
 
 }
 
+/// A compaction rewrite in progress, named per process.
+fn compacting_path(topic: TopicId, partition: i32, base: i64) -> PathBuf {
+    let ext = format!("log.compacting.{}", std::process::id());
+    data_path(&segment_path(topic, partition, base, &ext))
+}
+
+/// Remove rewrites left by processes that no longer exist: a crash, or a backend cancelled
+/// mid-compaction. Returns the number removed.
+pub fn remove_stale_compactions() -> usize {
+    let mut removed = 0;
+    let Ok(topics) = std::fs::read_dir(log_root()) else {
+        return 0;
+    };
+    for topic in topics.flatten() {
+        let Ok(partitions) = std::fs::read_dir(topic.path()) else {
+            continue;
+        };
+        for partition in partitions.flatten() {
+            let Ok(files) = std::fs::read_dir(partition.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let name = file.file_name();
+                let Some(pid) = name
+                    .to_str()
+                    .and_then(|n| n.split_once(".log.compacting."))
+                    .and_then(|(_, pid)| pid.parse::<libc::pid_t>().ok())
+                else {
+                    continue;
+                };
+                let alive = unsafe { libc::kill(pid, 0) } == 0
+                    || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+                if !alive && std::fs::remove_file(file.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    removed
+}
+
+/// Marks a log root whose `.timeindex` files are in Kafka's entry format.
+const TIME_INDEX_FORMAT_MARKER: &str = ".timeindex-kafka-format";
+
+/// Delete every pre-0.3.0 `.timeindex`, whose `(timestamp, byte position)` entries read as
+/// Kafka's format would seek past matches. A missing index costs a scan. Once per log root,
+/// before the broker serves; returns the number of files removed.
+pub fn migrate_time_indexes() -> std::io::Result<usize> {
+    let root = log_root();
+    let marker = root.join(TIME_INDEX_FORMAT_MARKER);
+    if marker.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    if let Ok(topics) = std::fs::read_dir(&root) {
+        for topic in topics.flatten() {
+            let Ok(partitions) = std::fs::read_dir(topic.path()) else {
+                continue;
+            };
+            for partition in partitions.flatten() {
+                let Ok(files) = std::fs::read_dir(partition.path()) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().is_some_and(|e| e == "timeindex") {
+                        std::fs::remove_file(&path)?;
+                        removed += 1;
+                    }
+                }
+            }
+        }
+    }
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(&marker, b"")?;
+    Ok(removed)
+}
+
+/// Whether a transactional batch came from `kafgres_produce()`, which stamps producer epoch
+/// -1. From the header alone: the producer table forgets idle producers, and a SQL xid can
+/// equal a Kafka producer id.
+pub(super) fn is_marker_backed(header: &[u8]) -> bool {
+    header
+        .get(records::PRODUCER_EPOCH_OFFSET..records::PRODUCER_EPOCH_OFFSET + 2)
+        .and_then(|b| b.try_into().ok())
+        .is_some_and(|b| i16::from_be_bytes(b) < 0)
+}
+
+fn last_offset_delta_of(bytes: &[u8]) -> i64 {
+    bytes
+        .get(records::LAST_OFFSET_DELTA_OFFSET..records::LAST_OFFSET_DELTA_OFFSET + 4)
+        .and_then(|b| b.try_into().ok())
+        .map_or(0, |b| i32::from_be_bytes(b) as i64)
+}
+
 fn max_timestamp_of(bytes: &[u8]) -> Option<i64> {
     if bytes.len() < records::RECORD_BATCH_OVERHEAD {
         return None;
@@ -1284,17 +1981,15 @@ impl LogStore for SegmentStore {
             // Enumerate from disk, not the hint map: hints are per-process, so a partition appended by
             // TODO: cache the per-Fetch `read_dir`; the list changes only on roll/reclaim.
             let bases_on_disk = Self::segment_bases(topic, partition)?;
-            let committed = match isolation {
+            // The marker load can lower the ceiling: past its cap, reading beyond it would
+            // judge a batch committed on missing evidence.
+            let (committed, ceiling) = match isolation {
                 IsolationLevel::ReadCommitted => {
-                    Some(pmeta::committed_markers(topic, partition, offset, ceiling)?)
+                    let (set, capped) =
+                        pmeta::committed_markers(topic, partition, offset, ceiling)?;
+                    (Some(set), capped)
                 }
-                IsolationLevel::ReadUncommitted => None,
-            };
-            // Producer ids Kafka handed out, so a transactional batch from one of them is
-            let kafka_producers = if committed.is_some() {
-                pmeta::known_producer_ids()?
-            } else {
-                std::collections::HashSet::new()
+                IsolationLevel::ReadUncommitted => (None, ceiling),
             };
             Self::with_slot(topic, partition, |st, hints| {
                 let mut bases = bases_on_disk;
@@ -1392,7 +2087,7 @@ impl LogStore for SegmentStore {
 
                             if is_txn
                                 && !is_control
-                                && !kafka_producers.contains(&producer_id)
+                                && is_marker_backed(&header)
                                 && !committed.contains(&batch_base)
                             {
                                 aborted.push(super::AbortedTxn {
@@ -1452,17 +2147,17 @@ impl LogStore for SegmentStore {
         topic: TopicId,
         partition: i32,
         timestamp: i64,
-    ) -> StoreResult<Option<i64>> {
+    ) -> StoreResult<Option<(i64, i64)>> {
         // -1 latest, -2 earliest: the sentinels ListOffsets uses.
         match timestamp {
-            -1 => return self.high_watermark(topic, partition).map(Some),
-            -2 => return self.log_start_offset(topic, partition).map(Some),
+            -1 => return self.high_watermark(topic, partition).map(|o| Some((o, -1))),
+            -2 => return self.log_start_offset(topic, partition).map(|o| Some((o, -1))),
             _ => {}
         }
 
         // The earliest offset whose timestamp is at or after `timestamp` — what `offsetsForTimes`
         let bases_on_disk = Self::segment_bases(topic, partition)?;
-        Self::with_slot(topic, partition, |st, _hints| {
+        Self::with_slot(topic, partition, |st, hints| {
             let mut bases = bases_on_disk;
             bases.sort_unstable();
             for base in bases {
@@ -1478,7 +2173,8 @@ impl LogStore for SegmentStore {
                 };
                 // Start where the time index says the answer cannot be behind us.
                 let mut pos =
-                    Self::time_index_seek(topic, partition, base, data_end, timestamp);
+                    Self::time_index_seek(topic, partition, base, timestamp, hints.get(&base))
+                        .min(data_end);
                 let mut header = [0u8; records::RECORD_BATCH_OVERHEAD];
                 while pos + header.len() as u64 <= data_end {
                     if vfd.read_at(&mut header, pos)? != header.len() {
@@ -1489,7 +2185,10 @@ impl LogStore for SegmentStore {
                             .try_into()
                             .expect("4 bytes"),
                     );
-                    if length <= 0 {
+                    // A length past the data is a corrupt header.
+                    if length <= 0
+                        || pos + (records::LENGTH_OFFSET + 4) as u64 + length as u64 > data_end
+                    {
                         break;
                     }
                     let max_ts = i64::from_be_bytes(
@@ -1498,12 +2197,17 @@ impl LogStore for SegmentStore {
                             .expect("8 bytes"),
                     );
                     if max_ts >= timestamp {
-                        let batch_base = i64::from_be_bytes(
-                            header[records::BASE_OFFSET_OFFSET..records::BASE_OFFSET_OFFSET + 8]
-                                .try_into()
-                                .expect("8 bytes"),
-                        );
-                        return Ok(Some(batch_base));
+                        let mut body = vec![0u8; records::LENGTH_OFFSET + 4 + length as usize];
+                        if vfd.read_at(&mut body, pos)? != body.len() {
+                            return Err(StoreError::Io(format!(
+                                "short read of the batch at {pos} in {}",
+                                path.display()
+                            )));
+                        }
+                        return Ok(super::first_at_or_after(
+                            kafgres_codec::bytes::Bytes::from(body),
+                            timestamp,
+                        ));
                     }
                     pos += records::LENGTH_OFFSET as u64 + 4 + length as u64;
                 }
@@ -1695,150 +2399,8 @@ impl LogStore for SegmentStore {
 
     /// One compaction pass over a partition's **sealed** segments.
     fn compact(&mut self, topic: TopicId, partition: i32) -> StoreResult<u64> {
-        use kafgres_codec::compaction::{rebuild_batch, survivors_until, KeptRecord};
-        use kafgres_codec::records::{BatchIter, RecordBatch};
-
-        let limits = crate::config::compaction_limits(topic);
-        let now = now_millis();
-        let tombstone_cutoff = now - limits.delete_retention_ms;
-        let lag_cutoff = now - limits.min_compaction_lag_ms;
-
-        let infos = Self::segment_infos(topic, partition)?;
-        let sealed: Vec<SegInfo> = infos[..infos.len().saturating_sub(1)].to_vec();
-        if sealed.is_empty() {
-            return Ok(0);
-        }
-
-        // Resume where the last pass stopped, wrapping. Without this a bounded pass re-reads
-        let cursor = Self::with_slot(topic, partition, |st, _| Ok(st.compact_cursor))?;
-        let start = sealed.iter().position(|i| i.base >= cursor).unwrap_or(0);
-
-        let mut window: Vec<SegInfo> = Vec::new();
-        let mut bytes = 0usize;
-        for info in sealed.iter().cycle().skip(start).take(sealed.len()) {
-            // Checked *before* the segment is added: checking after would allow one whole `segment_bytes`
-            if !window.is_empty()
-                && (bytes + info.bytes as usize > MAX_COMPACT_BYTES
-                    || window.len() >= MAX_COMPACT_SEGMENTS)
-            {
-                break;
-            }
-            if info.mtime_ms > lag_cutoff {
-                break;
-            }
-            bytes += info.bytes as usize;
-            window.push(info.clone());
-        }
-        if window.is_empty() {
-            return Ok(0);
-        }
-
-        let mut loaded: Vec<(SegInfo, Vec<RecordBatch>)> = Vec::new();
-        for info in &window {
-            let path = data_path(&segment_path(topic, partition, info.base, "log"));
-            let vfd = match Vfd::open(&path, false) {
-                Ok(v) => v,
-                // Reclaimed between the listing and here. Not an error: it is gone, which
-                Err(_) => continue,
-            };
-            let size = vfd.size()? as usize;
-            if size > MAX_COMPACT_BYTES {
-                continue;
-            }
-            let mut buf = vec![0u8; size];
-            if size > 0 && vfd.read_at(&mut buf, 0)? != size {
-                continue;
-            }
-            let blob = kafgres_codec::bytes::Bytes::from(buf);
-            let mut batches = Vec::new();
-            for item in BatchIter::new(blob) {
-                match item {
-                    Ok(view) => batches.push(view),
-                    Err(e) => {
-                        pgrx::log!("kafgres: compaction skipping {}: {e}", path.display());
-                        batches.clear();
-                        break;
-                    }
-                }
-            }
-            if !batches.is_empty() {
-                loaded.push((info.clone(), batches));
-            }
-        }
-        if loaded.is_empty() {
-            return Ok(0);
-        }
-
-        let all: Vec<RecordBatch> = loaded
-            .iter()
-            .flat_map(|(_, b)| b.iter().cloned())
-            .collect();
-        let keep = survivors_until(&all, tombstone_cutoff)
-            .map_err(|e| StoreError::Io(format!("compaction survivors: {e}")))?;
-
-        let mut removed = 0u64;
-        let mut last_base = window[window.len() - 1].base;
-        for (info, batches) in &loaded {
-            let mut rebuilt: Vec<u8> = Vec::new();
-            let mut changed = false;
-            for view in batches {
-                if view.is_control() {
-                    rebuilt.extend_from_slice(view.as_bytes());
-                    continue;
-                }
-                let base = view.base_offset();
-                let mut kept = Vec::new();
-                let mut total = 0usize;
-                for record in view
-                    .records_decompressed()
-                    .map_err(|e| StoreError::Io(format!("compaction records: {e}")))?
-                {
-                    let record =
-                        record.map_err(|e| StoreError::Io(format!("compaction record: {e}")))?;
-                    total += 1;
-                    let offset = base + record.offset_delta as i64;
-                    if keep.keeps(offset) {
-                        kept.push(KeptRecord {
-                            offset,
-                            timestamp: view.base_timestamp() + record.timestamp_delta,
-                            key: record.key,
-                            value: record.value,
-                            headers: record.headers,
-                            attributes: record.attributes,
-                        });
-                    }
-                }
-                if kept.len() == total {
-                    rebuilt.extend_from_slice(view.as_bytes());
-                    continue;
-                }
-                changed = true;
-                removed += (total - kept.len()) as u64;
-                if let Some(bytes) = rebuild_batch(view, &kept) {
-                    rebuilt.extend_from_slice(&bytes);
-                }
-            }
-            if !changed {
-                continue;
-            }
-            if !Self::swap_segment(topic, partition, info, &rebuilt)? {
-                // Something moved underneath us. The next pass picks it up.
-                removed = removed.saturating_sub(1);
-            }
-        }
-
-        last_base = last_base.saturating_add(1);
-        Self::with_slot(topic, partition, |st, _| {
-            // Wrap when the window reached the end, so the next pass starts over and
-            st.compact_cursor = if window[window.len() - 1].base >= sealed[sealed.len() - 1].base {
-                0
-            } else {
-                last_base
-            };
-            Ok(())
-        })?;
-
-        Ok(removed)
+        let stable_end = self.last_stable_offset(topic, partition)?;
+        Self::compact_pass(topic, partition, stable_end)
     }
 
     fn enforce_retention(
@@ -1873,6 +2435,11 @@ impl LogStore for SegmentStore {
         }
         // And the topic directory once its last partition is gone; `remove_dir` failing with
         let _ = std::fs::remove_dir(log_root().join(topic.to_string()));
+
+        if let Some(plans) = PLANS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            plans.remove(&(topic, partition));
+        }
+        super::forget_cleaned(topic, partition);
 
         // Free the shared slot, or the partition keeps its append position across a
         {
@@ -1911,9 +2478,9 @@ impl LogStore for SegmentStore {
             // Hand the tail to writeback first, as the roll path does.
             a.log
                 .writeback(a.writeback_from, bytes.saturating_sub(a.writeback_from));
-            a.log.sync();
+            a.log.sync()?;
             a.writeback_from = bytes;
-            Ok(())
+            a.sync_dir(topic, partition)
         })
     }
 
@@ -1972,6 +2539,10 @@ impl LogStore for SegmentStore {
 
     /// The only place committed records are deliberately destroyed: a leader's
     fn truncate_to(&mut self, topic: TopicId, partition: i32, offset: i64) -> StoreResult<i64> {
+        if let Some(plans) = PLANS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            plans.remove(&(topic, partition));
+        }
+        super::forget_cleaned(topic, partition);
         let bases = Self::segment_bases(topic, partition)?;
         let removed = Self::with_slot(topic, partition, |st, hints| {
             if offset >= st.next_offset {
@@ -2028,6 +2599,8 @@ impl LogStore for SegmentStore {
                 vfd.truncate(cut)?;
                 // The retained prefix's max, recomputed: a stale value would poison the next index entry's
                 st.max_timestamp_so_far = i64::MIN;
+                st.max_timestamp_offset = -1;
+                st.time_indexed_ts = i64::MIN;
                 let mut scan = 0u64;
                 let mut hdr = [0u8; records::RECORD_BATCH_OVERHEAD];
                 while scan + hdr.len() as u64 <= cut {
@@ -2043,7 +2616,15 @@ impl LogStore for SegmentStore {
                         break;
                     }
                     if let Some(ts) = max_timestamp_of(&hdr) {
-                        st.max_timestamp_so_far = st.max_timestamp_so_far.max(ts);
+                        if ts > st.max_timestamp_so_far {
+                            let first = i64::from_be_bytes(
+                                hdr[records::BASE_OFFSET_OFFSET..records::BASE_OFFSET_OFFSET + 8]
+                                    .try_into()
+                                    .expect("8 bytes"),
+                            );
+                            st.max_timestamp_so_far = ts;
+                            st.max_timestamp_offset = first + last_offset_delta_of(&hdr);
+                        }
                     }
                     scan += records::LENGTH_OFFSET as u64 + 4 + len as u64;
                 }
@@ -2072,10 +2653,14 @@ impl LogStore for SegmentStore {
                 st.active_base = offset;
                 st.active_bytes = 0;
                 st.max_timestamp_so_far = i64::MIN;
+                st.max_timestamp_offset = -1;
+                st.time_indexed_ts = i64::MIN;
                 st.layout_generation = st.layout_generation.wrapping_add(1);
             }
 
             st.next_offset = offset;
+            // Everything is dirty again.
+            st.compact_cursor = 0;
             log!(
                 "kafgres: truncated {topic}/{partition} to offset {offset}, discarding \
                  {removed} record slot(s) this node held and the leader did not"
@@ -2159,7 +2744,12 @@ impl SegmentStore {
 
     /// Release one uncommitted reservation, on both commit and abort: missing it on the abort
     pub fn release_pending(topic: TopicId, partition: i32) {
-        let mut slots = SHARDS[shard_of(topic, partition)].exclusive();
+        // Runs in a commit or abort callback, where a panic is a PANIC: no indexing.
+        let Some(shard) = SHARDS.get(shard_of(topic, partition)) else {
+            pgrx::warning!("kafgres: no lock shard for topic {topic} partition {partition}; reservation not released");
+            return;
+        };
+        let mut slots = shard.exclusive();
         for slot in slots.iter_mut() {
             if slot.topic == topic && slot.partition == partition {
                 slot.pending_count = (slot.pending_count - 1).max(0);

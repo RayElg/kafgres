@@ -277,7 +277,8 @@ def test_a_marker_whose_payload_did_not_survive_is_dropped_loudly(topic):
     mine = f"SELECT count(*) FROM kafgres_markers WHERE topic_id = {topic_id}"
     assert sql(mine) == "1", "no marker was written for this topic"
 
-    seg = f"/var/lib/postgresql/data/kafgres/{topic_id}/0/00000000000000000000.log"
+    # From the server: PGDATA moved in the PG 18 images.
+    seg = f"{sql('SHOW data_directory')}/kafgres/{topic_id}/0/00000000000000000000.log"
 
     out = compose("exec", "-T", "postgres", "truncate", "-s", "0", seg)
     assert out.returncode == 0, f"could not truncate the segment: {out.stderr.strip()}"

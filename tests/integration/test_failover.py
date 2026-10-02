@@ -33,6 +33,8 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 TOPIC = "p6-failover"
 
 FENCED_LEADER_EPOCH = 74
+# Epochs a timeline can mint: a promotion to timeline 2 starts at this one.
+EPOCHS_PER_TIMELINE = 1 << 16
 UNKNOWN_LEADER_EPOCH = 75
 
 def compose(*args, timeout=300, check=False):
@@ -151,9 +153,9 @@ def promoted_standby():
     """
     subprocess.run(
         ["docker", "compose", "exec", "-T", "postgres", "sh", "-c",
-         "grep -q 'kafgres-failover-rig' /var/lib/postgresql/data/pg_hba.conf || "
+         "grep -q 'kafgres-failover-rig' \"$PGDATA/pg_hba.conf\" || "
          "printf '# kafgres-failover-rig\\nhost replication all all trust\\n"
-         "host all all all trust\\n' >> /var/lib/postgresql/data/pg_hba.conf"],
+         "host all all all trust\\n' >> \"$PGDATA/pg_hba.conf\""],
         capture_output=True, text=True, timeout=60, cwd=REPO,
     )
     sql("SELECT pg_reload_conf()")
@@ -200,8 +202,12 @@ def promoted_standby():
                    capture_output=True, text=True, timeout=180, cwd=REPO)
     deadline = time.time() + 90
     while time.time() < deadline:
-        if sql("SELECT 1").strip() == "1":
-            break
+        # Refused while it recovers: "the database system is starting up".
+        try:
+            if sql("SELECT 1").strip() == "1":
+                break
+        except RuntimeError:
+            pass
         time.sleep(2)
     primary_epoch = sql(
         f"""SELECT leader_epoch FROM kafgres_partitions
@@ -265,17 +271,18 @@ def test_a_standby_runs_no_broker_until_promotion(promoted_standby):
         "the broker was listening on the standby while it was still a replica"
     )
 
-def test_a_restart_is_not_a_promotion(promoted_standby):
-    """The primary restarted mid-divergence and its epoch did not move.
-
-    An epoch derived from a local counter bumps here, and that is what makes it unsafe:
-    the promoted standby then raises its own stale copy to the *same* number for
-    different records, and a consumer holding it is told its position is current. The
-    epoch is the Postgres timeline, which a diverged primary can never reach — so a
-    restart, which diverges from nothing, must leave it alone.
-    """
-    assert promoted_standby["primary_epoch"] == "0", (
-        f"the primary's epoch moved on a restart: {promoted_standby['primary_epoch']}"
+def test_a_restart_takes_an_epoch_a_promotion_never_reuses(promoted_standby):
+    """The primary restarted mid-divergence and took a new epoch, as every start does. It
+    must never be the number the promoted standby takes for different records: restarts
+    count within the timeline, and a promotion jumps to the next timeline's range."""
+    primary = int(promoted_standby["primary_epoch"])
+    assert primary == 1, f"the primary's restart did not take the next epoch: {primary}"
+    standby = int(standby_sql(
+        f"""SELECT leader_epoch FROM kafgres_partitions
+             WHERE topic_id = (SELECT topic_id FROM kafgres_topics WHERE name = '{TOPIC}')"""
+    ))
+    assert standby == EPOCHS_PER_TIMELINE, (
+        f"the promotion did not jump to timeline 2's range: {standby}"
     )
 
 def test_promotion_bumps_the_leader_epoch(promoted_standby):
@@ -286,8 +293,9 @@ def test_promotion_bumps_the_leader_epoch(promoted_standby):
              WHERE topic_id = (SELECT topic_id FROM kafgres_topics WHERE name = '{TOPIC}')
              ORDER BY leader_epoch"""
     ).split()
-    assert history == ["0:0", "1:3"], (
-        f"expected epoch 0 from offset 0 and epoch 1 from the divergence point, got {history}"
+    assert history == ["0:0", f"{EPOCHS_PER_TIMELINE}:3"], (
+        f"expected epoch 0 from offset 0 and timeline 2's first epoch from the divergence "
+        f"point, got {history}"
     )
 
 def test_offset_for_leader_epoch_gives_the_truncation_point(promoted_standby):
@@ -312,9 +320,10 @@ def test_offset_for_leader_epoch_gives_the_truncation_point(promoted_standby):
 def test_the_current_epoch_ends_at_the_log_end(promoted_standby):
     """An epoch that has not ended has no start-of-next to report, so the answer is the
     log end. A consumer ahead of *that* truncates too, which is the same case."""
-    error, epoch, end = offset_for_leader_epoch(STANDBY_PORT, TOPIC, leader_epoch=1)
+    error, epoch, end = offset_for_leader_epoch(
+        STANDBY_PORT, TOPIC, leader_epoch=EPOCHS_PER_TIMELINE)
     assert error == 0, f"error {error}"
-    assert epoch == 1 and end == next_offset(standby_sql), (epoch, end)
+    assert epoch == EPOCHS_PER_TIMELINE and end == next_offset(standby_sql), (epoch, end)
 
 def test_fencing_in_both_directions(promoted_standby):
     """`current_leader_epoch` says what the client believes. The two disagreements mean
@@ -325,7 +334,8 @@ def test_fencing_in_both_directions(promoted_standby):
     error, _, _ = offset_for_leader_epoch(STANDBY_PORT, TOPIC, 0, current_leader_epoch=0)
     assert error == FENCED_LEADER_EPOCH, f"expected 74, got {error}"
 
-    error, _, _ = offset_for_leader_epoch(STANDBY_PORT, TOPIC, 0, current_leader_epoch=9)
+    error, _, _ = offset_for_leader_epoch(
+        STANDBY_PORT, TOPIC, 0, current_leader_epoch=EPOCHS_PER_TIMELINE + 9)
     assert error == UNKNOWN_LEADER_EPOCH, f"expected 75, got {error}"
 
 def test_retention_cannot_erase_the_truncation_point(promoted_standby):

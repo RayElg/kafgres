@@ -456,6 +456,8 @@ def test_a_held_table_lock_does_not_wedge_the_broker(topic):
     make(topic)
     from conftest import API_VERSIONS, BROKER_HOST, BROKER_PORT, METADATA, Connection
     import socket as _socket
+    # Only this test's log lines: other tests kill the broker on purpose.
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 1))
 
     HOLD = 12.0  # far longer than any timeout, so a wedged broker cannot pass
 
@@ -504,7 +506,8 @@ def test_a_held_table_lock_does_not_wedge_the_broker(topic):
         holder.wait(timeout=30)
 
     logs = subprocess.run(
-        ["docker", "compose", "logs", "postgres"], capture_output=True, text=True, timeout=60
+        ["docker", "compose", "logs", "--since", since, "postgres"],
+        capture_output=True, text=True, timeout=60,
     ).stdout
     assert "query aborted" in logs.lower(), "no lock conflict occurred — test is vacuous"
     deaths = [
@@ -516,3 +519,79 @@ def test_a_held_table_lock_does_not_wedge_the_broker(topic):
     time.sleep(1.0)
     out = kcat("-L")
     assert out.returncode == 0, out.stderr
+
+def test_a_fetch_filled_to_the_cap_is_still_served(topic, conn):
+    """Batches filling every partition's 1 MiB limit add up to the 8 MiB cap; the envelope
+    on top must still fit."""
+    from recordbatch import produce_v3_many, parse_produce_v3_many, record_batch
+    make(topic, partitions=8)
+    pad = 900
+    while len(record_batch([b"x" * pad])) != 1024:
+        pad += 1 if len(record_batch([b"x" * pad])) < 1024 else -1
+    batch = record_batch([b"x" * pad])
+    rounds = 1100
+    for r in range(rounds):
+        header = struct.pack(">hhi", 0, 3, 50000 + r) + struct.pack(">h", 6) + b"pytest"
+        frame = header + produce_v3_many(topic, [(p, batch) for p in range(8)])
+        conn.sock.sendall(struct.pack(">i", len(frame)) + frame)
+        _, results = parse_produce_v3_many(conn.recv())
+        assert all(err == 0 for _, err, _ in results), results
+    # Default clients ask for 1 MiB from each of the 8 at once.
+    from kafka import KafkaConsumer, TopicPartition
+    c = KafkaConsumer(bootstrap_servers=BROKER, enable_auto_commit=False,
+                      consumer_timeout_ms=10000)
+    c.assign([TopicPartition(topic, p) for p in range(8)])
+    c.seek_to_beginning()
+    got = sum(1 for _ in c)
+    c.close()
+    assert got == 8 * rounds, f"read {got} of {8 * rounds}"
+
+def test_a_batch_that_does_not_fit_waits_for_the_next_fetch(topic, conn):
+    """Two batches near the 8 MiB `max.message.bytes`: only the first may overshoot the
+    budget, or the response is about 16 MiB, past even the headroom."""
+    from kafka import KafkaConsumer, TopicPartition
+    from kafka.admin import ConfigResource, ConfigResourceType, KafkaAdminClient
+    from recordbatch import produce_v3_many, parse_produce_v3_many, record_batch
+    make(topic, partitions=2)
+    admin = KafkaAdminClient(bootstrap_servers=BROKER)
+    admin.alter_configs([ConfigResource(ConfigResourceType.TOPIC, topic,
+                                        configs={"max.message.bytes": str(8 << 20)})])
+    admin.close()
+    batch = record_batch([b"x" * ((8 << 20) - 300 * 1024)])
+    for p in range(2):
+        header = struct.pack(">hhi", 0, 3, 51000 + p) + struct.pack(">h", 6) + b"pytest"
+        frame = header + produce_v3_many(topic, [(p, batch)])
+        conn.sock.sendall(struct.pack(">i", len(frame)) + frame)
+        _, results = parse_produce_v3_many(conn.recv())
+        assert all(err == 0 for _, err, _ in results), results
+    c = KafkaConsumer(bootstrap_servers=BROKER, enable_auto_commit=False, consumer_timeout_ms=10000,
+                      max_partition_fetch_bytes=16 << 20, fetch_max_bytes=32 << 20)
+    c.assign([TopicPartition(topic, p) for p in range(2)])
+    c.seek_to_beginning()
+    got = sum(1 for _ in c)
+    c.close()
+    assert got == 2, f"read {got} of 2"
+
+def test_a_batch_of_the_largest_allowed_size_can_be_fetched(topic, conn):
+    """A batch of the largest `max.message.bytes` fits with its envelope."""
+    from kafka import KafkaConsumer, TopicPartition
+    from kafka.admin import ConfigResource, ConfigResourceType, KafkaAdminClient
+    from recordbatch import produce_v3, record_batch
+    make(topic)
+    admin = KafkaAdminClient(bootstrap_servers=BROKER)
+    admin.alter_configs([ConfigResource(ConfigResourceType.TOPIC, topic,
+                                        configs={"max.message.bytes": str(8 << 20)})])
+    admin.close()
+    batch = record_batch([b"y" * ((8 << 20) - 110)])
+    assert len(batch) <= 8 << 20
+    header = struct.pack(">hhi", 0, 3, 52000) + struct.pack(">h", 6) + b"pytest"
+    frame = header + produce_v3(topic, 0, batch)
+    conn.sock.sendall(struct.pack(">i", len(frame)) + frame)
+    conn.recv()
+    c = KafkaConsumer(bootstrap_servers=BROKER, enable_auto_commit=False, consumer_timeout_ms=10000,
+                      max_partition_fetch_bytes=16 << 20, fetch_max_bytes=16 << 20)
+    c.assign([TopicPartition(topic, 0)])
+    c.seek_to_beginning()
+    got = [len(m.value) for m in c]
+    c.close()
+    assert got == [(8 << 20) - 110], got

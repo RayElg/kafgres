@@ -23,6 +23,16 @@ pub fn atomically<T, E>(
     // `catch_others` runs across a setjmp, so it wants an `FnMut` that is unwind-safe
     aborted: impl Fn(&str) -> E + std::panic::UnwindSafe + std::panic::RefUnwindSafe,
 ) -> Result<T, E> {
+    atomically_coded(f, move |message, _| aborted(message))
+}
+
+/// `atomically`, handing `aborted` the error's SQLSTATE too: messages are translated.
+pub fn atomically_coded<T, E>(
+    f: impl FnOnce() -> Result<T, E>,
+    aborted: impl Fn(&str, pgrx::PgSqlErrorCode) -> E
+        + std::panic::UnwindSafe
+        + std::panic::RefUnwindSafe,
+) -> Result<T, E> {
     use pgrx::pg_sys::pg_try::PgTryBuilder;
 
     unsafe {
@@ -35,18 +45,18 @@ pub fn atomically<T, E>(
         .catch_others(|caught| {
             // Log what actually happened before substituting the caller's error: `aborted`
             pgrx::log!("kafgres: subtransaction aborted: {caught:?}");
-            let message = match &caught {
+            let (message, code) = match &caught {
                 pgrx::pg_sys::panic::CaughtError::PostgresError(e)
                 | pgrx::pg_sys::panic::CaughtError::ErrorReport(e)
                 | pgrx::pg_sys::panic::CaughtError::RustPanic { ereport: e, .. } => {
-                    e.message().to_string()
+                    (e.message().to_string(), e.sql_error_code())
                 }
             };
             unsafe {
                 pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
             }
             rolled_back_by_pg.store(true, Ordering::Relaxed);
-            Err(aborted(&message))
+            Err(aborted(&message, code))
         })
         .execute();
 
@@ -64,6 +74,44 @@ pub fn atomically<T, E>(
 
 fn with_subtransaction<T>(f: impl FnOnce() -> Result<T, HandlerError>) -> Result<T, HandlerError> {
     atomically(f, |message| HandlerError::Internal(format!("query aborted: {message}")))
+}
+
+/// Hand this worker's accumulated table statistics to the cumulative stats system.
+///
+/// An ordinary backend does this from `PostgresMain`'s idle loop; a background worker never
+/// runs that loop, so without this call its row counts stay in process memory until the
+/// worker exits, and autovacuum (which decides what to vacuum from those counts) never sees
+/// the churn. Postgres's own long-lived workers call this for the same reason
+/// (`replication/logical/worker.c`).
+///
+/// `force = false` is cheap to call every pass: no stats lock wait, and it returns early
+/// when a flush happened less than `PGSTAT_MIN_INTERVAL` (1 s) ago, measured from the last
+/// transaction's stop time. A quiet worker's pending counts are force-flushed at most once
+/// per `PGSTAT_IDLE_INTERVAL` (10 s), matching Postgres's own idle-backend bound.
+///
+/// Must be called between transactions: `pgstat_report_stat` asserts
+/// `!IsTransactionOrTransactionBlock()`. Call sites are each worker's loop head, never
+/// inside `BackgroundWorker::transaction`.
+pub fn report_stats() {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    const IDLE_INTERVAL: Duration = Duration::from_secs(10);
+    thread_local! {
+        static LAST_FORCED: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+
+    let now = Instant::now();
+    let force = LAST_FORCED.with(|last| match last.get() {
+        Some(t) if now.duration_since(t) < IDLE_INTERVAL => false,
+        _ => {
+            last.set(Some(now));
+            true
+        }
+    });
+    unsafe {
+        pgrx::pg_sys::pgstat_report_stat(force);
+    }
 }
 
 /// Let this transaction's commit return without waiting for its WAL to reach the disk:

@@ -33,6 +33,10 @@ use kafgres_codec::Encodable;
 /// Kept in step with the inbound frame cap: a response the peer could never have asked
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Room over `MAX_RESPONSE_BYTES` for the envelope of the largest fetch (4096 partitions)
+/// around one batch of the largest `max.message.bytes`, also 8 MiB.
+const RESPONSE_HEADROOM: usize = 2 * 1024 * 1024;
+
 /// Responses are measured only after assembly, and items expand far past their wire size.
 pub const MAX_ADMIN_ITEMS: usize = 1_000;
 
@@ -124,7 +128,7 @@ pub fn write_response<T: Encodable>(
         unknown_tagged_fields: Vec::new(),
     };
     let total = header.size(header_version) + body.size(api_version);
-    if total > MAX_RESPONSE_BYTES {
+    if total > MAX_RESPONSE_BYTES + RESPONSE_HEADROOM {
         return Err(HandlerError::TooLarge {
             what: "response",
             n: total,

@@ -216,49 +216,87 @@ pub fn advance_log_start(topic: TopicId, partition: i32, offset: i64) -> StoreRe
     forget_aborted_below(topic, partition, offset)
 }
 
+/// Cap on markers loaded per Fetch. Without it a `read_committed` consumer far behind the
+/// LSO could pull an unbounded set into memory; a Rust allocation failure in a Postgres
+/// backend is an `abort()`, crashing the whole cluster.
+const MARKERS_PER_FETCH: usize = 65_536;
+
 /// Base offsets in `[from, to)` that have a committed marker. MVCC does the work: an
+///
+/// Also returns the effective ceiling: at the cap, only markers up to the highest one
+/// loaded are known, and the caller must not read past it.
 pub fn committed_markers(
     topic: TopicId,
     partition: i32,
     from: i64,
     to: i64,
-) -> StoreResult<std::collections::HashSet<i64>> {
+) -> StoreResult<(std::collections::HashSet<i64>, i64)> {
     Spi::connect(|client| {
         let rows = client.select(
             "SELECT base_offset FROM kafgres_markers
               WHERE topic_id = $1::oid AND partition = $2
-                AND base_offset >= $3 AND base_offset < $4",
+                AND base_offset >= $3 AND base_offset < $4
+              ORDER BY base_offset LIMIT $5",
             None,
             &[
                 (topic as i32).into(),
                 partition.into(),
                 from.into(),
                 to.into(),
+                (MARKERS_PER_FETCH as i64).into(),
             ],
         )?;
         let mut out = std::collections::HashSet::new();
+        let mut highest = from;
         for row in rows {
             if let Some(b) = row.get::<i64>(1)? {
                 out.insert(b);
+                highest = highest.max(b);
             }
         }
-        Ok::<_, spi::Error>(out)
+        // Under the cap the range is covered exhaustively; at the cap, knowledge stops
+        // after the highest marker loaded.
+        let ceiling = if out.len() < MARKERS_PER_FETCH {
+            to
+        } else {
+            (highest + 1).min(to)
+        };
+        Ok::<_, spi::Error>((out, ceiling))
     })
     .map_err(spi_err)
 }
 
-/// Producer ids allocated by `InitProducerId`; tells a Kafka transaction's batch from
-pub fn known_producer_ids() -> StoreResult<std::collections::HashSet<i64>> {
+/// Whether a `kafgres_produce()` batch's marker exists, and whether its writer has finished,
+/// in one statement so both see one snapshot.
+pub fn marker_state(topic: TopicId, partition: i32, base: i64, xid: i64) -> StoreResult<(bool, bool)> {
     Spi::connect(|client| {
-        let rows = client.select("SELECT producer_id FROM kafgres_producers", None, &[])?;
-        let mut out = std::collections::HashSet::new();
-        for row in rows {
-            if let Some(id) = row.get::<i64>(1)? {
-                out.insert(id);
-            }
-        }
-        Ok::<_, spi::Error>(out)
+        let row = client
+            .select(
+                "SELECT EXISTS (SELECT 1 FROM kafgres_markers
+                                 WHERE topic_id = $1::oid AND partition = $2
+                                   AND base_offset = $3),
+                        pg_visible_in_snapshot($4::text::xid8, pg_current_snapshot())",
+                Some(1),
+                &[(topic as i32).into(), partition.into(), base.into(), xid.into()],
+            )?
+            .first();
+        Ok::<_, spi::Error>((
+            row.get::<bool>(1)?.unwrap_or(false),
+            row.get::<bool>(2)?.unwrap_or(false),
+        ))
     })
+    .map_err(spi_err)
+}
+
+/// Whether an aborted Kafka transaction of `producer_id` covers `offset`.
+pub fn aborted_at(topic: TopicId, partition: i32, producer_id: i64, offset: i64) -> StoreResult<bool> {
+    Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS (SELECT 1 FROM kafgres_txn_aborted
+                         WHERE topic_id = $1::oid AND partition = $2 AND producer_id = $3
+                           AND first_offset <= $4 AND last_offset >= $4)",
+        &[(topic as i32).into(), partition.into(), producer_id.into(), offset.into()],
+    )
+    .map(|v| v.unwrap_or(false))
     .map_err(spi_err)
 }
 
@@ -342,6 +380,28 @@ pub fn register_txn_partition(
     )
     .map_err(spi_err)?;
     Ok(())
+}
+
+/// Stamps the transaction's first offset in this partition. Only overwrites the `-1`
+/// placeholder, so a later batch of the same transaction leaves it alone.
+pub fn stamp_txn_partition(
+    producer_id: i64,
+    topic: TopicId,
+    partition: i32,
+    base_offset: i64,
+) -> StoreResult<()> {
+    Spi::run_with_args(
+        "UPDATE kafgres_txn_partitions SET first_offset = $4
+          WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3
+            AND first_offset < 0",
+        &[
+            producer_id.into(),
+            (topic as i32).into(),
+            partition.into(),
+            base_offset.into(),
+        ],
+    )
+    .map_err(spi_err)
 }
 
 fn now_millis() -> i64 {

@@ -40,6 +40,11 @@ SELECT kafgres_create_topic('shipments', 3);
 SELECT kafgres_create_topic('inventory.state', 3);
 SELECT kafgres_create_topic('payments.events', 1);
 
+-- Current stock per SKU: only the latest record per key matters.
+UPDATE kafgres_topics
+   SET config = COALESCE(config, '{}'::jsonb) || '{"cleanup.policy": "compact"}'
+ WHERE name = 'inventory.state';
+
 -- The Debezium replacement. One mapping, defined in SQL, enriched by a join at capture
 -- time — the product name comes along without the consumer needing a second lookup.
 DELETE FROM kafgres_cdc_mappings WHERE mapping_name = 'orders-cdc';

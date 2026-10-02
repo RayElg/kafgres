@@ -156,7 +156,7 @@ pub static ADVERTISED: &[ApiVersionRange] = &[
     ApiVersionRange { api_key: 64, min_version: 0, max_version: 0 },
     ApiVersionRange { api_key: 65, min_version: 0, max_version: 0 },
     ApiVersionRange { api_key: 66, min_version: 0, max_version: 2 },
-    ApiVersionRange { api_key: 68, min_version: 0, max_version: 0 },
+    ApiVersionRange { api_key: 68, min_version: 0, max_version: 1 },
     ApiVersionRange { api_key: 69, min_version: 0, max_version: 1 },
     ApiVersionRange { api_key: 74, min_version: 1, max_version: 1 },
     ApiVersionRange { api_key: 75, min_version: 0, max_version: 0 },

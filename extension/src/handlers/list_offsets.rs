@@ -8,6 +8,9 @@ use super::HandlerError;
 use crate::meta;
 use crate::storage::LogStore;
 
+/// Matches the Fetch and OffsetCommit per-consumer data-path limit.
+const MAX_LIST_OFFSETS_PARTITIONS: usize = 4096;
+
 pub const TIMESTAMP_EARLIEST: i64 = -2;
 /// The high watermark — the offset of the *next* record, not the last one.
 pub const TIMESTAMP_LATEST: i64 = -1;
@@ -38,6 +41,21 @@ pub fn handle(
     store: &dyn LogStore,
     authz: &crate::acl::Authz,
 ) -> Result<ListOffsetsResponse, HandlerError> {
+    // Both caps: empty topic entries sum to zero partitions.
+    if req.topics.len() > MAX_LIST_OFFSETS_PARTITIONS {
+        return Err(HandlerError::TooLarge {
+            what: "list offsets topic list",
+            n: req.topics.len(),
+        });
+    }
+    let total: usize = req.topics.iter().map(|t| t.partitions.len()).sum();
+    if total > MAX_LIST_OFFSETS_PARTITIONS {
+        return Err(HandlerError::TooLarge {
+            what: "list offsets partition list",
+            n: total,
+        });
+    }
+
     let mut topics = Vec::with_capacity(req.topics.len());
 
     for topic in &req.topics {
@@ -113,11 +131,14 @@ fn resolve(
         };
     }
 
+    // (offset, timestamp): a lookup by time answers with the record's own timestamp.
     let result = match timestamp {
-        TIMESTAMP_EARLIEST => store.log_start_offset(topic, partition).map(Some),
-        TIMESTAMP_LATEST => store.high_watermark(topic, partition).map(Some),
+        TIMESTAMP_EARLIEST => store.log_start_offset(topic, partition).map(|o| Some((o, -1))),
+        TIMESTAMP_LATEST => store.high_watermark(topic, partition).map(|o| Some((o, -1))),
         // No remote tier, so the local log is the whole log: this is the log start.
-        TIMESTAMP_EARLIEST_LOCAL => store.log_start_offset(topic, partition).map(Some),
+        TIMESTAMP_EARLIEST_LOCAL => {
+            store.log_start_offset(topic, partition).map(|o| Some((o, -1)))
+        }
         // Nothing is tiered or queued for upload, so there is no such offset: -1, no error.
         TIMESTAMP_LATEST_TIERED | TIMESTAMP_EARLIEST_PENDING_UPLOAD => Ok(None),
         ts if ts < 0 => {
@@ -131,12 +152,8 @@ fn resolve(
         Ok(found) => ListOffsetsPartitionResponse {
             partition_index: partition,
             error_code: ErrorCode::None.code(),
-            timestamp: if found.is_some() && timestamp >= 0 {
-                timestamp
-            } else {
-                -1
-            },
-            offset: found.unwrap_or(OFFSET_NOT_FOUND),
+            timestamp: found.map_or(-1, |(_, ts)| ts),
+            offset: found.map_or(OFFSET_NOT_FOUND, |(o, _)| o),
             leader_epoch: epoch,
             ..Default::default()
         },

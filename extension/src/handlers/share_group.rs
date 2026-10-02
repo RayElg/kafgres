@@ -281,6 +281,14 @@ pub fn acknowledge(
     last: i64,
     types: &[Ack],
 ) -> Result<(), HandlerError> {
+    if last < first {
+        return Err(HandlerError::Internal(BAD_RANGE.to_string()));
+    }
+    // A single type covers the whole range, as in Kafka.
+    if types.len() == 1 && last > first {
+        ack_range(group, member, topic, partition, first, last, types[0])?;
+        return advance_start_offset(group, topic, partition);
+    }
     for (i, kind) in types.iter().enumerate() {
         let offset = first + i as i64;
         if offset > last {
@@ -334,6 +342,72 @@ pub fn acknowledge(
     advance_start_offset(group, topic, partition)
 }
 
+/// `acknowledge` for a range under one type, in one statement.
+fn ack_range(
+    group: &str,
+    member: &str,
+    topic: u32,
+    partition: i32,
+    first: i64,
+    last: i64,
+    kind: Ack,
+) -> Result<(), HandlerError> {
+    let (sql, state) = match kind {
+        Ack::Accept => (FINISH_RANGE, Some("acked")),
+        Ack::Reject | Ack::Gap => (FINISH_RANGE, Some("archived")),
+        Ack::Release => (
+            "WITH up AS (
+                 UPDATE kafgres_share_inflight
+                    SET state = 'acquired', member_id = NULL, acquired_until = NULL
+                  WHERE group_id = $1 AND topic_id = $2::oid AND partition = $3
+                    AND record_offset BETWEEN $4 AND $5 AND member_id = $6
+                 RETURNING 1)
+             SELECT count(*) FROM up",
+            None,
+        ),
+        Ack::Renew => (
+            "WITH up AS (
+                 UPDATE kafgres_share_inflight
+                    SET acquired_until = now() + make_interval(
+                            secs => $7::double precision / 1000)
+                  WHERE group_id = $1 AND topic_id = $2::oid AND partition = $3
+                    AND record_offset BETWEEN $4 AND $5 AND member_id = $6
+                    AND state = 'acquired'
+                 RETURNING 1)
+             SELECT count(*) FROM up",
+            None,
+        ),
+    };
+    let mut all: Vec<pgrx::datum::DatumWithOid> = vec![
+        group.into(),
+        (topic as i32).into(),
+        partition.into(),
+        first.into(),
+        last.into(),
+        member.into(),
+    ];
+    match (kind, state) {
+        (_, Some(s)) => all.push(s.into()),
+        (Ack::Renew, None) => all.push(lock_duration_ms().into()),
+        _ => {}
+    }
+    let changed: Option<i64> =
+        Spi::get_one_with_args(sql, &all).map_err(|e| HandlerError::Internal(e.to_string()))?;
+    // As per offset: Accept and Reject need every record held; a gap need not be.
+    if matches!(kind, Ack::Accept | Ack::Reject) && changed.unwrap_or(0) < last.saturating_sub(first).saturating_add(1) {
+        return Err(HandlerError::Internal(NOT_HELD.to_string()));
+    }
+    Ok(())
+}
+
+const FINISH_RANGE: &str = "WITH up AS (
+         UPDATE kafgres_share_inflight
+            SET state = $7, member_id = NULL, acquired_until = NULL
+          WHERE group_id = $1 AND topic_id = $2::oid AND partition = $3
+            AND record_offset BETWEEN $4 AND $5 AND member_id = $6
+         RETURNING 1)
+     SELECT count(*) FROM up";
+
 /// An acknowledgement for a record this member no longer holds. The client must hear
 #[derive(Debug)]
 pub struct NotHeld;
@@ -373,6 +447,9 @@ fn set_state(
 
 /// Marker for "this member does not hold that record"; the handlers turn it into
 pub const NOT_HELD: &str = "record is not held by this member";
+
+/// An acknowledgement batch whose last offset is before its first: `INVALID_REQUEST`.
+const BAD_RANGE: &str = "acknowledgement batch ends before it starts";
 
 /// Move the share partition past every finished record at its head, contiguously only —
 fn advance_start_offset(group: &str, topic: u32, partition: i32) -> Result<(), HandlerError> {
@@ -812,6 +889,7 @@ fn uuid_like() -> Result<String, HandlerError> {
 fn ack_error(e: &HandlerError) -> ErrorCode {
     match e {
         HandlerError::Internal(m) if m.contains(NOT_HELD) => ErrorCode::InvalidRecordState,
+        HandlerError::Internal(m) if m.contains(BAD_RANGE) => ErrorCode::InvalidRequest,
         _ => ErrorCode::UnknownServerError,
     }
 }

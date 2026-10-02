@@ -125,6 +125,89 @@ def test_a_tombstone_survives_the_pass_that_supersedes_its_key(topic):
         f"the superseded value survived: {lines}"
     )
 
+@pytest.mark.skipif(engine() != "table", reason="table engine only: its rewrites are transactional")
+def test_a_pass_undone_by_a_savepoint_is_not_taken_as_clean(topic):
+    """The broker sweeps in one savepoint, so a later topic's error can undo a finished
+    pass while the transaction commits. A cleaner that still counted that range as clean
+    would let the tombstone go on a later pass and leave the value it deleted readable."""
+    # The broker's own sweep would compact this topic between the steps below.
+    sql("ALTER SYSTEM SET kafgres.retention_check_interval_ms = 3600000")
+    sql("SELECT pg_reload_conf()")
+    try:
+        _savepoint_scenario(topic)
+    finally:
+        sql("ALTER SYSTEM RESET kafgres.retention_check_interval_ms")
+        sql("SELECT pg_reload_conf()")
+
+def _savepoint_scenario(topic):
+    make_compacted(topic)
+    out = kafka_tool("kafka-configs.sh", "--entity-type", "topics", "--entity-name", topic,
+                     "--alter", "--add-config", "delete.retention.ms=0")
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert kcat("-t", topic, "-P", "-K:", stdin=f"gone:1{PAD}\n").returncode == 0
+    time.sleep(0.3)
+    assert kcat("-t", topic, "-P", "-K:", "-Z", stdin="gone:\n").returncode == 0
+    time.sleep(0.3)
+    produce(topic, ["a:1", "b:1", "c:1", "d:1"])
+    assert any(l.startswith("0 gone") for l in read_values(topic)), "compacted before the test"
+
+    # One backend throughout: the cleaner's state is per process.
+    session = subprocess.Popen(
+        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-X",
+         "-q", "-v", "ON_ERROR_STOP=1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+
+    def run(statement):
+        session.stdin.write(statement + "\n\\echo __done__\n")
+        session.stdin.flush()
+        out = []
+        for line in session.stdout:
+            if line.strip() == "__done__":
+                return out
+            out.append(line)
+        raise AssertionError(f"psql exited: {''.join(out)}")
+
+    try:
+        run("BEGIN; SAVEPOINT s; SELECT kafgres_enforce_retention(); "
+            "ROLLBACK TO SAVEPOINT s; COMMIT;")
+        assert any(l.startswith("0 gone") for l in read_values(topic)), "the rollback left no value"
+        produce(topic, ["e:1", "f:1", "g:1", "h:1"])
+        run("SELECT kafgres_enforce_retention();")
+    finally:
+        session.stdin.close()
+        session.wait(timeout=60)
+
+    lines = read_values(topic)
+    if any(l.startswith("0 gone") for l in lines):
+        assert any(l.startswith("1 gone") for l in lines), (
+            f"the tombstone went while the value it deletes is still readable: {lines}"
+        )
+
+@pytest.mark.skipif(engine() != "segment", reason="kafgres_produce() is segment engine only")
+def test_a_sql_produce_rolled_back_to_a_savepoint_supersedes_nothing(topic):
+    """The payload of a `kafgres_produce()` whose savepoint rolled back stays in the log
+    without a marker while its top-level transaction commits. Judged by the top-level
+    commit it would supersede the key's real value, and compaction would delete that."""
+    make_compacted(topic)
+    sql(f"SELECT kafgres_produce('{topic}', 'k', 'v1')")
+    out = subprocess.run(
+        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-X", "-q",
+         "-v", "ON_ERROR_STOP=1", "-c",
+         f"BEGIN; SAVEPOINT s; SELECT kafgres_produce('{topic}', 'k', 'v2'); "
+         "ROLLBACK TO SAVEPOINT s; COMMIT;"],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    produce(topic, ["a:1", "b:1", "c:1", "d:1"])
+
+    compact()
+    values = kcat("-C", "-t", topic, "-o", "beginning", "-e", "-q",
+                  "-X", "isolation.level=read_committed", "-f", "%k=%s\n")
+    assert "k=v1" in values.stdout.split(), (
+        f"the committed value was superseded by a rolled-back one: {values.stdout.split()[:6]}"
+    )
+
 def test_a_null_key_is_refused_on_a_compacted_topic(topic):
     """Verified against Kafka 4.1.0: INVALID_RECORD at produce time."""
     make_compacted(topic)
@@ -406,3 +489,102 @@ def test_a_large_segment_bytes_protects_the_whole_log(byte_arm_topic):
         f"records were compacted inside a 1 GiB active region: {span} produced, "
         f"{len(after)} readable after a pass"
     )
+
+def produce_lines(name, lines, one_per_batch=False):
+    """One kcat invocation for many records; `one_per_batch` gives each its own batch."""
+    batching = ["-X", "batch.num.messages=1", "-X", "linger.ms=0"] if one_per_batch else []
+    out = kcat("-t", name, "-P", "-K:", *batching, stdin="".join(f"{l}\n" for l in lines),
+               timeout=600)
+    assert out.returncode == 0, out.stderr
+    time.sleep(1)
+
+def test_a_supersession_far_behind_the_head_is_compacted(topic):
+    """The version that supersedes `K` is about 30 segments later, further than any
+    bounded window of segments reaches."""
+    if engine() != "segment":
+        pytest.skip("the segment engine's cleaner")
+    make_compacted(topic)
+    lines = ([f"K:old{PAD}"] + [f"u{i}:{PAD}" for i in range(60)] + [f"K:new{PAD}"]
+             + [f"v{i}:{PAD}" for i in range(4)])
+    produce_lines(topic, lines, one_per_batch=True)
+    for _ in range(3):
+        compact()
+
+    got = [line.split() for line in read_back(topic)]
+    k_offsets = [int(o) for o, k in got if k == "K"]
+    assert k_offsets == [61], (
+        f"the superseded K survived, or the latest was renumbered (I9): {k_offsets}"
+    )
+    u_offsets = [int(o) for o, k in got if k.startswith("u")]
+    assert u_offsets == list(range(1, 61)), "a record with no successor was removed"
+
+def test_a_segment_larger_than_a_pass_is_compacted():
+    """A sealed segment above the cleaner's 32 MiB per-pass read budget still compacts."""
+    if engine() != "segment":
+        pytest.skip("the segment engine's cleaner")
+    name = "cmp-large-segment"
+    sql(f"SELECT kafgres_drop_topic('{name}')")
+    sql(f"SELECT kafgres_create_topic('{name}', 1)")
+    try:
+        out = kafka_tool("kafka-configs.sh", "--entity-type", "topics", "--entity-name", name,
+                         "--alter", "--add-config",
+                         f"cleanup.policy=compact,segment.bytes={40 * 1024 * 1024}")
+        assert out.returncode == 0, out.stdout + out.stderr
+        value = "x" * 1000
+        # About 45 MB over 100 keys: one sealed 40 MiB segment and an active one.
+        produce_lines(name, [f"k{i % 100}:{value}" for i in range(45_000)])
+        for _ in range(4):
+            compact()
+
+        offsets = [int(line.split()[0]) for line in read_back(name)]
+        assert offsets[-1] == 44_999, f"the log end moved: {offsets[-3:]}"
+        assert len(offsets) < 10_000, (
+            f"{len(offsets)} of 45000 records readable: the sealed 40 MiB segment was not "
+            "compacted"
+        )
+    finally:
+        sql(f"SELECT kafgres_drop_topic('{name}')")
+
+def test_an_aborted_record_supersedes_nothing(topic):
+    """A rolled-back produce leaves its bytes in the log. Were it mapped as the key's latest
+    value, the committed value before it would be removed, and a read_committed consumer
+    would lose the key entirely (I10)."""
+    if engine() != "segment":
+        pytest.skip("kafgres_produce() is the segment engine's")
+    make_compacted(topic)
+    sql(f"SELECT kafgres_produce('{topic}', 'k', 'committed{PAD}')")
+    try:
+        sql(f"BEGIN; SELECT kafgres_produce('{topic}', 'k', 'aborted{PAD}'); "
+            "SELECT 1/0; COMMIT")
+    except RuntimeError:
+        pass
+    for i in range(6):
+        sql(f"SELECT kafgres_produce('{topic}', 'f{i}', 'filler{PAD}')")
+    for _ in range(3):
+        compact()
+
+    out = kcat("-C", "-t", topic, "-o", "beginning", "-e", "-q",
+               "-X", "isolation.level=read_committed", "-f", "%k %s\n")
+    assert out.returncode == 0, out.stderr
+    values = [line.split()[1][:9] for line in out.stdout.splitlines()
+              if line.startswith("k ")]
+    assert values == ["committed"], f"read_committed view of k after compaction: {values}"
+
+def test_batches_larger_than_segment_bytes_still_compact(byte_arm_topic):
+    """Each batch here is larger than `segment.bytes`. Kafka rolls a segment per batch, so
+    only the newest is active; the table engine used to find no batch small enough to bound
+    the active region and protected the whole log instead."""
+    topic = byte_arm_topic
+    out = kafka_tool("kafka-configs.sh", "--entity-type", "topics", "--entity-name", topic,
+                     "--alter", "--add-config", "cleanup.policy=compact,segment.bytes=65536")
+    assert out.returncode == 0, out.stdout + out.stderr
+    for wave in range(4):
+        # One kcat run per wave: about 500 records of 230 bytes, batched together.
+        produce_lines(topic, [f"c{i % 50}:w{wave}-{i}-{'p' * 200}" for i in range(500)])
+    for _ in range(3):
+        compact()
+
+    got = [line.split() for line in read_back(topic)]
+    assert len(got) < 2000, f"{len(got)} of 2000 records readable: nothing was compacted"
+    latest = {k: int(o) for o, k in got}
+    assert len(latest) == 50, f"a key was lost: {len(latest)} keys"
