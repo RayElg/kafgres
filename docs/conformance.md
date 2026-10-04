@@ -28,7 +28,7 @@ broker is absent. CI runs both halves.
 
 `codec/KAFKA_VERSION` pins the message schemas the codec is generated from. The
 reference image tag is matched to that version manually, in `docker-compose.yml`,
-`scripts/parity-demo.sh`, and `tests/conformance/test_clients.py`. An unpinned older
+`demo/parity-demo.sh`, and `tests/conformance/test_clients.py`. An unpinned older
 broker turns version skew into false deviations: 4.1.0 serves OffsetCommit and
 OffsetFetch only up to v9, so a correct v10 advertisement looks like over-advertising.
 
@@ -237,10 +237,10 @@ Stated so the suite is not read as broader than it is.
 - **Compression codecs end to end.** The integration suite asserts record-bytes
   round-tripping per codec; the conformance scenarios do not vary compression.
 - **TLS and SASL under the matrix.** Covered by
-  `tests/integration/test_tls.py` and the neighbouring auth and ACL suites,
+  `tests/integration/security/test_tls.py` and the neighbouring auth and ACL suites,
   against librdkafka and the Java tooling. The Sarama and kafka-python runners speak
   PLAINTEXT.
-- **Failover.** `tests/integration/test_failover.py`, behind the `failover` profile, needs
+- **Failover.** `tests/integration/replication/test_failover.py`, behind the `failover` profile, needs
   a real physical standby.
 - **Anything a scenario does not do.** The scenario count is a floor, not a ceiling.
   When a client reports a bug, the fix is a new scenario here first.

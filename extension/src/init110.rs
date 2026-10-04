@@ -1,10 +1,6 @@
 //! Retention may not reclaim a segment until a row here records it as archived, or the archive
 
-use pgrx::spi::Spi;
-
-fn run_ddl(sql: &str, operation: &str) {
-    Spi::run(sql).unwrap_or_else(|e| pgrx::error!("kafgres: failed to {}: {}", operation, e));
-}
+use crate::ddl::run_ddl;
 
 pub fn init_110() {
     // Rows outlive the segment: a restore needs the list of what the archive holds after the

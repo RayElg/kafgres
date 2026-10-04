@@ -1,10 +1,6 @@
 //! Kafka EOS (wire-protocol) transaction state in Postgres — not the same thing as `kafgres_produce()`'s transactionality.
 
-use pgrx::spi::Spi;
-
-fn run_ddl(sql: &str, operation: &str) {
-    Spi::run(sql).unwrap_or_else(|e| pgrx::error!("kafgres: failed to {}: {}", operation, e));
-}
+use crate::ddl::run_ddl;
 
 pub fn init_090() {
     // Keyed on producer_id, not transactional_id: fencing bumps the epoch at InitProducerId,

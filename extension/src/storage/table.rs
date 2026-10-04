@@ -1,5 +1,6 @@
 //! Table-backed log storage: the only file permitted to run SQL against the log table
 
+use crate::clock::now_millis;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -956,13 +957,6 @@ impl LogStore for TableStore {
             },
         })
     }
-}
-
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -56,7 +56,7 @@ pub fn handle(
                 producer_id.into(),
                 (epoch as i32).into(),
                 id.to_string().into(),
-                super::txn::now_millis().into(),
+                crate::clock::now_millis().into(),
                 timeout.into(),
             ],
         )

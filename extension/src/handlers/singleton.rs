@@ -59,14 +59,12 @@ pub fn alter_replica_log_dirs(
     let denied = cluster_denied(authz, Operation::Alter);
 
     // I8: one response entry per (topic, partition) named by the caller; cap before building.
-    super::check_admin_len("alter replica log dirs", req.dirs.len())?;
-    let partitions: usize = req
-        .dirs
-        .iter()
-        .flat_map(|d| d.topics.iter())
-        .map(|t| t.partitions.len())
-        .sum();
-    super::check_admin_len("alter replica log dir partitions", partitions)?;
+    super::check_nested_len(
+        "alter replica log dirs",
+        "alter replica log dir partitions",
+        &req.dirs,
+        |d| d.topics.iter().map(|t| t.partitions.len()).sum(),
+    )?;
 
     let mut results: Vec<AlterReplicaLogDirTopicResult> = Vec::new();
     for dir in &req.dirs {
@@ -166,9 +164,12 @@ pub fn alter_partition_reassignments(
     }
 
     // I8: one response entry per partition the caller names; cap before building.
-    super::check_admin_len("reassignment topics", req.topics.len())?;
-    let partitions: usize = req.topics.iter().map(|t| t.partitions.len()).sum();
-    super::check_admin_len("reassignment partitions", partitions)?;
+    super::check_nested_len(
+        "reassignment topics",
+        "reassignment partitions",
+        &req.topics,
+        |t| t.partitions.len(),
+    )?;
 
     const NO_MOVE: &str =
         "this broker has one replica per partition; replication is the database's";
