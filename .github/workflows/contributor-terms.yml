@@ -1,0 +1,25 @@
+name: Contributor Terms
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  # Mark this job as a required status check on main, or the box is advisory only.
+  # pull_request_target so it also runs on fork PRs; it never checks out PR code.
+  contributor-terms:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Contributor Terms box is ticked
+        # The owner already holds the rights the terms grant. Skipping the step rather
+        # than the job keeps the required check green on the owner's PRs.
+        if: github.event.pull_request.author_association != 'OWNER'
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if ! printf '%s' "$BODY" | grep -Eq '^\s*-\s*\[[xX]\]\s*I agree to the kafgres \[Contributor Terms \(v1\)\]'; then
+            echo "::error::Tick the Contributor Terms box in the PR description (see CONTRIBUTING.md)."
+            exit 1
+          fi
