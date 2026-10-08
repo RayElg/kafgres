@@ -424,17 +424,14 @@ def test_a_wide_produce_costs_one_subtransaction(conn):
     packs every ready partition into one request, so a savepoint each reaches the cliff
     on a single normal append.
 
-    Each writing subtransaction burns an xid, so xid consumption is the measurement.
+    Each writing subtransaction burns an xid, so the xids on the rows it wrote are the
+    measurement.
     """
     name = "p4-wide"
     parts = 40
     sql(f"SELECT kafgres_drop_topic('{name}')")
     sql(f"SELECT kafgres_create_topic('{name}', {parts})")
     try:
-        def next_xid():
-            return int(sql("SELECT pg_snapshot_xmax(pg_current_snapshot())").strip())
-
-        before = next_xid()
         batches = [
             (p, record_batch([f"w{p}".encode()], producer_id=7900 + p,
                              producer_epoch=0, base_sequence=0))
@@ -448,12 +445,27 @@ def test_a_wide_produce_costs_one_subtransaction(conn):
 
         assert len(results) == parts, f"expected {parts} partition responses"
         assert all(err == 0 for _, err, _ in results), results
-        after = next_xid()
-
-        assert after - before < 20, (
-            f"a {parts}-partition produce consumed {after - before} xids; "
-            "the per-partition savepoint is back"
-        )
+        # A row's xmin is the xid of the subtransaction that wrote it. Only this produce
+        # wrote these rows, so other backends' xids cannot inflate the count.
+        written = [(
+            "window",
+            "SELECT count(*), count(DISTINCT xmin::text) FROM kafgres_producer_batches"
+            f" WHERE producer_id BETWEEN 7900 AND {7900 + parts - 1}",
+        )]
+        if sql("SHOW kafgres.storage_engine") == "table":
+            written.append((
+                "log",
+                "SELECT count(*), count(DISTINCT xmin::text) FROM kafgres_log"
+                " WHERE topic_id = (SELECT topic_id FROM kafgres_topics"
+                f" WHERE name = '{name}')",
+            ))
+        for what, query in written:
+            rows, xmins = sql(query).strip().split("|")
+            assert int(rows) == parts, f"expected {parts} {what} rows, found {rows}"
+            assert int(xmins) <= 2, (
+                f"a {parts}-partition produce wrote its {what} rows under {xmins} xids; "
+                "the per-partition savepoint is back"
+            )
     finally:
         sql(f"SELECT kafgres_drop_topic('{name}')")
 
