@@ -330,9 +330,9 @@ thread_local! {
     static SQL_ACLS: std::cell::RefCell<AclCache> = std::cell::RefCell::new(AclCache::default());
 }
 
-/// Whether a SQL caller may write `topic`, as `User:<role>`. A Postgres superuser passes:
+/// Whether a SQL caller may `op` on `topic`, as `User:<role>`. A Postgres superuser passes:
 /// it can rewrite `kafgres_acls` anyway.
-pub fn sql_caller_may_write(role: &str, host: &str, topic: &str) -> Result<bool, spi::Error> {
+pub fn sql_caller_may(op: Operation, role: &str, host: &str, topic: &str) -> Result<bool, spi::Error> {
     let enabled = crate::acls_enabled();
     if !enabled || unsafe { pgrx::pg_sys::superuser() } {
         return Ok(true);
@@ -346,17 +346,34 @@ pub fn sql_caller_may_write(role: &str, host: &str, topic: &str) -> Result<bool,
         SQL_ACLS.with(|c| *c.borrow_mut() = fresh);
     }
     let who = Principal::user(role, host);
-    Ok(SQL_ACLS.with(|c| c.borrow().allows(&who, Operation::Write, ResourceType::Topic, topic)))
+    Ok(SQL_ACLS.with(|c| c.borrow().allows(&who, op, ResourceType::Topic, topic)))
+}
+
+/// Raise an ERROR unless a SQL caller may `op` on `topic`, per [`sql_caller_may`].
+pub fn sql_require(op: Operation, role: &str, host: &str, topic: &str) {
+    match sql_caller_may(op, role, host, topic) {
+        Ok(true) => {}
+        Ok(false) => pgrx::ereport!(
+            pgrx::PgLogLevel::ERROR,
+            pgrx::PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
+            format!("kafgres: User:{role} is not allowed to {} topic {topic:?}", op.as_str()),
+            format!(
+                "kafgres.acls_enabled is on and kafgres_acls grants this role no {} on the topic.",
+                op.as_str()
+            )
+        ),
+        Err(e) => pgrx::error!("kafgres: could not read kafgres_acls: {e}"),
+    }
 }
 
 /// Switches the current user for one read; restored on drop, including on unwind.
-struct AsBootstrapSuperuser {
+pub(crate) struct AsBootstrapSuperuser {
     user: pgrx::pg_sys::Oid,
     context: std::os::raw::c_int,
 }
 
 impl AsBootstrapSuperuser {
-    fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         let mut user = pgrx::pg_sys::InvalidOid;
         let mut context = 0;
         // SAFETY: called inside a transaction; the pair is restored by Drop or by abort.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Upgrade a populated release install to the current build and check nothing moved.
 
-    python3 scripts/dev/upgrade-test.py [--engine segment|table] [--from 0.2.0] [--keep]
+    python3 scripts/dev/upgrade-test.py [--engine segment|table] [--from 0.3.0] [--keep]
 
 Seeds a volume under the tagged release, restarts it on the current build, and checks the
 same records, group offsets and timestamp lookups before and after
@@ -193,7 +193,7 @@ def epoch():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", choices=["segment", "table"], default="segment")
-    ap.add_argument("--from", dest="old", default="0.2.0")
+    ap.add_argument("--from", dest="old", default="0.3.0")
     ap.add_argument("--keep", action="store_true", help="leave the container and volume")
     ap.add_argument("--no-build", action="store_true")
     args = ap.parse_args()
@@ -222,7 +222,8 @@ def main():
              stdin="k1:after-upgrade\n")
         if args.engine == "segment":
             sql("SELECT kafgres_produce('up-sql', 'k9', 'after-upgrade')")
-            assert "pre-0.3.0 .timeindex" in logs(), "the time index was not migrated"
+            if args.old < "0.3.0":
+                assert "pre-0.3.0 .timeindex" in logs(), "the time index was not migrated"
 
         step("ALTER EXTENSION kafgres UPDATE")
         sql("ALTER EXTENSION kafgres UPDATE")
@@ -237,9 +238,16 @@ def main():
                 missing = set(before["records"][topic]) - set(after["records"][topic])
                 assert not missing, f"{topic} lost {len(missing)} records after the update"
         assert after["groups"] == before["groups"]
+        # kafgres_read() arrives with 0.4.0, not executable by PUBLIC, and reads the old log.
+        assert sql("SELECT has_function_privilege('public', 'kafgres_read(text,int,bigint,bigint,"
+                   "timestamptz,timestamptz,text,bigint)', 'EXECUTE')") == "f", \
+            "the update left kafgres_read() public"
+        read = sql("SELECT count(*) FROM kafgres_read('up-plain')")
+        assert int(read) >= len(before["records"]["up-plain"]), \
+            f"kafgres_read() saw {read} of {len(before['records']['up-plain'])} records"
         assert after["lookup"] == before["lookup"]
 
-        step("compacting what 0.2.0 wrote")
+        step(f"compacting what {args.old} wrote")
         sql("SELECT kafgres_enforce_retention()")
         compacted = read_topic("up-compact")
         latest = {k: o for _, o, k, _ in compacted}

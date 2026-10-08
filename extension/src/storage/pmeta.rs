@@ -435,12 +435,13 @@ pub fn record_aborted_txn(
 pub const MAX_ABORTED_PER_FETCH: i64 = 1_000;
 
 /// Aborted transactions overlapping `[from, to)`, oldest first. `last_offset >= from`
+/// Also where the cap cut the list short: entries starting there or later may be missing.
 pub fn aborted_txns(
     topic: TopicId,
     partition: i32,
     from: i64,
     to: i64,
-) -> StoreResult<Vec<super::AbortedTxn>> {
+) -> StoreResult<(Vec<super::AbortedTxn>, Option<i64>)> {
     Spi::connect(|client| {
         let rows = client.select(
             "SELECT producer_id, first_offset FROM kafgres_txn_aborted
@@ -466,7 +467,10 @@ pub fn aborted_txns(
                 });
             }
         }
-        Ok::<_, spi::Error>(out)
+        let cut = (out.len() as i64 >= MAX_ABORTED_PER_FETCH)
+            .then(|| out.last().map(|a| a.first_offset))
+            .flatten();
+        Ok::<_, spi::Error>((out, cut))
     })
     .map_err(spi_err)
 }
