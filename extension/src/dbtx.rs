@@ -1,20 +1,108 @@
 //! Database plumbing for the request path. A Postgres `ERROR` inside a background worker is
 
+use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::handlers::HandlerError;
 
-/// Take every table lock a request needs, up front, **without waiting**. The broker is one
+/// Take every table lock a request needs, up front, waiting only out of [`LOCK_WAIT_BUDGET`].
+/// Vacuum truncation holds ACCESS EXCLUSIVE and yields only to a waiter, so `NOWAIT` alone
+/// fails every request for its duration. The budget is the loop's, not the request's: once
+/// spent, locks use `NOWAIT` until the window ends, so no run of holders can stall the loop
+/// for longer. `lock_timeout` is per relation, so one statement can overrun by its table count.
 fn acquire_request_locks() -> Result<(), pgrx::spi::Error> {
-    crate::meta::lock_for_read()?;
-    crate::group::lock_for_read()?;
-    crate::acl::lock_for_read()?;
-    crate::producer::lock_for_read()?;
-    crate::storage::lock_for_read()?;
+    let budget = lock_wait_left();
+    let started = Instant::now();
+    let mut timeout_set = false;
+    // A lock failure is an ERROR, so it skips the reset below; `guarded` charges it then.
+    LOCKING_SINCE.with(|l| l.set(Some(started)));
+    let locked = (|| -> Result<(), pgrx::spi::Error> {
+        let locks: [fn(LockWait) -> Result<(), pgrx::spi::Error>; 5] = [
+            crate::meta::lock_for_read,
+            crate::group::lock_for_read,
+            crate::acl::lock_for_read,
+            crate::producer::lock_for_read,
+            crate::storage::lock_for_read,
+        ];
+        for lock in locks {
+            // Until something waits, the budget is all left: set it once, not per statement.
+            let waited = started.elapsed();
+            let left = budget.saturating_sub(waited);
+            if left < MIN_LOCK_WAIT {
+                lock(LockWait::NoWait)?;
+                continue;
+            }
+            if !timeout_set || waited >= MIN_LOCK_WAIT {
+                let ms = left.as_millis();
+                pgrx::Spi::run(&format!("SET LOCAL lock_timeout = '{ms}ms'"))?;
+                timeout_set = true;
+            }
+            lock(LockWait::Bounded)?;
+        }
+        Ok(())
+    })();
+    LOCKING_SINCE.with(|l| l.set(None));
+    charge_lock_wait(started.elapsed());
+    locked?;
     // Row-lock backstop. Deliberately not tiny: a producer waiting on another producer's
     pgrx::Spi::run("SET LOCAL lock_timeout = '2s'")?;
     pgrx::Spi::run("SET LOCAL statement_timeout = '5s'")
+}
+
+/// Table-lock waiting allowed per [`LOCK_WAIT_WINDOW`]. Outlasts a vacuum truncation, which
+/// checks for waiters every 20 ms.
+const LOCK_WAIT_BUDGET: Duration = Duration::from_millis(250);
+const LOCK_WAIT_WINDOW: Duration = Duration::from_secs(5);
+/// A lock phase shorter than this is not charged, so an uncontended phase that is merely slow
+/// (many `kafgres_log` partitions, a loaded backend) cannot drain the budget.
+const MIN_LOCK_WAIT: Duration = Duration::from_millis(10);
+
+thread_local! {
+    /// Start of the current window and the waiting charged to it.
+    static LOCK_WAITED: Cell<Option<(Instant, Duration)>> = const { Cell::new(None) };
+    /// When the in-progress lock phase began.
+    static LOCKING_SINCE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+fn lock_wait_left() -> Duration {
+    match LOCK_WAITED.with(|w| w.get()) {
+        Some((start, spent)) if start.elapsed() < LOCK_WAIT_WINDOW => {
+            LOCK_WAIT_BUDGET.saturating_sub(spent)
+        }
+        _ => LOCK_WAIT_BUDGET,
+    }
+}
+
+fn charge_lock_wait(waited: Duration) {
+    if waited < MIN_LOCK_WAIT {
+        return;
+    }
+    LOCK_WAITED.with(|w| {
+        w.set(Some(match w.get() {
+            Some((start, spent)) if start.elapsed() < LOCK_WAIT_WINDOW => (start, spent + waited),
+            _ => (Instant::now(), waited),
+        }))
+    });
+}
+
+/// Whether a request's table locks wait (briefly) or fail at once.
+#[derive(Clone, Copy)]
+pub enum LockWait {
+    Bounded,
+    NoWait,
+}
+
+impl LockWait {
+    /// ACCESS SHARE on `tables`, a comma-separated list.
+    pub fn lock(self, tables: &str) -> Result<(), pgrx::spi::Error> {
+        let nowait = match self {
+            LockWait::Bounded => "",
+            LockWait::NoWait => " NOWAIT",
+        };
+        pgrx::Spi::run(&format!("LOCK TABLE {tables} IN ACCESS SHARE MODE{nowait}"))
+    }
 }
 
 /// Run `f` inside a savepoint, catching a Postgres error rather than letting it unwind: on
@@ -132,9 +220,17 @@ pub fn contained<T>(f: impl FnOnce() -> Result<T, HandlerError>) -> Result<T, Ha
 
 /// The wrapper every request-path transaction body should use: timeouts applied, query
 pub fn guarded<T>(f: impl FnOnce() -> Result<T, HandlerError>) -> Result<T, HandlerError> {
-    // Locks first, and inside the savepoint: a NOWAIT failure is an ordinary error the
-    with_subtransaction(|| {
-        acquire_request_locks()?;
-        f()
-    })
+    // Locks first, and inside the savepoint: a lock failure is an ordinary error the
+    atomically(
+        || {
+            acquire_request_locks()?;
+            f()
+        },
+        |message| {
+            if let Some(since) = LOCKING_SINCE.with(|l| l.replace(None)) {
+                charge_lock_wait(since.elapsed());
+            }
+            HandlerError::Internal(format!("query aborted: {message}"))
+        },
+    )
 }
