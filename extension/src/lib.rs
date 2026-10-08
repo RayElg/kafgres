@@ -12,6 +12,7 @@ pub mod archive;
 pub mod cdc;
 pub mod decoding;
 pub mod config;
+pub mod consume_sql;
 pub mod clock;
 mod dbtx;
 mod ddl;
