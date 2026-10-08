@@ -520,6 +520,56 @@ def test_a_held_table_lock_does_not_wedge_the_broker(topic):
     out = kcat("-L")
     assert out.returncode == 0, out.stderr
 
+def test_a_vacuum_truncating_a_broker_table_fails_no_request():
+    """Vacuum truncates a table's empty tail under ACCESS EXCLUSIVE and yields only to a
+    waiter, so a NOWAIT lock fails, and the request loses its connection, for the whole
+    truncation. Plain VACUUM stands in for autovacuum, on a table every request locks."""
+    from conftest import BROKER_HOST, BROKER_PORT, METADATA, Connection
+    import socket as _socket
+    import threading
+
+    filler = "vacuum-truncate-filler"
+    sql(f"DELETE FROM kafgres_offsets WHERE group_id LIKE '{filler}-%'")
+    sql(f"""INSERT INTO kafgres_offsets (group_id, topic_id, partition, committed_offset, metadata)
+            SELECT '{filler}-' || g, 0, 0, 0, repeat('x', 500) FROM generate_series(1, 300000) g""")
+    sql(f"DELETE FROM kafgres_offsets WHERE group_id LIKE '{filler}-%'")
+    before = int(sql("SELECT pg_relation_size('kafgres_offsets')"))
+
+    stop = threading.Event()
+    served, failure = [0], []
+
+    def hammer():
+        s = _socket.create_connection((BROKER_HOST, BROKER_PORT), timeout=10)
+        c = Connection(s)
+        try:
+            n = 0
+            while not stop.is_set():
+                n += 1
+                c.send(METADATA, 1, n, body=struct.pack(">i", -1))
+                resp = c.recv()
+                assert struct.unpack_from(">i", resp, 0)[0] == n
+                served[0] += 1
+        except Exception as e:  # the broker closes the connection on a failed request
+            failure.append(repr(e))
+        finally:
+            s.close()
+
+    t = threading.Thread(target=hammer)
+    t.start()
+    try:
+        time.sleep(0.5)
+        sql("VACUUM kafgres_offsets")
+        time.sleep(0.5)
+    finally:
+        stop.set()
+        t.join(timeout=30)
+
+    after = int(sql("SELECT pg_relation_size('kafgres_offsets')"))
+    assert after < before // 2, f"vacuum truncated nothing ({before} -> {after}): test is vacuous"
+    assert not failure, f"a request failed while vacuum truncated, after {served[0]}: {failure[0]}"
+    assert served[0] > 0
+
+
 def test_a_fetch_filled_to_the_cap_is_still_served(topic, conn):
     """Batches filling every partition's 1 MiB limit add up to the 8 MiB cap; the envelope
     on top must still fit."""
