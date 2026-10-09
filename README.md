@@ -66,13 +66,13 @@ extension on first start (`CREATE EXTENSION kafgres` runs from the image's init
 scripts). On a cluster you administer yourself, add `kafgres` to
 `shared_preload_libraries` and run `CREATE EXTENSION kafgres;`.
 
-`scripts/kcat-demo.sh` then points `kcat` at it and runs the commands you would run
+`demo/kcat-demo.sh` then points `kcat` at it and runs the commands you would run
 against any Kafka broker. It needs the broker up; with no local `kcat` it builds the
 small test-client image on first use:
 
 ```
 docker compose up -d
-bash scripts/kcat-demo.sh
+bash demo/kcat-demo.sh
 ```
 
 ```
@@ -206,12 +206,12 @@ transaction saw, use `kafgres_produce()`, which runs inside the transaction.
 
 ## Parity demo
 
-`scripts/parity-demo.sh` runs the same commands against kafgres and against a real
+`demo/parity-demo.sh` runs the same commands against kafgres and against a real
 `apache/kafka` broker and diffs the output. It needs both images and nothing else:
 
 ```
 docker compose build && docker build -t kafgres-clients tests/clients
-bash scripts/parity-demo.sh
+bash demo/parity-demo.sh
 ```
 
 ```

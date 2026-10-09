@@ -23,14 +23,8 @@ use kafgres_codec::generated::write_txn_markers_response::{
 use kafgres_codec::records::{build_control_batch, RecordBatch};
 
 use super::HandlerError;
+use crate::clock::now_millis;
 use crate::storage::RawBatch;
-
-pub(super) fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
 
 /// Why a transactional request's `(transactional_id, producer_id, epoch)` cannot act.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -898,16 +892,10 @@ pub fn write_txn_markers(
     req: &WriteTxnMarkersRequest,
     authz: &crate::acl::Authz,
 ) -> Result<WriteTxnMarkersResponse, HandlerError> {
-    super::check_admin_len("transaction markers", req.markers.len())?;
-    let total: usize = req
-        .markers
-        .iter()
-        .map(|m| m.topics.iter().map(|t| t.partition_indexes.len()).sum::<usize>())
-        .sum();
     // Each partition named costs a control batch in memory and an append, while the
-    if total > super::MAX_ADMIN_ITEMS {
-        return Err(HandlerError::TooLarge { what: "marker partitions", n: total });
-    }
+    super::check_nested_len("transaction markers", "marker partitions", &req.markers, |m| {
+        m.topics.iter().map(|t| t.partition_indexes.len()).sum()
+    })?;
 
     let authorized = authz
         .check(

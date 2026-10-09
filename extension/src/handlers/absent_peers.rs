@@ -34,7 +34,7 @@ use kafgres_codec::generated::write_share_group_state_response::{
     PartitionResult as WritePartitionResult, WriteShareGroupStateResponse, WriteStateResult,
 };
 
-use super::{check_admin_len, HandlerError};
+use super::{check_admin_len, check_nested_len, HandlerError};
 use crate::acl::{Authz, Operation, ResourceType};
 
 const NO_PERSISTER: &str =
@@ -51,9 +51,7 @@ fn check_share_state_len<T>(
     topics: &[T],
     partitions: impl Fn(&T) -> usize,
 ) -> Result<(), HandlerError> {
-    check_admin_len("share state topics", topics.len())?;
-    let total: usize = topics.iter().map(partitions).sum();
-    check_admin_len("share state partitions", total)
+    check_nested_len("share state topics", "share state partitions", topics, partitions)
 }
 
 /// The code and reason every persister RPC partition result carries; authorization denial wins.

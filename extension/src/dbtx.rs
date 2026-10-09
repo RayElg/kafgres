@@ -234,3 +234,17 @@ pub fn guarded<T>(f: impl FnOnce() -> Result<T, HandlerError>) -> Result<T, Hand
         },
     )
 }
+
+/// `guarded` in its own transaction. SPI outside a transaction takes the postmaster down.
+pub fn guarded_tx<T>(
+    f: impl FnOnce() -> Result<T, HandlerError> + std::panic::UnwindSafe + std::panic::RefUnwindSafe,
+) -> Result<T, HandlerError> {
+    pgrx::bgworkers::BackgroundWorker::transaction(|| guarded(f))
+}
+
+/// `contained` in its own transaction, for a body that touches no kafgres table.
+pub fn contained_tx<T>(
+    f: impl FnOnce() -> Result<T, HandlerError> + std::panic::UnwindSafe + std::panic::RefUnwindSafe,
+) -> Result<T, HandlerError> {
+    pgrx::bgworkers::BackgroundWorker::transaction(|| contained(f))
+}

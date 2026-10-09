@@ -2,11 +2,7 @@
 //! into an already-cut generation and pay a second round. `join_window_until` holds the
 //! window open so simultaneous arrivals land in one generation, capped by the rebalance deadline.
 
-use pgrx::spi::Spi;
-
-fn run_ddl(sql: &str, operation: &str) {
-    Spi::run(sql).unwrap_or_else(|e| pgrx::error!("kafgres: failed to {}: {}", operation, e));
-}
+use crate::ddl::run_ddl;
 
 pub fn init_160() {
     run_ddl(

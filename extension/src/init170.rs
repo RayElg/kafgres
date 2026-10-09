@@ -2,11 +2,7 @@
 //! start a cluster over at timeline 1. `bias`, added to it, keeps the epochs' timeline
 //! from going backwards.
 
-use pgrx::spi::Spi;
-
-fn run_ddl(sql: &str, operation: &str) {
-    Spi::run(sql).unwrap_or_else(|e| pgrx::error!("kafgres: failed to {}: {}", operation, e));
-}
+use crate::ddl::run_ddl;
 
 pub fn init_170() {
     run_ddl(
