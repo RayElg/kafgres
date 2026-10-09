@@ -549,10 +549,12 @@ fn poll_connections(srv: &mut Server, cfg: &ClusterConfig, ready: Option<&HashSe
             let others = oversize_total.saturating_sub(mine.saturating_sub(tier));
             let others_total = inbound_total.saturating_sub(mine);
             // The request limit plus the 4-byte length prefix.
+            // Admission checks `reserved`, which a frame parked to retry has already left.
             let budget = tier
                 .saturating_add(MAX_OVERSIZE_TOTAL_BYTES.saturating_sub(others))
                 .min(requested_cap.max(tier).saturating_add(4))
-                .min(MAX_INBOUND_TOTAL_BYTES.saturating_sub(others_total));
+                .min(MAX_INBOUND_TOTAL_BYTES.saturating_sub(others_total))
+                .saturating_sub(conn.parked_bytes);
             // Only a frame over the request limit is refused; others wait for budget.
             conn.frame_cap = requested_cap.max(tier);
             let outcome = read_admitted(conn, budget);
@@ -766,6 +768,7 @@ fn serve_one(srv: &mut Server, id: i32, frame: Bytes, cfg: &ClusterConfig) -> bo
         return serve_raw_sasl(srv, id, &frame);
     }
 
+    let frame_len = frame.len();
     let (req, outcome) = match handlers::parse(frame) {
         Ok(v) => v,
         Err(e) => {
@@ -844,7 +847,7 @@ fn serve_one(srv: &mut Server, id: i32, frame: Bytes, cfg: &ClusterConfig) -> bo
             true
         }
         Ok(Disposition::Parked) => true,
-        Err(HandlerError::Busy(why)) => park_retry(srv, id, seq, req, &why),
+        Err(HandlerError::Busy(why)) => park_retry(srv, id, seq, req, frame_len, &why),
         Err(e) => {
             let peer = srv.conns.get(&id).map(|c| c.peer.clone()).unwrap_or_default();
             log!(
@@ -870,6 +873,7 @@ fn park_retry(
     conn_id: i32,
     seq: u64,
     request: handlers::Request,
+    frame_len: usize,
     why: &str,
 ) -> bool {
     let Some(c) = srv.conns.get_mut(&conn_id) else {
@@ -883,7 +887,8 @@ fn park_retry(
     // Once per request: retries run every pass.
     log!("kafgres: {} api {key} v{version}: {why}; retrying", c.peer);
     c.retrying = true;
-    c.parked_bytes = request.body.len();
+    // The whole frame: the body is a slice of its allocation, and the header is decoded beside it.
+    c.parked_bytes = frame_len;
     srv.parked.push(Parked {
         conn_id,
         seq,
@@ -1074,28 +1079,58 @@ fn fetch_wait(max_wait_ms: i32) -> Duration {
 }
 
 /// Evict members that stopped heartbeating, and cut join windows whose deadline passed.
-/// The member behind a classic group request parked to retry: it is alive, only blocked on a
-/// table lock, and the sweep can run in the same pass the lock is released.
-fn retried_member(req: &handlers::Request) -> Option<(String, String)> {
+/// Which member sweep a group request belongs to.
+#[derive(Clone, Copy, PartialEq)]
+enum GroupKind {
+    Classic,
+    Consumer,
+    Share,
+}
+
+/// The member behind a group request parked to retry: it is alive, only blocked on a table
+/// lock, and a sweep can run in the same pass the lock is released.
+fn retried_member(req: &handlers::Request) -> Option<(GroupKind, String, String)> {
     use kafgres_codec::generated::heartbeat_request::HeartbeatRequest;
     use kafgres_codec::generated::join_group_request::JoinGroupRequest;
+    use kafgres_codec::generated::consumer_group_heartbeat_request::ConsumerGroupHeartbeatRequest;
+    use kafgres_codec::generated::share_group_heartbeat_request::ShareGroupHeartbeatRequest;
     use kafgres_codec::generated::sync_group_request::SyncGroupRequest;
 
     let mut body = req.body.clone();
-    let (group_id, member_id) = match req.api_key {
-        11 => JoinGroupRequest::decode(&mut body, req.api_version)
+    let v = req.api_version;
+    let (kind, group_id, member_id) = match req.api_key {
+        11 => JoinGroupRequest::decode(&mut body, v)
             .ok()
-            .map(|r| (r.group_id, r.member_id))?,
-        12 => HeartbeatRequest::decode(&mut body, req.api_version)
+            .map(|r| (GroupKind::Classic, r.group_id, r.member_id))?,
+        12 => HeartbeatRequest::decode(&mut body, v)
             .ok()
-            .map(|r| (r.group_id, r.member_id))?,
-        14 => SyncGroupRequest::decode(&mut body, req.api_version)
+            .map(|r| (GroupKind::Classic, r.group_id, r.member_id))?,
+        14 => SyncGroupRequest::decode(&mut body, v)
             .ok()
-            .map(|r| (r.group_id, r.member_id))?,
+            .map(|r| (GroupKind::Classic, r.group_id, r.member_id))?,
+        68 => ConsumerGroupHeartbeatRequest::decode(&mut body, v)
+            .ok()
+            .map(|r| (GroupKind::Consumer, r.group_id, r.member_id))?,
+        76 => ShareGroupHeartbeatRequest::decode(&mut body, v)
+            .ok()
+            .map(|r| (GroupKind::Share, r.group_id, r.member_id))?,
         _ => return None,
     };
-    // A first JoinGroup has no member id yet.
-    (!member_id.is_empty()).then_some((group_id, member_id))
+    // A first join may not carry a member id yet.
+    (!member_id.is_empty()).then_some((kind, group_id, member_id))
+}
+
+/// Members of `kind` whose requests are parked to retry.
+fn retried_members(srv: &Server, kind: GroupKind) -> Vec<(String, String)> {
+    srv.parked
+        .iter()
+        .filter_map(|p| match &p.waiting {
+            Waiting::Retry { request } => retried_member(request),
+            _ => None,
+        })
+        .filter(|(k, _, _)| *k == kind)
+        .map(|(_, g, m)| (g, m))
+        .collect()
 }
 
 fn expire_group_members(srv: &mut Server) {
@@ -1103,7 +1138,7 @@ fn expire_group_members(srv: &mut Server) {
     if !srv.due(EVERY_N_TICKS) {
         return;
     }
-    let awaiting: Vec<(String, String)> = srv
+    let mut awaiting: Vec<(String, String)> = srv
         .parked
         .iter()
         .filter_map(|p| match &p.waiting {
@@ -1115,10 +1150,10 @@ fn expire_group_members(srv: &mut Server) {
                 group_id,
                 member_id,
             } => Some((group_id.clone(), member_id.clone())),
-            Waiting::Retry { request } => retried_member(request),
-            Waiting::Fetch { .. } => None,
+            Waiting::Fetch { .. } | Waiting::Retry { .. } => None,
         })
         .collect();
+    awaiting.extend(retried_members(srv, GroupKind::Classic));
 
     let changed = BackgroundWorker::transaction(|| {
         crate::dbtx::guarded(|| {
@@ -1404,8 +1439,9 @@ fn expire_share_group_state(srv: &Server) {
     if !srv.due(EVERY_N_TICKS) {
         return;
     }
+    let alive = retried_members(srv, GroupKind::Share);
     if let Err(e) = BackgroundWorker::transaction(|| {
-        crate::dbtx::guarded(crate::handlers::share_group::expire)
+        crate::dbtx::guarded(|| crate::handlers::share_group::expire(&alive))
     }) {
         log!("kafgres: could not expire share group state: {e}");
     }
@@ -1416,8 +1452,9 @@ fn expire_consumer_group_members(srv: &Server) {
     if !srv.due(EVERY_N_TICKS) {
         return;
     }
+    let alive = retried_members(srv, GroupKind::Consumer);
     if let Err(e) = BackgroundWorker::transaction(|| {
-        crate::dbtx::guarded(crate::handlers::consumer_group::expire_members)
+        crate::dbtx::guarded(|| crate::handlers::consumer_group::expire_members(&alive))
     }) {
         log!("kafgres: could not expire consumer group members: {e}");
     }

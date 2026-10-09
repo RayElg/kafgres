@@ -493,3 +493,141 @@ def test_parked_fetches_past_their_deadline_behind_a_held_lock_do_not_slow_the_l
     assert not errors, f"{len(errors)} parked fetches were not answered cleanly"
     assert worst < 0.1, f"the loop took {worst * 1000:.0f} ms to answer ApiVersions " \
                         f"with 300 expired fetches behind a held lock"
+
+
+def _restart_postgres():
+    subprocess.run(["docker", "compose", "restart", "postgres"], check=True,
+                   capture_output=True, timeout=180)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        try:
+            if broker_pid():
+                return
+        except RuntimeError:
+            pass  # still starting
+        time.sleep(0.5)
+    raise AssertionError("the broker worker did not start")
+
+
+@pytest.fixture
+def prepared_transactions():
+    """A prepared transaction keeps its locks across a restart: the one way to have a table
+    lock held while the broker worker starts."""
+    if sql("SHOW max_prepared_transactions") == "0":
+        sql("ALTER SYSTEM SET max_prepared_transactions = 4")
+        _restart_postgres()
+    yield
+    sql("ALTER SYSTEM RESET max_prepared_transactions")
+    _restart_postgres()
+
+
+def test_startup_reconciliation_waits_out_a_held_lock(topic, prepared_transactions):
+    """A crash can leave a marker past the recovered log end; the worker drops it at start,
+    before serving. If a table lock is held then, it must wait for the lock rather than give
+    up: a stale marker makes the next batch at its offset read as committed."""
+    tid = sql(f"SELECT topic_id FROM kafgres_topics WHERE name = '{TOPIC}'")
+    sql(f"INSERT INTO kafgres_markers VALUES ({tid}, 0, 5, 5, 100)")
+
+    def markers():
+        return int(sql(f"SELECT count(*) FROM kafgres_markers WHERE topic_id = {tid}"))
+
+    gid = "hunt-lockwait-startup"
+    try:
+        sql(f"BEGIN; LOCK TABLE kafgres_offsets IN ACCESS EXCLUSIVE MODE; "
+            f"PREPARE TRANSACTION '{gid}';")
+        _restart_postgres()
+        time.sleep(3)  # long enough to have tried reconciliation behind the lock
+        assert markers() == 1, "reconciled through a held lock: test is vacuous"
+        sql(f"ROLLBACK PREPARED '{gid}'")
+        deadline = time.monotonic() + 10
+        while markers() and time.monotonic() < deadline:
+            time.sleep(0.5)
+        assert markers() == 0, "the stale marker survived a start behind a held lock"
+    finally:
+        if sql(f"SELECT count(*) FROM pg_prepared_xacts WHERE gid = '{gid}'") != "0":
+            sql(f"ROLLBACK PREPARED '{gid}'")
+        sql(f"DELETE FROM kafgres_markers WHERE topic_id = {tid}")
+
+
+def test_a_group_member_outlives_a_lock_held_past_its_session_timeout(topic):
+    """A consumer's heartbeat waits behind a lock held longer than its session timeout. It
+    must land before the member sweep judges the member silent, so the group keeps its
+    generation instead of rebalancing a member that never stopped heartbeating."""
+    from kafka import KafkaConsumer
+
+    group = "hunt-lockwait-session"
+    stop = threading.Event()
+    errors = []
+
+    def consume():
+        try:
+            c = KafkaConsumer(TOPIC, bootstrap_servers=f"{BROKER_HOST}:{BROKER_PORT}",
+                              group_id=group, session_timeout_ms=6000,
+                              heartbeat_interval_ms=1000, enable_auto_commit=False)
+            while not stop.is_set():
+                c.poll(timeout_ms=200)
+            c.close(autocommit=False)
+        except Exception as e:
+            errors.append(repr(e))
+
+    def member():
+        return sql(f"SELECT g.generation || ' ' || m.member_id FROM kafgres_groups g "
+                   f"JOIN kafgres_group_members m USING (group_id) "
+                   f"WHERE g.group_id = '{group}' AND g.state = 'Stable'")
+
+    t = threading.Thread(target=consume)
+    t.start()
+    try:
+        deadline = time.monotonic() + 30
+        while not member() and time.monotonic() < deadline:
+            time.sleep(0.5)
+        before = member()
+        assert before, "the consumer never joined"
+        with Holder() as held:
+            time.sleep(8)
+            held.release()
+        time.sleep(4)
+        after = member()
+    finally:
+        stop.set()
+        t.join(timeout=30)
+    assert not errors, errors
+    assert after == before, f"the member was rebalanced: {before!r} -> {after!r}"
+
+
+def test_parked_frames_count_against_the_inbound_cap(topic):
+    """Every connection sends a large Produce while a lock is held, and each one parks. A
+    parked frame stays allocated, so it must stay counted: past the 512 MiB inbound cap,
+    further frames must wait unread rather than be taken off the socket and parked."""
+    n, size = 120, 5 * 1024 * 1024
+    cap = 512 * 1024 * 1024
+    body = produce_v3(TOPIC, 0, record_batch([b"x" * size]))
+    header = struct.pack(">hhi", PRODUCE, 3, 1) + struct.pack(">h", 6) + b"pytest"
+    frame = struct.pack(">i", len(header) + len(body)) + header + body
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 1))
+    answered = [0]
+    lock = threading.Lock()
+
+    def client():
+        with _connect() as s:
+            s.settimeout(120)
+            s.sendall(frame)
+            if struct.unpack_from(">i", Connection(s).recv(), 0)[0] == 1:
+                with lock:
+                    answered[0] += 1
+
+    threads = [threading.Thread(target=client) for _ in range(n)]
+    with Holder() as held:
+        for t in threads:
+            t.start()
+        time.sleep(8)
+        logs = subprocess.run(["docker", "compose", "logs", "--since", since, "postgres"],
+                              capture_output=True, text=True, timeout=60).stdout
+        parked = sum(1 for ln in logs.splitlines() if "api 0 v3" in ln and "retrying" in ln)
+        held.release()
+    for t in threads:
+        t.join(timeout=150)
+    assert parked > 1, "nothing parked: test is vacuous"
+    assert parked * len(frame) <= cap + len(frame), \
+        f"{parked} frames of {len(frame)} bytes parked, past the {cap}-byte inbound cap"
+    assert answered[0] == n, f"{n - answered[0]} of {n} produces were never answered"
