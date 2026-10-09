@@ -1,5 +1,6 @@
 //! Storage boundary: every read or write of log data goes through [`LogStore`].
 
+pub mod cursor;
 pub mod pmeta;
 pub mod segment;
 pub mod table;
@@ -270,6 +271,9 @@ pub struct FetchSlice {
     /// Last Stable Offset — equal to `high_watermark` when no transaction is in flight.
     pub last_stable_offset: i64,
     pub aborted: Vec<AbortedTxn>,
+    /// Set when `aborted` hit its cap: transactions first written at or after this offset
+    /// may be missing from it, so a batch reaching it cannot be judged from this slice.
+    pub aborted_cut_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

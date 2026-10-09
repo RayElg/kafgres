@@ -148,9 +148,10 @@ broker.
 
 Install the new build, restart Postgres, then run `ALTER EXTENSION kafgres UPDATE;` in
 the database the broker uses. The broker serves across the restart before the update
-runs; the update changes who may call the administrative functions (see
-[docs/producing.md](docs/producing.md#who-may-produce)) and pins `kafgres_produce()`'s
-search path.
+runs. Updating from 0.3.0 adds `kafgres_read()` ([docs/reading.md](docs/reading.md)),
+executable by no role until it is granted. Updating from 0.2.0 also changes who may call
+the administrative functions (see [docs/producing.md](docs/producing.md#who-may-produce))
+and pins `kafgres_produce()`'s search path.
 
 From 0.2.0, the first start on the segment engine removes the log's old-format
 `.timeindex` files. Nothing is lost: timestamp lookups scan the segments written before
@@ -272,6 +273,7 @@ both brokers in eighteen more, in CI on every pull request.
 |-----|----------|
 | [docs/architecture.md](docs/architecture.md) | The design: one broker per instance, how durability maps onto Postgres, both storage engines, transactional produce, segment replication. |
 | [docs/producing.md](docs/producing.md) | The three produce paths, CDC mappings, and how to choose between them. |
+| [docs/reading.md](docs/reading.md) | `kafgres_read()`: a topic's records as rows, by offset or time range, for SQL to filter and join. |
 | [docs/conformance.md](docs/conformance.md) | The client matrix, how the suite runs, and the catalogue of client-visible differences from Kafka. |
 | [docs/configuration.md](docs/configuration.md) | Every `kafgres.*` setting: scope, default, and what it controls. |
 
@@ -292,7 +294,7 @@ codec/          kafgres-codec, the wire protocol. No pgrx, no Postgres, unit-tes
   src/generated/     emitted by codec-gen and checked in; do not edit
 codec-gen/      the generator. `cargo run -p kafgres-codec-gen`
 extension/      the pgrx extension. Its own workspace on purpose.
-docs/           architecture.md, producing.md, conformance.md, configuration.md
+docs/           architecture.md, producing.md, reading.md, conformance.md, configuration.md
 ```
 
 ## Build

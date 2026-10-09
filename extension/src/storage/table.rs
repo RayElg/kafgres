@@ -224,6 +224,41 @@ pub fn lock_for_read(wait: crate::dbtx::LockWait) -> Result<(), pgrx::spi::Error
     wait.lock("kafgres_log, kafgres_log_segments")
 }
 
+/// A batch column copied out in SPI's own context. pgrx's `get::<Vec<u8>>` detoasts into the
+/// transaction's context, so a long statement would hold every batch it read.
+fn bytea_column(row: &pgrx::spi::SpiHeapTupleData<'_>, ordinal: usize) -> Result<Option<Vec<u8>>, spi::Error> {
+    let Some(RawBytea(datum)) = row.get::<RawBytea>(ordinal)? else {
+        return Ok(None);
+    };
+    // SAFETY: a non-null bytea from the row; the detoasted copy is in SPI's current context,
+    // freed at SPI_finish, and is copied out before then.
+    unsafe {
+        let plain = pg_sys::pg_detoast_datum_packed(datum.cast_mut_ptr());
+        let len = pgrx::varlena::varsize_any_exhdr(plain);
+        let data = pgrx::varlena::vardata_any(plain) as *const u8;
+        Ok(Some(std::slice::from_raw_parts(data, len).to_vec()))
+    }
+}
+
+/// A `bytea` datum as SPI holds it, neither detoasted nor copied.
+struct RawBytea(pg_sys::Datum);
+
+impl FromDatum for RawBytea {
+    unsafe fn from_polymorphic_datum(datum: pg_sys::Datum, is_null: bool, _: pg_sys::Oid) -> Option<Self> {
+        (!is_null).then_some(RawBytea(datum))
+    }
+}
+
+impl IntoDatum for RawBytea {
+    fn into_datum(self) -> Option<pg_sys::Datum> {
+        Some(self.0)
+    }
+
+    fn type_oid() -> pg_sys::Oid {
+        pg_sys::BYTEAOID
+    }
+}
+
 fn spi_err(e: impl std::fmt::Display) -> StoreError {
     StoreError::Io(e.to_string())
 }
@@ -410,6 +445,7 @@ impl LogStore for TableStore {
         let mut bytes: Vec<u8> = Vec::new();
         let mut next_offset = offset;
         let mut aborted: Vec<AbortedTxn> = Vec::new();
+        let mut aborted_cut_at = None;
 
         if offset < ceiling {
 
@@ -438,7 +474,7 @@ impl LogStore for TableStore {
 
             for row in rows {
                 let last: i64 = row.get(2)?.unwrap_or(0);
-                let blob: Vec<u8> = match row.get::<Vec<u8>>(3)? {
+                let blob: Vec<u8> = match bytea_column(&row, 3)? {
                     Some(b) => b,
                     None => continue,
                 };
@@ -457,7 +493,8 @@ impl LogStore for TableStore {
 
             // Aborted txns from the index, not the batches in hand: a txn spanning fetches reads as committed.
             if matches!(isolation, IsolationLevel::ReadCommitted) {
-                aborted = pmeta::aborted_txns(topic, partition, offset, next_offset.max(offset + 1))?;
+                (aborted, aborted_cut_at) =
+                    pmeta::aborted_txns(topic, partition, offset, next_offset.max(offset + 1))?;
             }
         }
 
@@ -468,6 +505,7 @@ impl LogStore for TableStore {
             log_start_offset: log_start,
             last_stable_offset: lso,
             aborted,
+            aborted_cut_at,
         })
     }
 
@@ -507,7 +545,7 @@ impl LogStore for TableStore {
             )?;
             let mut found: Option<Vec<u8>> = None;
             for row in rows {
-                found = row.get::<Vec<u8>>(1)?;
+                found = bytea_column(&row, 1)?;
             }
             Ok::<_, spi::Error>(found)
         })
@@ -1032,7 +1070,7 @@ impl Cleanable {
             let mut out = Vec::new();
             for row in rows {
                 if let (Some(base), Some(blob), Some(ts)) =
-                    (row.get::<i64>(1)?, row.get::<Vec<u8>>(2)?, row.get::<i64>(3)?)
+                    (row.get::<i64>(1)?, bytea_column(&row, 2)?, row.get::<i64>(3)?)
                 {
                     out.push((base, blob, ts));
                 }
