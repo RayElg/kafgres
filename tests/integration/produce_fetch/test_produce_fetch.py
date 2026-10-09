@@ -509,7 +509,7 @@ def test_a_held_table_lock_does_not_wedge_the_broker(topic):
         ["docker", "compose", "logs", "--since", since, "postgres"],
         capture_output=True, text=True, timeout=60,
     ).stdout
-    assert "query aborted" in logs.lower(), "no lock conflict occurred — test is vacuous"
+    assert "could not obtain lock" in logs.lower(), "no lock conflict occurred — test is vacuous"
     deaths = [
         ln for ln in logs.splitlines()
         if "kafgres_broker" in ln and ("exited" in ln or "terminated" in ln)
@@ -522,8 +522,9 @@ def test_a_held_table_lock_does_not_wedge_the_broker(topic):
 
 def test_a_vacuum_truncating_a_broker_table_fails_no_request():
     """Vacuum truncates a table's empty tail under ACCESS EXCLUSIVE and yields only to a
-    waiter, so a NOWAIT lock fails, and the request loses its connection, for the whole
-    truncation. Plain VACUUM stands in for autovacuum, on a table every request locks."""
+    waiter, so a NOWAIT lock fails for the whole truncation; a request that lost its
+    connection over it would have failed. Plain VACUUM stands in for autovacuum, on a table
+    every request locks. test_hunt_lock_wait.py goes after the same thing harder."""
     from conftest import BROKER_HOST, BROKER_PORT, METADATA, Connection
     import socket as _socket
     import threading

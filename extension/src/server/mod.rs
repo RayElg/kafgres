@@ -50,6 +50,10 @@ const MAX_PARKED: usize = 4096;
 /// Longest we will hold a Fetch, whatever the client asked for: `fetch.max.wait.ms` is
 const MAX_FETCH_WAIT: Duration = Duration::from_millis(5_000);
 
+/// How long a request may find a table lock held before its connection is closed. Outlasts
+/// a vacuum truncation; a `VACUUM FULL` or an operator's `LOCK` may never end.
+const MAX_LOCK_RETRY: Duration = Duration::from_secs(10);
+
 /// Failed SASL steps a connection may make before it is dropped.
 const MAX_SASL_FAILURES: u32 = 3;
 
@@ -80,6 +84,12 @@ struct Conn {
     /// A produce response is queued whose bytes are not yet on the platter. Only such a
     /// connection holds its acks back; a consumer that never produces keeps its mid-pass flush.
     awaiting_sync: bool,
+    /// A request is parked behind a held table lock. Later requests wait for it: Kafka runs
+    /// a connection's requests in order.
+    retrying: bool,
+    /// Size of the frame parked to retry. Taking a frame releases it from the inbound
+    /// budgets, so a parked one is counted here.
+    parked_bytes: usize,
 
     sasl: crate::sasl::SaslState,
     /// Failed SASL steps on this connection: a failed proof leaves the state at
@@ -153,6 +163,8 @@ enum Waiting {
     },
     Join { group_id: String, member_id: String },
     Sync { group_id: String, member_id: String },
+    /// A request behind a held table lock, dispatched again each pass up to [`MAX_LOCK_RETRY`].
+    Retry { request: handlers::Request },
 }
 
 struct Parked {
@@ -314,13 +326,7 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
     refresh_acls(&mut srv);
 
     // After recovery has truncated any torn tail, and before serving: a marker pointing
-    match BackgroundWorker::transaction(|| {
-        crate::dbtx::guarded(|| Ok(crate::produce_sql::reconcile_markers(&mut *crate::storage::open())))
-    }) {
-        Ok(0) => {}
-        Ok(n) => log!("kafgres: marker reconciliation dropped {n} orphaned marker(s)"),
-        Err(e) => log!("kafgres: marker reconciliation failed: {e}"),
-    }
+    let mut markers_reconciled = reconcile_markers();
 
     // The wait returns as soon as any socket has bytes; `tick` only bounds the sweeps.
     // A pass that served a frame polls again immediately: a pipelining client's next
@@ -377,11 +383,20 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
             }
             continue;
         }
+        // Serving past a stale marker lets a rolled-back batch at its offset read as committed.
+        if !markers_reconciled {
+            spin = false;
+            if srv.due(200) {
+                markers_reconciled = reconcile_markers();
+            }
+            continue;
+        }
 
         let served_before = srv.served;
 
         refresh_acls(&mut srv);
         accept_new(&listener, &mut srv);
+        retry_parked(&mut srv, &cfg);
         poll_connections(&mut srv, &cfg, None);
         drop_unauthenticated(&mut srv);
         expire_group_members(&mut srv);
@@ -447,6 +462,8 @@ fn accept_new(listener: &TcpListener, srv: &mut Server) {
                         prefix_pending: false,
                         last_read: Instant::now(),
                         awaiting_sync: false,
+                        retrying: false,
+                        parked_bytes: 0,
                         outbuf: BytesMut::new(),
                         next_seq: 0,
                         flush_seq: 0,
@@ -617,7 +634,7 @@ enum ReadResult {
 impl Conn {
     /// Bytes counted against the shared inbound budgets.
     fn claim(&self) -> usize {
-        self.inbuf.len().max(self.reserved)
+        self.inbuf.len().max(self.reserved) + self.parked_bytes
     }
 
     /// Bytes of an admitted body have yet to arrive. Missing bytes that are only the next
@@ -695,6 +712,9 @@ fn serve_frames(srv: &mut Server, id: i32, cfg: &ClusterConfig) -> bool {
             // a pipelining client refill mid-pass and keeps `outbuf` drained between requests.
             if !conn.flush_unless_held() {
                 return false;
+            }
+            if conn.retrying {
+                return true;
             }
             if conn.queued_bytes() > MAX_CONN_BUFFER_BYTES {
                 // Behind a barrier nothing could have drained, so the backlog was built by
@@ -793,6 +813,7 @@ fn serve_one(srv: &mut Server, id: i32, frame: Bytes, cfg: &ClusterConfig) -> bo
         );
         handlers::write_unsupported(&mut out, &req, outcome).map(|()| Disposition::Reply)
     } else {
+        crate::dbtx::begin_request();
         dispatch::dispatch(&mut out, &req, cfg, srv, id, seq)
     };
 
@@ -823,6 +844,7 @@ fn serve_one(srv: &mut Server, id: i32, frame: Bytes, cfg: &ClusterConfig) -> bo
             true
         }
         Ok(Disposition::Parked) => true,
+        Err(HandlerError::Busy(why)) => park_retry(srv, id, seq, req, &why),
         Err(e) => {
             let peer = srv.conns.get(&id).map(|c| c.peer.clone()).unwrap_or_default();
             log!(
@@ -839,6 +861,40 @@ enum Disposition {
     Reply,
     NoReply,
     Parked,
+}
+
+/// Park a request behind a held table lock, and its connection's later requests with it.
+/// False closes the connection.
+fn park_retry(
+    srv: &mut Server,
+    conn_id: i32,
+    seq: u64,
+    request: handlers::Request,
+    why: &str,
+) -> bool {
+    let Some(c) = srv.conns.get_mut(&conn_id) else {
+        return false;
+    };
+    let (key, version) = (request.api_key, request.api_version);
+    if srv.parked.len() >= MAX_PARKED {
+        log!("kafgres: {} api {key} v{version}: {why}, and the parking cap is reached; closing", c.peer);
+        return false;
+    }
+    // Once per request: retries run every pass.
+    log!("kafgres: {} api {key} v{version}: {why}; retrying", c.peer);
+    c.retrying = true;
+    c.parked_bytes = request.body.len();
+    srv.parked.push(Parked {
+        conn_id,
+        seq,
+        correlation_id: request.correlation_id,
+        api_key: request.api_key,
+        api_version: request.api_version,
+        client_id: request.client_id.clone().unwrap_or_default(),
+        deadline: Instant::now() + MAX_LOCK_RETRY,
+        waiting: Waiting::Retry { request },
+    });
+    true
 }
 
 /// One unwrapped SASL token, for a connection that handshook at v0: no correlation id and no response header, so a failure closes the connection.
@@ -1018,6 +1074,30 @@ fn fetch_wait(max_wait_ms: i32) -> Duration {
 }
 
 /// Evict members that stopped heartbeating, and cut join windows whose deadline passed.
+/// The member behind a classic group request parked to retry: it is alive, only blocked on a
+/// table lock, and the sweep can run in the same pass the lock is released.
+fn retried_member(req: &handlers::Request) -> Option<(String, String)> {
+    use kafgres_codec::generated::heartbeat_request::HeartbeatRequest;
+    use kafgres_codec::generated::join_group_request::JoinGroupRequest;
+    use kafgres_codec::generated::sync_group_request::SyncGroupRequest;
+
+    let mut body = req.body.clone();
+    let (group_id, member_id) = match req.api_key {
+        11 => JoinGroupRequest::decode(&mut body, req.api_version)
+            .ok()
+            .map(|r| (r.group_id, r.member_id))?,
+        12 => HeartbeatRequest::decode(&mut body, req.api_version)
+            .ok()
+            .map(|r| (r.group_id, r.member_id))?,
+        14 => SyncGroupRequest::decode(&mut body, req.api_version)
+            .ok()
+            .map(|r| (r.group_id, r.member_id))?,
+        _ => return None,
+    };
+    // A first JoinGroup has no member id yet.
+    (!member_id.is_empty()).then_some((group_id, member_id))
+}
+
 fn expire_group_members(srv: &mut Server) {
     const EVERY_N_TICKS: u64 = 100; // ~500ms at the default 5ms tick
     if !srv.due(EVERY_N_TICKS) {
@@ -1035,6 +1115,7 @@ fn expire_group_members(srv: &mut Server) {
                 group_id,
                 member_id,
             } => Some((group_id.clone(), member_id.clone())),
+            Waiting::Retry { request } => retried_member(request),
             Waiting::Fetch { .. } => None,
         })
         .collect();
@@ -1112,6 +1193,29 @@ fn raise_fd_limit() {
 ///
 /// The timeline is the high half: a diverged primary restarting on its old timeline never
 /// reaches the epochs a promotion takes.
+/// Drop markers past the recovered log end. False only on a held table lock; other failures
+/// are logged and serving proceeds.
+fn reconcile_markers() -> bool {
+    crate::dbtx::begin_request();
+    match BackgroundWorker::transaction(|| {
+        crate::dbtx::guarded(|| Ok(crate::produce_sql::reconcile_markers(&mut *crate::storage::open())))
+    }) {
+        Ok(0) => true,
+        Ok(n) => {
+            log!("kafgres: marker reconciliation dropped {n} orphaned marker(s)");
+            true
+        }
+        Err(HandlerError::Busy(why)) => {
+            log!("kafgres: marker reconciliation waits for a table lock: {why}");
+            false
+        }
+        Err(e) => {
+            log!("kafgres: marker reconciliation failed: {e}");
+            true
+        }
+    }
+}
+
 fn raise_leader_epochs() -> bool {
     let result = BackgroundWorker::transaction(|| {
         crate::dbtx::guarded(|| {
@@ -1355,6 +1459,68 @@ fn enforce_retention(srv: &mut Server) {
     }
 }
 
+/// Dispatch again each request parked behind a held table lock. Runs before the member
+/// sweeps, so a Heartbeat that waited out the lock lands before the member is judged silent.
+fn retry_parked(srv: &mut Server, cfg: &ClusterConfig) {
+    if !srv.parked.iter().any(|p| matches!(p.waiting, Waiting::Retry { .. })) {
+        return;
+    }
+    let now = Instant::now();
+    let (retries, rest): (Vec<Parked>, Vec<Parked>) = std::mem::take(&mut srv.parked)
+        .into_iter()
+        .partition(|p| matches!(p.waiting, Waiting::Retry { .. }));
+    srv.parked = rest;
+    let mut still_waiting = Vec::new();
+    // Every request takes the same locks, so once one finds them held the rest would too.
+    let mut locks_held = false;
+
+    for p in retries {
+        if !srv.conns.contains_key(&p.conn_id) {
+            continue;
+        }
+        let expired = now >= p.deadline;
+        if locks_held && !expired {
+            still_waiting.push(p);
+            continue;
+        }
+        let Waiting::Retry { request } = &p.waiting else {
+            continue;
+        };
+        crate::dbtx::begin_request();
+        let mut out = BytesMut::new();
+        match dispatch::dispatch(&mut out, request, cfg, srv, p.conn_id, p.seq) {
+            Err(HandlerError::Busy(_)) if !expired => {
+                locks_held = true;
+                still_waiting.push(p);
+                continue;
+            }
+            Err(e) => {
+                let peer = srv.conns.get(&p.conn_id).map(|c| c.peer.clone());
+                log!(
+                    "kafgres: {} api {} v{}: {e}",
+                    peer.unwrap_or_default(),
+                    p.api_key,
+                    p.api_version
+                );
+                drop_conn(srv, p.conn_id);
+                continue;
+            }
+            // Parked again (Fetch, Join) under the same `seq`, replacing this entry.
+            Ok(Disposition::Parked) => {}
+            Ok(Disposition::Reply) | Ok(Disposition::NoReply) => {
+                if let Some(c) = srv.conns.get_mut(&p.conn_id) {
+                    c.complete(p.seq, out);
+                }
+            }
+        }
+        if let Some(c) = srv.conns.get_mut(&p.conn_id) {
+            c.retrying = false;
+            c.parked_bytes = 0;
+        }
+    }
+    srv.parked.extend(still_waiting);
+}
+
 fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
     if srv.parked.is_empty() {
         srv.appended.clear();
@@ -1368,14 +1534,23 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
 
     let pending = std::mem::take(&mut srv.parked);
     let mut still_parked = Vec::with_capacity(pending.len());
+    let mut locks_held = false;
 
     for p in pending {
         if !srv.conns.contains_key(&p.conn_id) {
             continue;
         }
         let expired = now >= p.deadline;
+        // A completion behind a held table lock retries until this.
+        let may_retry = now < p.deadline + MAX_LOCK_RETRY;
+        crate::dbtx::begin_request();
 
         let encoded = match &p.waiting {
+            // Dispatched again by `retry_parked`, earlier in the pass.
+            Waiting::Retry { .. } => {
+                still_parked.push(p);
+                continue;
+            }
             Waiting::Fetch {
                 request,
                 watching,
@@ -1383,6 +1558,12 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
             } => {
                 let woken = watching.iter().any(|k| appended.contains(k));
                 if !expired && !woken {
+                    still_parked.push(p);
+                    continue;
+                }
+                // Stay woken, or the retry waits for the deadline.
+                if locks_held && may_retry {
+                    srv.appended.extend(watching.iter().copied());
                     still_parked.push(p);
                     continue;
                 }
@@ -1408,6 +1589,12 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
                         );
                         encode_parked(&p, &body)
                     }
+                    Err(HandlerError::Busy(_)) if may_retry => {
+                        locks_held = true;
+                        srv.appended.extend(watching.iter().copied());
+                        still_parked.push(p);
+                        continue;
+                    }
                     Err(e) => {
                         log!("kafgres: parked fetch failed: {e}");
                         drop_conn(srv, p.conn_id);
@@ -1426,6 +1613,12 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
                 }
                 let group_id = group_id.clone();
                 let member_id = member_id.clone();
+                // Stay woken, or the retry waits for the deadline.
+                if locks_held && may_retry {
+                    srv.groups_changed.insert(group_id);
+                    still_parked.push(p);
+                    continue;
+                }
                 let ready = BackgroundWorker::transaction(|| {
                     crate::dbtx::guarded(|| {
                         let g = crate::group::load(&group_id)?;
@@ -1456,6 +1649,12 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
                         still_parked.push(p);
                         continue;
                     }
+                    Err(HandlerError::Busy(_)) if may_retry => {
+                        locks_held = true;
+                        srv.groups_changed.insert(group_id);
+                        still_parked.push(p);
+                        continue;
+                    }
                     Err(e) => {
                         log!("kafgres: parked join failed: {e}");
                         drop_conn(srv, p.conn_id);
@@ -1474,6 +1673,12 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
                 }
                 let group_id = group_id.clone();
                 let member_id = member_id.clone();
+                // Stay woken, or the retry waits for the deadline.
+                if locks_held && may_retry {
+                    srv.groups_changed.insert(group_id);
+                    still_parked.push(p);
+                    continue;
+                }
                 let ready = BackgroundWorker::transaction(|| {
                     crate::dbtx::guarded(|| {
                         handlers::join_sync::sync_response(&group_id, &member_id)
@@ -1491,6 +1696,12 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
                             kafgres_codec::ErrorCode::RebalanceInProgress,
                         ),
                     ),
+                    Err(HandlerError::Busy(_)) if may_retry => {
+                        locks_held = true;
+                        srv.groups_changed.insert(group_id);
+                        still_parked.push(p);
+                        continue;
+                    }
                     Err(e) => {
                         log!("kafgres: parked sync failed: {e}");
                         drop_conn(srv, p.conn_id);

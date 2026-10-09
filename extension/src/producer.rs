@@ -433,8 +433,8 @@ pub fn sweep(policy: Retention) -> Result<u64, spi::Error> {
     Ok(dropped as u64)
 }
 
-pub fn lock_for_read(wait: crate::dbtx::LockWait) -> Result<(), spi::Error> {
-    wait.lock("kafgres_producers, kafgres_producer_batches")
+pub fn lock_for_read() -> Result<(), spi::Error> {
+    crate::dbtx::lock_nowait("kafgres_producers, kafgres_producer_batches")
 }
 
 #[cfg(test)]

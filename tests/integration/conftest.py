@@ -249,6 +249,10 @@ class Connection:
             return 2 if api_version >= 3 else 1
         if api_key == END_TXN:
             return 2 if api_version >= 3 else 1
+        if api_key == PRODUCE:
+            return 2 if api_version >= 9 else 1
+        if api_key == OFFSET_FETCH:
+            return 2 if api_version >= 6 else 1
         raise AssertionError(f"unmapped api {api_key}")
 
     def recv(self):
