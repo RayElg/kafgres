@@ -1,11 +1,8 @@
-"""Request locks against the things that hold them: vacuum truncation, which yields only to a
-waiter; VACUUM FULL and an operator's LOCK, which never yield; and a starved CPU, which makes
-every lock phase slow. Each test tries to make a request fail, or the loop stall, rather than
-to show one scenario working.
+"""Request locks against what holds them: vacuum truncation, which yields only to a waiter;
+VACUUM FULL and an operator's LOCK, which never yield; and a starved CPU.
 
-A failed request closes its connection, so the hammer counts disconnects and error codes. The
-loop is single-threaded, so ApiVersions, which takes no table lock, measures how long the
-loop was stalled."""
+A failed request closes its connection, so the hammer counts disconnects and error codes.
+ApiVersions takes no table lock, so its latency measures how long the loop stalled."""
 
 import os
 import socket
@@ -281,8 +278,8 @@ def test_a_held_lock_delays_requests_and_its_release_frees_them_at_once(topic):
 
 
 def test_a_parked_fetch_is_answered_across_a_truncation(topic):
-    """Parked fetches complete from the loop, under the same locks, when a truncation can
-    be holding them. Each must be answered, without an error and on its connection."""
+    """Parked fetches complete under the same locks a truncation holds. Each is answered
+    without an error, on its connection."""
     fill_and_empty_offsets()
     conns = [socket.create_connection((BROKER_HOST, BROKER_PORT), timeout=30)
              for _ in range(8)]
@@ -349,9 +346,8 @@ def _fetch_values(topic):
 
 
 def test_requests_behind_a_held_lock_run_in_the_order_sent(topic):
-    """A connection pipelines produces, one with acks=0, and a Metadata while a lock is held.
-    The first waits for the lock; the rest must not run ahead of it, or the log reads out of
-    order, and the answers must come back in the order asked."""
+    """Produces (one acks=0) and a Metadata pipelined behind a held lock run and answer in
+    the order sent."""
     with _connect() as s:
         c = Connection(s)
         with Holder() as held:
@@ -369,9 +365,8 @@ def test_requests_behind_a_held_lock_run_in_the_order_sent(topic):
 
 
 def test_a_lock_held_past_the_retry_limit_fails_its_requests_and_nothing_else(topic):
-    """A lock that never comes free: the request behind it must keep trying for the whole
-    limit, not fail at once, then lose its connection; the loop must keep serving every
-    other connection meanwhile, and serve normally once the lock goes."""
+    """A request behind a lock that never frees retries for the whole limit, then loses its
+    connection. Other connections are served throughout, and normally once the lock goes."""
     pid = broker_pid()
     worst = 0.0
     with Holder() as held:
@@ -409,8 +404,8 @@ def test_a_lock_held_past_the_retry_limit_fails_its_requests_and_nothing_else(to
 
 
 def test_clients_that_leave_while_retrying_are_forgotten(topic):
-    """Connections close while their requests wait for a lock. When it comes free nothing
-    may be answered into a closed socket, and the worker must not trip over the leftovers."""
+    """Connections close while their requests wait for a lock. On release none of those
+    requests runs, and the worker stays up."""
     pid = broker_pid()
     with Holder() as held:
         socks = [_connect() for _ in range(32)]
@@ -431,8 +426,7 @@ def test_clients_that_leave_while_retrying_are_forgotten(topic):
 
 
 def test_many_retrying_requests_do_not_slow_the_loop(topic):
-    """Every waiting request is retried every pass. Hundreds of them, behind one held lock,
-    must not turn each pass into hundreds of failed transactions that stall everyone."""
+    """300 requests behind one held lock cost one failed retry per pass, not 300."""
     with Holder() as held:
         socks = [_connect() for _ in range(300)]
         for i, s in enumerate(socks):
@@ -462,9 +456,8 @@ def test_many_retrying_requests_do_not_slow_the_loop(topic):
 
 
 def test_parked_fetches_past_their_deadline_behind_a_held_lock_do_not_slow_the_loop(topic):
-    """Hundreds of consumers long-poll an empty topic, and their deadlines pass while a lock
-    is held. Each must try again behind the lock without the loop making every pass a few
-    hundred failed reads, and each must be answered once it is released."""
+    """300 long-polls pass their deadline behind a held lock. The loop stays responsive and
+    each is answered on release."""
     socks = [_connect() for _ in range(300)]
     try:
         for i, s in enumerate(socks):
@@ -511,8 +504,8 @@ def _restart_postgres():
 
 @pytest.fixture
 def prepared_transactions():
-    """A prepared transaction keeps its locks across a restart: the one way to have a table
-    lock held while the broker worker starts."""
+    """A prepared transaction keeps its locks across a restart, so one can be held while the
+    broker worker starts."""
     if sql("SHOW max_prepared_transactions") == "0":
         sql("ALTER SYSTEM SET max_prepared_transactions = 4")
         _restart_postgres()
@@ -522,9 +515,8 @@ def prepared_transactions():
 
 
 def test_startup_reconciliation_waits_out_a_held_lock(topic, prepared_transactions):
-    """A crash can leave a marker past the recovered log end; the worker drops it at start,
-    before serving. If a table lock is held then, it must wait for the lock rather than give
-    up: a stale marker makes the next batch at its offset read as committed."""
+    """A marker past the recovered log end is dropped at start even behind a held lock (I1):
+    a stale marker makes the next batch at its offset read as committed."""
     tid = sql(f"SELECT topic_id FROM kafgres_topics WHERE name = '{TOPIC}'")
     sql(f"INSERT INTO kafgres_markers VALUES ({tid}, 0, 5, 5, 100)")
 
@@ -550,9 +542,8 @@ def test_startup_reconciliation_waits_out_a_held_lock(topic, prepared_transactio
 
 
 def test_a_group_member_outlives_a_lock_held_past_its_session_timeout(topic):
-    """A consumer's heartbeat waits behind a lock held longer than its session timeout. It
-    must land before the member sweep judges the member silent, so the group keeps its
-    generation instead of rebalancing a member that never stopped heartbeating."""
+    """A heartbeat behind a lock held past the session timeout lands before the member sweep,
+    so the group keeps its generation."""
     from kafka import KafkaConsumer
 
     group = "hunt-lockwait-session"
@@ -596,9 +587,8 @@ def test_a_group_member_outlives_a_lock_held_past_its_session_timeout(topic):
 
 
 def test_parked_frames_count_against_the_inbound_cap(topic):
-    """Every connection sends a large Produce while a lock is held, and each one parks. A
-    parked frame stays allocated, so it must stay counted: past the 512 MiB inbound cap,
-    further frames must wait unread rather than be taken off the socket and parked."""
+    """Large Produces parked behind a held lock count against the 512 MiB inbound cap (I8):
+    past it, further frames wait unread on their sockets."""
     n, size = 120, 5 * 1024 * 1024
     cap = 512 * 1024 * 1024
     body = produce_v3(TOPIC, 0, record_batch([b"x" * size]))

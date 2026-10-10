@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::handlers::HandlerError;
 
-/// Every table lock a request takes, in the order it takes them.
 const REQUEST_LOCKS: [fn() -> Result<(), pgrx::spi::Error>; 5] = [
     crate::meta::lock_for_read,
     crate::group::lock_for_read,
@@ -15,9 +14,8 @@ const REQUEST_LOCKS: [fn() -> Result<(), pgrx::spi::Error>; 5] = [
     crate::storage::lock_for_read,
 ];
 
-/// Take every table lock a request needs, up front, with `NOWAIT`: a lock wait stalls the
-/// loop (I7). A held lock fails the request as [`HandlerError::Busy`] before it has done
-/// anything, and the server retries it.
+/// Take every table lock a request needs up front, with `NOWAIT` (I7). A held lock fails the
+/// request as [`HandlerError::Busy`] before it has done anything, and the server retries it.
 fn acquire_request_locks() -> Result<(), pgrx::spi::Error> {
     // A lock failure is an ERROR, so it skips the reset below; `guarded` reads it then.
     LOCKING.with(|l| l.set(true));
@@ -40,7 +38,6 @@ pub fn begin_request() {
     DID_WORK.with(|d| d.set(false));
 }
 
-/// A `LOCK_NOT_AVAILABLE` from the request-lock phase.
 fn held_lock(code: pgrx::PgSqlErrorCode) -> bool {
     code == pgrx::PgSqlErrorCode::ERRCODE_LOCK_NOT_AVAILABLE && LOCKING.with(|l| l.get())
 }

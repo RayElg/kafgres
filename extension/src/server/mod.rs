@@ -84,11 +84,9 @@ struct Conn {
     /// A produce response is queued whose bytes are not yet on the platter. Only such a
     /// connection holds its acks back; a consumer that never produces keeps its mid-pass flush.
     awaiting_sync: bool,
-    /// A request is parked behind a held table lock. Later requests wait for it: Kafka runs
-    /// a connection's requests in order.
+    /// A request is parked behind a held table lock; later ones wait (Kafka runs them in order).
     retrying: bool,
-    /// Size of the frame parked to retry. Taking a frame releases it from the inbound
-    /// budgets, so a parked one is counted here.
+    /// The frame parked to retry, no longer in `reserved`, so counted against budgets here.
     parked_bytes: usize,
 
     sasl: crate::sasl::SaslState,
@@ -866,8 +864,7 @@ enum Disposition {
     Parked,
 }
 
-/// Park a request behind a held table lock, and its connection's later requests with it.
-/// False closes the connection.
+/// Park a request behind a held table lock, holding its connection's later ones. False closes.
 fn park_retry(
     srv: &mut Server,
     conn_id: i32,
@@ -887,7 +884,7 @@ fn park_retry(
     // Once per request: retries run every pass.
     log!("kafgres: {} api {key} v{version}: {why}; retrying", c.peer);
     c.retrying = true;
-    // The whole frame: the body is a slice of its allocation, and the header is decoded beside it.
+    // The whole frame: the body is a slice of its allocation.
     c.parked_bytes = frame_len;
     srv.parked.push(Parked {
         conn_id,
@@ -1079,7 +1076,6 @@ fn fetch_wait(max_wait_ms: i32) -> Duration {
 }
 
 /// Evict members that stopped heartbeating, and cut join windows whose deadline passed.
-/// Which member sweep a group request belongs to.
 #[derive(Clone, Copy, PartialEq)]
 enum GroupKind {
     Classic,
@@ -1087,8 +1083,7 @@ enum GroupKind {
     Share,
 }
 
-/// The member behind a group request parked to retry: it is alive, only blocked on a table
-/// lock, and a sweep can run in the same pass the lock is released.
+/// The member behind a group request parked to retry: alive, only blocked on a table lock.
 fn retried_member(req: &handlers::Request) -> Option<(GroupKind, String, String)> {
     use kafgres_codec::generated::heartbeat_request::HeartbeatRequest;
     use kafgres_codec::generated::join_group_request::JoinGroupRequest;
@@ -1120,7 +1115,6 @@ fn retried_member(req: &handlers::Request) -> Option<(GroupKind, String, String)
     (!member_id.is_empty()).then_some((kind, group_id, member_id))
 }
 
-/// Members of `kind` whose requests are parked to retry.
 fn retried_members(srv: &Server, kind: GroupKind) -> Vec<(String, String)> {
     srv.parked
         .iter()
@@ -1578,7 +1572,6 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
             continue;
         }
         let expired = now >= p.deadline;
-        // A completion behind a held table lock retries until this.
         let may_retry = now < p.deadline + MAX_LOCK_RETRY;
         crate::dbtx::begin_request();
 
@@ -1650,7 +1643,6 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
                 }
                 let group_id = group_id.clone();
                 let member_id = member_id.clone();
-                // Stay woken, or the retry waits for the deadline.
                 if locks_held && may_retry {
                     srv.groups_changed.insert(group_id);
                     still_parked.push(p);
@@ -1710,7 +1702,6 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
                 }
                 let group_id = group_id.clone();
                 let member_id = member_id.clone();
-                // Stay woken, or the retry waits for the deadline.
                 if locks_held && may_retry {
                     srv.groups_changed.insert(group_id);
                     still_parked.push(p);
