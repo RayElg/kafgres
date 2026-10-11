@@ -79,7 +79,8 @@ class Hammer:
     """One connection per kind, each sending its request back to back, plus an ApiVersions
     probe every 50 ms. Records every failure with its time, and the probe's worst latency."""
 
-    def __init__(self, kinds=tuple(KINDS)):
+    def __init__(self, kinds=tuple(KINDS), pause=None):
+        self.pause = pause or {}
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.failures, self.served, self.served_at, self.probe_worst = [], 0, [], 0.0
@@ -120,6 +121,8 @@ class Hammer:
                             with self.lock:
                                 self.served += 1
                                 self.served_at.append(time.monotonic())
+                        if self.pause.get(kind):
+                            time.sleep(self.pause[kind])
             except Exception as e:  # a failed request costs its connection: reconnect
                 self._fail(kind, repr(e))
                 time.sleep(0.05)
@@ -204,11 +207,15 @@ def size(table):
     return int(sql(f"SELECT pg_relation_size('{table}')"))
 
 
+# Every kind through a truncation, paced so vacuum finds the gap it needs between request
+# locks (it retries every 50 ms for 5 s); back to back, a starved broker leaves none.
+PACED = {"metadata": 0.01, "produce": 0.05, "fetch": 0.05, "offset_fetch": 0.05}
+
+
 def vacuum_with_hammer(fills, tables, starve=None, attempts=3):
-    """Fill at full CPU, then VACUUM under a hammer, until a vacuum truncates. Vacuum takes
-    its ACCESS EXCLUSIVE only in a gap between request locks, so under load it can skip
-    truncating, which tests nothing; one Metadata connection leaves gaps on either engine.
-    Returns failures (seconds into their vacuum) and requests served."""
+    """Fill at full CPU, then VACUUM under a paced hammer, until a vacuum truncates: without
+    a gap vacuum skips truncating, which tests nothing. Returns failures (seconds into
+    their vacuum) and requests served."""
     failures, served = [], 0
     for _ in range(attempts):
         if starve:
@@ -218,7 +225,7 @@ def vacuum_with_hammer(fills, tables, starve=None, attempts=3):
         if starve:
             starve(True)
         before = {t: size(t) for t in tables}
-        with Hammer(kinds=("metadata",)) as h:
+        with Hammer(kinds=tuple(PACED), pause=PACED) as h:
             t0 = time.monotonic()
             sql(f"VACUUM {', '.join(tables)}")
             t1 = time.monotonic()
