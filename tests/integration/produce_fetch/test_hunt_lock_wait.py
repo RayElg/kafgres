@@ -158,12 +158,15 @@ def cpus():
     before = int(subprocess.run(["docker", "inspect", "-f", "{{.HostConfig.NanoCpus}}", cid],
                                 capture_output=True, text=True, check=True).stdout.strip())
 
+    # `--cpus 0` does not clear a limit, so full means every host CPU.
+    full = before / 1e9 if before else os.cpu_count()
+
     def limit(n):
-        subprocess.run(["docker", "update", "--cpus", str(n), cid], check=True,
+        """`n` CPUs, or back to full for None."""
+        subprocess.run(["docker", "update", "--cpus", str(n or full), cid], check=True,
                        capture_output=True)
     yield limit
-    # `--cpus 0` does not clear a limit, so restore to every host CPU.
-    limit(before / 1e9 if before else os.cpu_count())
+    limit(None)
 
 
 @pytest.fixture
@@ -183,7 +186,7 @@ def fill_and_empty_offsets(rows=300000):
     sql(f"DELETE FROM kafgres_offsets WHERE group_id LIKE '{FILLER}-%'")
     sql(f"""INSERT INTO kafgres_offsets (group_id, topic_id, partition, committed_offset, metadata)
             SELECT '{FILLER}-' || g, 0, 0, 0, repeat('x', 500)
-            FROM generate_series(1, {rows}) g""")
+            FROM generate_series(1, {rows}) g ON CONFLICT DO NOTHING""")
     sql(f"DELETE FROM kafgres_offsets WHERE group_id LIKE '{FILLER}-%'")
 
 
@@ -193,7 +196,7 @@ def fill_and_empty_producer_batches(rows=600000):
     sql("DELETE FROM kafgres_producer_batches WHERE producer_id < 0")
     sql(f"""INSERT INTO kafgres_producer_batches
               (producer_id, topic_id, partition, producer_epoch, first_seq, last_seq, base_offset)
-            SELECT -g, 0, 0, 0, 0, 0, 0 FROM generate_series(1, {rows}) g""")
+            SELECT -g, 0, 0, 0, 0, 0, 0 FROM generate_series(1, {rows}) g ON CONFLICT DO NOTHING""")
     sql("DELETE FROM kafgres_producer_batches WHERE producer_id < 0")
 
 
@@ -201,16 +204,21 @@ def size(table):
     return int(sql(f"SELECT pg_relation_size('{table}')"))
 
 
-def vacuum_with_hammer(fills, tables, attempts=3):
-    """Fill, then VACUUM under a hammer, until a vacuum truncates. Vacuum takes its ACCESS
-    EXCLUSIVE only in a gap between request locks, so under load it can skip truncating,
-    which tests nothing. Returns failures (seconds into their vacuum) and requests served."""
+def vacuum_with_hammer(fills, tables, starve=None, attempts=3):
+    """Fill at full CPU, then VACUUM under a hammer, until a vacuum truncates. Vacuum takes
+    its ACCESS EXCLUSIVE only in a gap between request locks, so under load it can skip
+    truncating, which tests nothing; one Metadata connection leaves gaps on either engine.
+    Returns failures (seconds into their vacuum) and requests served."""
     failures, served = [], 0
     for _ in range(attempts):
+        if starve:
+            starve(None)
         for fill in fills:
             fill()
+        if starve:
+            starve(True)
         before = {t: size(t) for t in tables}
-        with Hammer(kinds=("metadata", "produce")) as h:
+        with Hammer(kinds=("metadata",)) as h:
             t0 = time.monotonic()
             sql(f"VACUUM {', '.join(tables)}")
             t1 = time.monotonic()
@@ -227,18 +235,18 @@ def vacuum_with_hammer(fills, tables, attempts=3):
 def test_a_truncation_fails_no_request_even_on_a_starved_broker(topic, cpus, starve):
     """On a starved broker every lock phase is slow and vacuum's truncation holds its lock
     longer. Neither may cost a request."""
-    if starve:
-        cpus(starve)
-    failures, served = vacuum_with_hammer([fill_and_empty_offsets], ["kafgres_offsets"])
+    throttle = (lambda on: cpus(starve if on else None)) if starve else None
+    failures, served = vacuum_with_hammer([fill_and_empty_offsets], ["kafgres_offsets"],
+                                          starve=throttle)
     assert not failures, f"{len(failures)} failed, first {failures[0]}"
     assert served > 0
 
 
 def test_back_to_back_truncations_fail_no_request(topic, cpus):
     """Two tables truncated in one VACUUM on a half-starved broker: requests wait out both."""
-    cpus(0.5)
     failures, _ = vacuum_with_hammer([fill_and_empty_offsets, fill_and_empty_producer_batches],
-                                     ["kafgres_offsets", "kafgres_producer_batches"])
+                                     ["kafgres_offsets", "kafgres_producer_batches"],
+                                     starve=lambda on: cpus(0.5 if on else None))
     assert not failures, f"{len(failures)} failed, first {failures[0]}"
 
 
