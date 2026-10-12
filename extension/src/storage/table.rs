@@ -221,7 +221,7 @@ impl TableStore {
 
 /// Includes the partitioned parent, which `CREATE TABLE ... PARTITION OF` and `DROP TABLE` contend on.
 pub fn lock_for_read() -> Result<(), pgrx::spi::Error> {
-    crate::dbtx::lock_nowait("kafgres_log, kafgres_log_segments")
+    crate::dbtx::lock_tables("kafgres_log, kafgres_log_segments")
 }
 
 fn spi_err(e: impl std::fmt::Display) -> StoreError {

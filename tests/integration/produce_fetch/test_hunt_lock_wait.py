@@ -548,30 +548,89 @@ def prepared_transactions():
 
 
 def test_startup_reconciliation_waits_out_a_held_lock(topic, prepared_transactions):
-    """A marker past the recovered log end is dropped at start even behind a held lock (I1):
-    a stale marker makes the next batch at its offset read as committed."""
+    """A marker past the recovered log end is dropped at start, before serving (I1): a stale
+    marker makes the next batch at its offset read as committed. A lock on the markers holds
+    that off, and the log says so and by whom. (A lock on a request table cannot be tried
+    here: the startup schema migrations wait on those before reconciliation runs.)"""
+    held = "kafgres_markers"
     tid = sql(f"SELECT topic_id FROM kafgres_topics WHERE name = '{TOPIC}'")
     sql(f"INSERT INTO kafgres_markers VALUES ({tid}, 0, 5, 5, 100)")
 
     def markers():
         return int(sql(f"SELECT count(*) FROM kafgres_markers WHERE topic_id = {tid}"))
 
-    gid = "hunt-lockwait-startup"
-    try:
-        sql(f"BEGIN; LOCK TABLE kafgres_offsets IN ACCESS EXCLUSIVE MODE; "
-            f"PREPARE TRANSACTION '{gid}';")
-        _restart_postgres()
-        time.sleep(3)  # long enough to have tried reconciliation behind the lock
-        assert markers() == 1, "reconciled through a held lock: test is vacuous"
-        sql(f"ROLLBACK PREPARED '{gid}'")
-        deadline = time.monotonic() + 10
+    def gone_within(seconds):
+        deadline = time.monotonic() + seconds
         while markers() and time.monotonic() < deadline:
             time.sleep(0.5)
-        assert markers() == 0, "the stale marker survived a start behind a held lock"
+        return markers() == 0
+
+    gid = "hunt-lockwait-startup"
+    try:
+        sql(f"BEGIN; LOCK TABLE {held} IN ACCESS EXCLUSIVE MODE; PREPARE TRANSACTION '{gid}';")
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _restart_postgres()
+        time.sleep(4)  # reconciliation has tried, and waited, behind the lock
+        logs = subprocess.run(["docker", "compose", "logs", "--since", since, "postgres"],
+                              capture_output=True, text=True, timeout=60).stdout
+        blocked = [ln for ln in logs.splitlines() if "not serving yet" in ln]
+        assert blocked, "startup did not say it was held off: test is vacuous, or it is silent"
+        assert "kafgres_markers (prepared transaction)" in blocked[0], \
+            f"the log does not name the holder: {blocked[0]}"
+        sql(f"ROLLBACK PREPARED '{gid}'")
+        assert gone_within(10), "the stale marker survived a start behind a held lock"
     finally:
         if sql(f"SELECT count(*) FROM pg_prepared_xacts WHERE gid = '{gid}'") != "0":
             sql(f"ROLLBACK PREPARED '{gid}'")
         sql(f"DELETE FROM kafgres_markers WHERE topic_id = {tid}")
+
+
+def _xacts():
+    """Transactions the broker's database has finished, flushed or not yet."""
+    return int(sql("SELECT xact_commit + xact_rollback FROM pg_stat_database "
+                   "WHERE datname = current_database()"))
+
+
+def test_a_held_lock_costs_few_transactions(topic):
+    """A request parked behind a held lock is retried with backoff, and a failed quota reload
+    waits its interval, rather than each costing a transaction every 5 ms tick."""
+    def window(hold):
+        time.sleep(1.5)  # the broker flushes its counts at most once a second
+        before = _xacts()
+        if hold:
+            with Holder():
+                with _connect() as s:
+                    Connection(s).send(METADATA, 1, 1, body=struct.pack(">i", -1))
+                    time.sleep(5)
+        else:
+            time.sleep(6)  # Holder spends a second taking its lock
+        time.sleep(1.5)
+        return _xacts() - before
+
+    idle, held = window(False), window(True)
+    assert held - idle < 300, \
+        f"{held - idle} more transactions in 6 s behind a held lock than idle ({idle})"
+
+
+def test_a_sql_sweep_waits_out_a_short_lock_and_gives_up_on_a_long_one(topic):
+    """SQL entry points are not retried by the broker loop, so their request locks wait
+    rather than fail at once, up to a bound."""
+    for hold, ok in ((1.0, True), (5.0, False)):
+        with Holder("kafgres_producers") as held:
+            threading.Timer(hold, held.release).start()
+            t0 = time.monotonic()
+            try:
+                sql("SELECT kafgres_expire_producers()")
+                outcome = None
+            except RuntimeError as e:
+                outcome = str(e)
+            took = time.monotonic() - t0
+        if ok:
+            assert outcome is None, f"failed behind a {hold}s lock: {outcome}"
+            assert took > 0.5, f"returned in {took:.2f}s: it did not wait for the lock"
+        else:
+            assert outcome and "lock" in outcome, f"waited out a {hold}s lock: {outcome}"
+            assert took < 4, f"waited {took:.2f}s: the wait is not bounded"
 
 
 def test_a_group_member_outlives_a_lock_held_past_its_session_timeout(topic):

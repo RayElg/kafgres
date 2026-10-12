@@ -341,7 +341,7 @@ impl std::fmt::Display for StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
-/// Take whatever locks the active engine needs to serve a read, without waiting.
+/// Take whatever locks the active engine needs to serve a read, within the wait `dbtx` allows.
 pub fn lock_for_read() -> Result<(), pgrx::spi::Error> {
     table::lock_for_read()
 }

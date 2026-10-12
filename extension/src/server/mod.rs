@@ -54,6 +54,11 @@ const MAX_FETCH_WAIT: Duration = Duration::from_millis(5_000);
 /// a vacuum truncation; a `VACUUM FULL` or an operator's `LOCK` may never end.
 const MAX_LOCK_RETRY: Duration = Duration::from_secs(10);
 
+/// Retries behind a held table lock back off from one tick to this, so a long hold costs about
+/// 20 failed transactions a second rather than one per pass, and a release is seen within it.
+const MIN_RETRY_BACKOFF: Duration = Duration::from_millis(5);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
 /// Failed SASL steps a connection may make before it is dropped.
 const MAX_SASL_FAILURES: u32 = 3;
 
@@ -211,9 +216,18 @@ struct Server {
     /// Connections refused for want of a descriptor since the last log line.
     refused: u64,
     refused_logged: Option<Instant>,
+    /// No parked request retries a held table lock before this.
+    retry_at: Instant,
+    /// The wait before `retry_at`: doubles while the lock stays held, cleared once one gets through.
+    retry_backoff: Duration,
 }
 
 impl Server {
+    /// A retry found a table lock held: wait longer before the next.
+    fn back_off(&mut self, now: Instant) {
+        self.retry_backoff = (self.retry_backoff * 2).clamp(MIN_RETRY_BACKOFF, MAX_RETRY_BACKOFF);
+        self.retry_at = now + self.retry_backoff;
+    }
     /// Whether a sweep with this period in ticks is due: once per matching tick, not per pass.
     fn due(&self, every_n_ticks: u64) -> bool {
         self.ticked && self.tick % every_n_ticks == 0
@@ -318,13 +332,16 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         spare_fd: std::fs::File::open("/dev/null").ok(),
         refused: 0,
         refused_logged: None,
+        retry_at: Instant::now(),
+        retry_backoff: Duration::ZERO,
     };
 
     // Load once before the loop, not just on the first tick: the default snapshot is
     refresh_acls(&mut srv);
 
     // After recovery has truncated any torn tail, and before serving: a marker pointing
-    let mut markers_reconciled = reconcile_markers();
+    let mut reconcile_blocked = None;
+    let mut markers_reconciled = reconcile_markers(&mut reconcile_blocked);
 
     // The wait returns as soon as any socket has bytes; `tick` only bounds the sweeps.
     // A pass that served a frame polls again immediately: a pipelining client's next
@@ -385,7 +402,7 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         if !markers_reconciled {
             spin = false;
             if srv.due(200) {
-                markers_reconciled = reconcile_markers();
+                markers_reconciled = reconcile_markers(&mut reconcile_blocked);
             }
             continue;
         }
@@ -989,7 +1006,10 @@ fn refresh_quotas(srv: &mut Server) {
     }) {
         Ok(fresh) => srv.quota_config = fresh,
         // Keep the previous snapshot: a briefly failing reload should go on limiting.
-        Err(e) => log!("kafgres: could not reload client quotas: {e}"),
+        Err(e) => {
+            srv.quota_config.mark_attempted();
+            log!("kafgres: could not reload client quotas: {e}");
+        }
     }
 }
 
@@ -1216,35 +1236,84 @@ fn raise_fd_limit() {
     }
 }
 
+/// Drop markers past the recovered log end. False only on a held table lock; other failures
+/// are logged and serving proceeds.
+///
+/// Not under `guarded`: its statements lock only the marker and log tables they read, waiting
+/// up to `lock_timeout`, so an operator's lock on an unrelated table does not hold serving off.
+/// Nothing is being served yet, so the wait stalls no client. `blocked` tracks how long it has
+/// been held up, for the log.
+fn reconcile_markers(blocked: &mut Option<(Instant, Instant)>) -> bool {
+    let outcome = BackgroundWorker::transaction(|| {
+        crate::dbtx::atomically_coded(
+            || {
+                let spi = |e: pgrx::spi::Error| (e.to_string(), false);
+                Spi::run("SET LOCAL lock_timeout = '2s'").map_err(spi)?;
+                Spi::run("SET LOCAL statement_timeout = '5s'").map_err(spi)?;
+                Ok(crate::produce_sql::reconcile_markers(&mut *crate::storage::open()))
+            },
+            |message, code| {
+                (message.to_string(), code == pgrx::PgSqlErrorCode::ERRCODE_LOCK_NOT_AVAILABLE)
+            },
+        )
+    });
+    match outcome {
+        Ok(n) => {
+            if n > 0 {
+                log!("kafgres: marker reconciliation dropped {n} orphaned marker(s)");
+            }
+            if let Some((since, _)) = blocked.take() {
+                log!("kafgres: marker reconciliation done after {}s; serving", since.elapsed().as_secs());
+            }
+            true
+        }
+        Err((why, true)) => {
+            let now = Instant::now();
+            let (since, logged) = blocked.get_or_insert((now, now - RECONCILE_LOG_EVERY));
+            if now.duration_since(*logged) >= RECONCILE_LOG_EVERY {
+                *logged = now;
+                log!(
+                    "kafgres: not serving yet: marker reconciliation blocked for {}s ({why}); \
+                     ACCESS EXCLUSIVE held on: {}",
+                    since.elapsed().as_secs(),
+                    exclusive_holders()
+                );
+            }
+            false
+        }
+        Err((why, false)) => {
+            log!("kafgres: marker reconciliation failed: {why}");
+            true
+        }
+    }
+}
+
+/// How often a blocked startup says so.
+const RECONCILE_LOG_EVERY: Duration = Duration::from_secs(10);
+
+/// Every kafgres table someone holds ACCESS EXCLUSIVE on, and who, for an operator to act on.
+fn exclusive_holders() -> String {
+    let holders = crate::dbtx::contained_tx(|| {
+        Ok(Spi::get_one::<String>(
+            "SELECT string_agg(DISTINCT format('%s (%s)', c.relname,
+                                COALESCE('pid ' || l.pid, 'prepared transaction')), ', ')
+               FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+              WHERE l.granted AND l.mode = 'AccessExclusiveLock' AND c.relname LIKE 'kafgres%'",
+        )?)
+    });
+    match holders {
+        Ok(Some(h)) => h,
+        Ok(None) => "none now".into(),
+        Err(e) => format!("unknown ({e})"),
+    }
+}
+
 /// Every start takes a new leader epoch for every partition (I5). A restart can lose
 /// unsynced records whose offsets new produces then reuse; the epoch starts at the recovered
 /// log end, so a client that read past it truncates there.
 ///
 /// The timeline is the high half: a diverged primary restarting on its old timeline never
 /// reaches the epochs a promotion takes.
-/// Drop markers past the recovered log end. False only on a held table lock; other failures
-/// are logged and serving proceeds.
-fn reconcile_markers() -> bool {
-    crate::dbtx::begin_request();
-    match BackgroundWorker::transaction(|| {
-        crate::dbtx::guarded(|| Ok(crate::produce_sql::reconcile_markers(&mut *crate::storage::open())))
-    }) {
-        Ok(0) => true,
-        Ok(n) => {
-            log!("kafgres: marker reconciliation dropped {n} orphaned marker(s)");
-            true
-        }
-        Err(HandlerError::Busy(why)) => {
-            log!("kafgres: marker reconciliation waits for a table lock: {why}");
-            false
-        }
-        Err(e) => {
-            log!("kafgres: marker reconciliation failed: {e}");
-            true
-        }
-    }
-}
-
 fn raise_leader_epochs() -> bool {
     let result = BackgroundWorker::transaction(|| {
         crate::dbtx::guarded(|| {
@@ -1503,7 +1572,7 @@ fn retry_parked(srv: &mut Server, cfg: &ClusterConfig) {
     srv.parked = rest;
     let mut still_waiting = Vec::new();
     // Every request takes the same locks, so once one finds them held the rest would too.
-    let mut locks_held = false;
+    let mut locks_held = now < srv.retry_at;
 
     for p in retries {
         if !srv.conns.contains_key(&p.conn_id) {
@@ -1522,6 +1591,7 @@ fn retry_parked(srv: &mut Server, cfg: &ClusterConfig) {
         match dispatch::dispatch(&mut out, request, cfg, srv, p.conn_id, p.seq) {
             Err(HandlerError::Busy(_)) if !expired => {
                 locks_held = true;
+                srv.back_off(now);
                 still_waiting.push(p);
                 continue;
             }
@@ -1544,6 +1614,7 @@ fn retry_parked(srv: &mut Server, cfg: &ClusterConfig) {
                 }
             }
         }
+        srv.retry_backoff = Duration::ZERO;
         if let Some(c) = srv.conns.get_mut(&p.conn_id) {
             c.retrying = false;
             c.parked_bytes = 0;
@@ -1592,7 +1663,7 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
                     continue;
                 }
                 // Stay woken, or the retry waits for the deadline.
-                if locks_held && may_retry {
+                if (locks_held || now < srv.retry_at) && may_retry {
                     srv.appended.extend(watching.iter().copied());
                     still_parked.push(p);
                     continue;
@@ -1621,6 +1692,7 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
                     }
                     Err(HandlerError::Busy(_)) if may_retry => {
                         locks_held = true;
+                        srv.back_off(now);
                         srv.appended.extend(watching.iter().copied());
                         still_parked.push(p);
                         continue;
@@ -1643,7 +1715,7 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
                 }
                 let group_id = group_id.clone();
                 let member_id = member_id.clone();
-                if locks_held && may_retry {
+                if (locks_held || now < srv.retry_at) && may_retry {
                     srv.groups_changed.insert(group_id);
                     still_parked.push(p);
                     continue;
@@ -1680,6 +1752,7 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
                     }
                     Err(HandlerError::Busy(_)) if may_retry => {
                         locks_held = true;
+                        srv.back_off(now);
                         srv.groups_changed.insert(group_id);
                         still_parked.push(p);
                         continue;
@@ -1702,7 +1775,7 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
                 }
                 let group_id = group_id.clone();
                 let member_id = member_id.clone();
-                if locks_held && may_retry {
+                if (locks_held || now < srv.retry_at) && may_retry {
                     srv.groups_changed.insert(group_id);
                     still_parked.push(p);
                     continue;
@@ -1726,6 +1799,7 @@ fn complete_parked(srv: &mut Server, _cfg: &ClusterConfig) {
                     ),
                     Err(HandlerError::Busy(_)) if may_retry => {
                         locks_held = true;
+                        srv.back_off(now);
                         srv.groups_changed.insert(group_id);
                         still_parked.push(p);
                         continue;

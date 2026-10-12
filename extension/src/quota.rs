@@ -102,6 +102,12 @@ impl QuotaCache {
         }
     }
 
+    /// As `AclCache::mark_attempted`: a failed load keeps the snapshot but restarts its clock,
+    /// or a held lock makes `is_stale()` retry, and log, every tick.
+    pub fn mark_attempted(&mut self) {
+        self.loaded = Some(std::time::Instant::now());
+    }
+
     pub fn load() -> Result<Self, String> {
         let rows: Vec<Row> = pgrx::Spi::connect(|client| {
             let got = client.select(

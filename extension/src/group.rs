@@ -81,7 +81,7 @@ pub fn new_member_id(client_id: &str) -> Result<String, spi::Error> {
 
 /// Read lock: `VACUUM FULL`/`pg_repack` on the bloat-prone members table take
 pub fn lock_for_read() -> Result<(), spi::Error> {
-    crate::dbtx::lock_nowait("kafgres_groups, kafgres_group_members, kafgres_offsets")
+    crate::dbtx::lock_tables("kafgres_groups, kafgres_group_members, kafgres_offsets")
 }
 
 /// Parked members send no heartbeats and the SQL sweep can't see them: without this a

@@ -957,10 +957,11 @@ fn kafgres_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Safe while the broker runs; under `guarded`'s bounded lock wait because both sweeps contend
+/// Safe while the broker runs; under `guarded_waiting`'s bounded lock wait because both sweeps contend
 #[pg_extern]
 fn kafgres_expire_producers() -> i64 {
-    let swept = crate::dbtx::guarded(|| crate::producer::sweep(producer_retention()).map_err(Into::into));
+    let swept =
+        crate::dbtx::guarded_waiting(|| crate::producer::sweep(producer_retention()).map_err(Into::into));
     match swept {
         Ok(n) => n as i64,
         Err(e) => error!("kafgres: producer sweep failed: {e}"),

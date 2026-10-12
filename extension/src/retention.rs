@@ -148,7 +148,7 @@ fn kafgres_enforce_retention() -> i64 {
     let mut writing_batches = 0u64;
     let mut cursor = 0u32;
     loop {
-        let batch = match crate::dbtx::guarded(|| sweep(cursor).map_err(Into::into)) {
+        let batch = match crate::dbtx::guarded_waiting(|| sweep(cursor).map_err(Into::into)) {
             Ok(b) => b,
             Err(e) => error!("kafgres: retention sweep failed: {e}"),
         };
@@ -180,7 +180,7 @@ fn kafgres_enforce_retention() -> i64 {
 fn kafgres_expire_transactions() -> i64 {
     // An abort appends control batches.
     crate::server::wait_for_epochs();
-    match crate::dbtx::guarded(crate::handlers::txn::expire_stale_transactions) {
+    match crate::dbtx::guarded_waiting(crate::handlers::txn::expire_stale_transactions) {
         Ok(n) => n as i64,
         Err(e) => error!("kafgres: expiring stale transactions failed: {e}"),
     }

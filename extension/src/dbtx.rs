@@ -17,6 +17,9 @@ const REQUEST_LOCKS: [fn() -> Result<(), pgrx::spi::Error>; 5] = [
 /// Take every table lock a request needs up front, with `NOWAIT` (I7). A held lock fails the
 /// request as [`HandlerError::Busy`] before it has done anything, and the server retries it.
 fn acquire_request_locks() -> Result<(), pgrx::spi::Error> {
+    if WAIT_FOR_LOCKS.with(|w| w.get()) {
+        pgrx::Spi::run(&format!("SET LOCAL lock_timeout = '{SQL_LOCK_WAIT}'"))?;
+    }
     // A lock failure is an ERROR, so it skips the reset below; `guarded` reads it then.
     LOCKING.with(|l| l.set(true));
     REQUEST_LOCKS.iter().try_for_each(|lock| lock())?;
@@ -31,6 +34,26 @@ thread_local! {
     static LOCKING: Cell<bool> = const { Cell::new(false) };
     /// A `guarded` body succeeded since [`begin_request`], so a retry would repeat its work.
     static DID_WORK: Cell<bool> = const { Cell::new(false) };
+    /// Inside [`guarded_waiting`]: request locks wait up to [`SQL_LOCK_WAIT`].
+    static WAIT_FOR_LOCKS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// How long a SQL caller's request locks wait. A waiter is what makes vacuum truncation
+/// yield, and a SQL session is not the broker loop, so waiting stalls no one else.
+const SQL_LOCK_WAIT: &str = "2s";
+
+/// `guarded` for a SQL entry point: the same locks, waited for rather than `NOWAIT`. Nothing
+/// retries a SQL call the way the broker loop retries a parked request.
+pub fn guarded_waiting<T>(f: impl FnOnce() -> Result<T, HandlerError>) -> Result<T, HandlerError> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            WAIT_FOR_LOCKS.with(|w| w.set(false));
+        }
+    }
+    WAIT_FOR_LOCKS.with(|w| w.set(true));
+    let _reset = Reset;
+    guarded(f)
 }
 
 /// Mark the start of a request, or of a retry of one, for [`HandlerError::Busy`].
@@ -42,9 +65,11 @@ fn held_lock(code: pgrx::PgSqlErrorCode) -> bool {
     code == pgrx::PgSqlErrorCode::ERRCODE_LOCK_NOT_AVAILABLE && LOCKING.with(|l| l.get())
 }
 
-/// ACCESS SHARE on `tables`, a comma-separated list, or a `LOCK_NOT_AVAILABLE` error.
-pub fn lock_nowait(tables: &str) -> Result<(), pgrx::spi::Error> {
-    pgrx::Spi::run(&format!("LOCK TABLE {tables} IN ACCESS SHARE MODE NOWAIT"))
+/// ACCESS SHARE on `tables`, a comma-separated list: `NOWAIT` in the broker loop, waited for
+/// under [`guarded_waiting`]. A held lock is a `LOCK_NOT_AVAILABLE` error either way.
+pub fn lock_tables(tables: &str) -> Result<(), pgrx::spi::Error> {
+    let nowait = if WAIT_FOR_LOCKS.with(|w| w.get()) { "" } else { " NOWAIT" };
+    pgrx::Spi::run(&format!("LOCK TABLE {tables} IN ACCESS SHARE MODE{nowait}"))
 }
 
 /// Run `f` inside a savepoint, catching a Postgres error rather than letting it unwind: on

@@ -639,7 +639,7 @@ mod tests {
 
 /// Read lock: an operator's open `UPDATE kafgres_acls` transaction would otherwise
 pub fn lock_for_read() -> Result<(), pgrx::spi::Error> {
-    crate::dbtx::lock_nowait("kafgres_acls")
+    crate::dbtx::lock_tables("kafgres_acls")
 }
 
 // Wire enums are written out as literal protocol constants: a wrong number silently makes
