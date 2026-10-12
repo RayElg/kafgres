@@ -1,5 +1,6 @@
 //! Table-backed log storage: the only file permitted to run SQL against the log table
 
+use crate::clock::now_millis;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -219,8 +220,8 @@ impl TableStore {
 }
 
 /// Includes the partitioned parent, which `CREATE TABLE ... PARTITION OF` and `DROP TABLE` contend on.
-pub fn lock_for_read() -> Result<(), pgrx::spi::Error> {
-    Spi::run("LOCK TABLE kafgres_log, kafgres_log_segments IN ACCESS SHARE MODE NOWAIT")
+pub fn lock_for_read(wait: crate::dbtx::LockWait) -> Result<(), pgrx::spi::Error> {
+    wait.lock("kafgres_log, kafgres_log_segments")
 }
 
 fn spi_err(e: impl std::fmt::Display) -> StoreError {
@@ -956,13 +957,6 @@ impl LogStore for TableStore {
             },
         })
     }
-}
-
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

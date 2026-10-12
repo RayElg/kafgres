@@ -79,12 +79,9 @@ pub fn new_member_id(client_id: &str) -> Result<String, spi::Error> {
     Ok(format!("{prefix}-{uuid}"))
 }
 
-/// NOWAIT read lock: `VACUUM FULL`/`pg_repack` on the bloat-prone members table take
-pub fn lock_for_read() -> Result<(), spi::Error> {
-    Spi::run(
-        "LOCK TABLE kafgres_groups, kafgres_group_members, kafgres_offsets
-           IN ACCESS SHARE MODE NOWAIT",
-    )
+/// Read lock: `VACUUM FULL`/`pg_repack` on the bloat-prone members table take
+pub fn lock_for_read(wait: crate::dbtx::LockWait) -> Result<(), spi::Error> {
+    wait.lock("kafgres_groups, kafgres_group_members, kafgres_offsets")
 }
 
 /// Parked members send no heartbeats and the SQL sweep can't see them: without this a

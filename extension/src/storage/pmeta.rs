@@ -1,5 +1,6 @@
 //! Partition metadata, shared by both engines: not log data, so not engine-specific.
 
+use crate::clock::now_millis;
 use pgrx::prelude::*;
 
 use super::{EpochEnd, StoreError, StoreResult, TopicId};
@@ -402,13 +403,6 @@ pub fn stamp_txn_partition(
         ],
     )
     .map_err(spi_err)
-}
-
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Record an aborted transaction's offset range so consumers can be told to drop it.

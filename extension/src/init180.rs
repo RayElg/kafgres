@@ -1,11 +1,7 @@
 //! KIP-848 regex subscriptions. `regex_matched` holds the pattern's matches under the
 //! member's ACLs at its last heartbeat, for recomputing the assignment without its request.
 
-use pgrx::spi::Spi;
-
-fn run_ddl(sql: &str, operation: &str) {
-    Spi::run(sql).unwrap_or_else(|e| pgrx::error!("kafgres: failed to {}: {}", operation, e));
-}
+use crate::ddl::run_ddl;
 
 pub fn init_180() {
     run_ddl(

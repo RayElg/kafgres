@@ -47,6 +47,17 @@ pub fn check_admin_len(what: &'static str, n: usize) -> Result<(), HandlerError>
     Ok(())
 }
 
+/// I8: caps the outer list and the total inner entries across it, not each level alone.
+pub fn check_nested_len<T>(
+    outer_what: &'static str,
+    inner_what: &'static str,
+    outer: &[T],
+    inner: impl Fn(&T) -> usize,
+) -> Result<(), HandlerError> {
+    check_admin_len(outer_what, outer.len())?;
+    check_admin_len(inner_what, outer.iter().map(inner).sum())
+}
+
 /// Distinct from `CodecError`: a broker-side failure must never read as a protocol error.
 #[derive(Debug)]
 pub enum HandlerError {

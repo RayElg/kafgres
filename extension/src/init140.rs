@@ -1,10 +1,6 @@
 //! Share-group state stores only the exceptions to "everything at or above a share-partition's
 
-use pgrx::spi::Spi;
-
-fn run_ddl(sql: &str, operation: &str) {
-    Spi::run(sql).unwrap_or_else(|e| pgrx::error!("kafgres: failed to {}: {}", operation, e));
-}
+use crate::ddl::run_ddl;
 
 pub fn init_140() {
     run_ddl(

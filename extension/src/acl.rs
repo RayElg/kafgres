@@ -637,9 +637,9 @@ mod tests {
     }
 }
 
-/// NOWAIT read lock: an operator's open `UPDATE kafgres_acls` transaction would otherwise
-pub fn lock_for_read() -> Result<(), pgrx::spi::Error> {
-    pgrx::Spi::run("LOCK TABLE kafgres_acls IN ACCESS SHARE MODE NOWAIT")
+/// Read lock: an operator's open `UPDATE kafgres_acls` transaction would otherwise
+pub fn lock_for_read(wait: crate::dbtx::LockWait) -> Result<(), pgrx::spi::Error> {
+    wait.lock("kafgres_acls")
 }
 
 // Wire enums are written out as literal protocol constants: a wrong number silently makes

@@ -21,7 +21,7 @@ use kafgres_codec::generated::describe_share_group_offsets_response::{
 };
 use kafgres_codec::prelude::Uuid;
 
-use super::{check_admin_len, HandlerError};
+use super::{check_admin_len, check_nested_len, HandlerError};
 use crate::acl::{Authz, Operation, ResourceType};
 use crate::meta;
 use crate::storage::LogStore;
@@ -132,9 +132,12 @@ pub fn alter(
         return Ok(alter_error(code, "not authorized to alter this group"));
     }
 
-    check_admin_len("share group offset topics", req.topics.len())?;
-    let total: usize = req.topics.iter().map(|t| t.partitions.len()).sum();
-    check_admin_len("share group offset partitions", total)?;
+    check_nested_len(
+        "share group offset topics",
+        "share group offset partitions",
+        &req.topics,
+        |t| t.partitions.len(),
+    )?;
 
     // Checked before the write; a bad group id would otherwise report success and write orphan rows.
     if !group_exists(&req.group_id)? {

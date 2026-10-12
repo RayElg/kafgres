@@ -433,10 +433,8 @@ pub fn sweep(policy: Retention) -> Result<u64, spi::Error> {
     Ok(dropped as u64)
 }
 
-pub fn lock_for_read() -> Result<(), spi::Error> {
-    Spi::run(
-        "LOCK TABLE kafgres_producers, kafgres_producer_batches IN ACCESS SHARE MODE NOWAIT",
-    )
+pub fn lock_for_read(wait: crate::dbtx::LockWait) -> Result<(), spi::Error> {
+    wait.lock("kafgres_producers, kafgres_producer_batches")
 }
 
 #[cfg(test)]

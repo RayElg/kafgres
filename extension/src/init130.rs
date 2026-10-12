@@ -1,8 +1,4 @@
-use pgrx::spi::Spi;
-
-fn run_ddl(sql: &str, operation: &str) {
-    Spi::run(sql).unwrap_or_else(|e| pgrx::error!("kafgres: failed to {}: {}", operation, e));
-}
+use crate::ddl::run_ddl;
 
 pub fn init_130() {
     // entity_name NULL is Kafka's own encoding of the *default* quota of an entity type, not

@@ -1,10 +1,6 @@
 //! Separate tables from the classic protocol: KIP-848 makes the *broker* the assignor, and a
 
-use pgrx::spi::Spi;
-
-fn run_ddl(sql: &str, operation: &str) {
-    Spi::run(sql).unwrap_or_else(|e| pgrx::error!("kafgres: failed to {}: {}", operation, e));
-}
+use crate::ddl::run_ddl;
 
 pub fn init_120() {
     // The clock the whole protocol runs on: a member is caught up when its member epoch equals

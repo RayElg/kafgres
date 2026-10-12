@@ -48,13 +48,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: LogStore boundary
-        run: ./scripts/check-boundary.sh
+        run: ./scripts/ci/check-boundary.sh
 
   # `cargo check` skips the pgrx/Postgres link step and passes on code that cannot
   # load. Only a real package build proves the extension is loadable.
   #
   # A runner and stack per PG version, engine and shard: the suites restart the broker,
-  # so shards cannot share one. scripts/ci-shard.py splits by file.
+  # so shards cannot share one. scripts/ci/ci-shard.py splits by file.
   extension:
     name: PG ${{ matrix.pg }} ${{ matrix.engine }} ${{ matrix.shard }}/2
     runs-on: ubuntu-latest
@@ -164,7 +164,7 @@ jobs:
       - name: Integration and conformance suites
         run: |
           python3 -m pip install --quiet -r requirements.txt
-          files=$(python3 scripts/ci-shard.py "$KAFGRES_ENGINE" $(( ${{ matrix.shard }} - 1 )) 2)
+          files=$(python3 scripts/ci/ci-shard.py "$KAFGRES_ENGINE" $(( ${{ matrix.shard }} - 1 )) 2)
           python3 -m pytest $files -v
 
       - name: Worker logs

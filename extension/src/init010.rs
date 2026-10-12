@@ -1,9 +1,4 @@
-use pgrx::spi::Spi;
-
-/// Abort init on failure: a half-created schema a worker can then read is worse than refusing to start.
-fn run_ddl(sql: &str, operation: &str) {
-    Spi::run(sql).unwrap_or_else(|e| pgrx::error!("kafgres: failed to {}: {}", operation, e));
-}
+use crate::ddl::run_ddl;
 
 pub fn init_010() {
     // `config` holds topic configs verbatim so CreateTopics/DescribeConfigs round-trip unknown keys.

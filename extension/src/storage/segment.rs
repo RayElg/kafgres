@@ -1,5 +1,6 @@
 //! Segment-file log storage: the only module permitted to do file I/O.
 
+use crate::clock::now_millis;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
@@ -1303,13 +1304,6 @@ fn roll_bounds_cached(topic: TopicId) -> (i64, i64) {
     let bytes = crate::config::segment_bytes(topic);
     map.insert(topic, (ms, bytes, now));
     (ms, bytes)
-}
-
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// One on-disk index entry: relative offset and file position, big-endian. Relative to the
