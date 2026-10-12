@@ -370,6 +370,61 @@ mod tests {
     }
 
     #[test]
+    fn kafka_five_byte_offset_alias_keeps_the_newer_value() {
+        let mut wire = crate::records::build_batch(&[
+            NewRecord {
+                key: Some(b"k".to_vec()),
+                value: Some(b"old".to_vec()),
+                timestamp: 1,
+            },
+            NewRecord {
+                key: Some(b"k".to_vec()),
+                value: Some(b"new".to_vec()),
+                timestamp: 1,
+            },
+        ])
+        .to_vec();
+        // Replace the second record's canonical delta 1 with Kafka's five-byte alias.
+        // Its record length, batch length, and CRC must all reflect the new bytes.
+        let first_len = (wire[crate::records::RECORD_BATCH_OVERHEAD] >> 1) as usize;
+        let second = crate::records::RECORD_BATCH_OVERHEAD + 1 + first_len;
+        let delta = second + 3; // one-byte length, attributes, timestamp delta
+        assert_eq!(wire[delta], 0x02);
+        wire.splice(delta..delta + 1, [0x82, 0x80, 0x80, 0x80, 0x10]);
+        wire[second] += 8; // four added body bytes, zigzag length
+        let length = (wire.len() - LENGTH_OFFSET - 4) as i32;
+        wire[LENGTH_OFFSET..LENGTH_OFFSET + 4].copy_from_slice(&length.to_be_bytes());
+        let crc = crc32c::crc32c(&wire[ATTRIBUTES_OFFSET..]);
+        wire[crate::records::CRC_OFFSET..crate::records::CRC_OFFSET + 4]
+            .copy_from_slice(&crc.to_be_bytes());
+
+        let validated = RecordBatch::validated(Bytes::from(wire)).unwrap();
+        assert_eq!(
+            (validated.record_count(), validated.last_offset_delta()),
+            (2, 1)
+        );
+        let batch = RecordBatch::new(validated.as_bytes().clone()).unwrap();
+        let s = survivors(std::slice::from_ref(&batch)).unwrap();
+        assert!(!s.keeps(0));
+        assert!(s.keeps(1));
+        let kept = kept_from(&batch, &s);
+        assert_eq!(kept.len(), 1);
+        let rebuilt = RecordBatch::validated(rebuild_batch(&batch, &kept).unwrap()).unwrap();
+        assert_eq!(rebuilt.base_offset(), 1);
+        assert_eq!(
+            rebuilt
+                .records()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .value
+                .as_deref(),
+            Some(&b"new"[..])
+        );
+    }
+
+    #[test]
     fn the_last_record_per_key_wins() {
         let batches = log(vec![
             (0, vec![("a", Some("1")), ("b", Some("1"))]),

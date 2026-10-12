@@ -768,6 +768,21 @@ fn read_varint_i64(buf: &[u8], pos: &mut usize) -> Option<i64> {
     None
 }
 
+/// Kafka's record offset delta is an int varint: truncate the unsigned payload to
+/// 32 bits *before* zigzag decoding. A terminating fifth byte may have spill bits.
+fn read_offset_varint(buf: &[u8], pos: &mut usize) -> Option<i32> {
+    let mut result = 0u32;
+    for shift in (0..35).step_by(7) {
+        let byte = *buf.get(*pos)?;
+        *pos += 1;
+        result |= ((byte & 0x7f) as u32).wrapping_shl(shift);
+        if byte & 0x80 == 0 {
+            return Some(((result >> 1) as i32) ^ -((result & 1) as i32));
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub struct RecordRef {
     pub offset_delta: i32,
@@ -849,7 +864,7 @@ impl RecordIter {
         let attributes = *self.buf.get(self.pos).ok_or_else(fail)?;
         self.pos += 1;
         let timestamp_delta = read_varint_i64(&self.buf, &mut self.pos).ok_or_else(fail)?;
-        let offset_delta = read_varint_i64(&self.buf, &mut self.pos).ok_or_else(fail)?;
+        let offset_delta = read_offset_varint(&self.buf[..end], &mut self.pos).ok_or_else(fail)?;
 
         let key = self.read_field(end)?;
         let value = self.read_field(end)?;
@@ -872,7 +887,7 @@ impl RecordIter {
         // The record's own length advances the cursor, so a miscounted header list cannot
         self.pos = end;
         Ok(RecordRef {
-            offset_delta: offset_delta as i32,
+            offset_delta,
             timestamp_delta,
             key,
             value,
@@ -1214,6 +1229,69 @@ mod record_decoder_tests {
             })
             .collect();
         RecordBatch::new(build_batch(&built)).unwrap()
+    }
+
+    /// Substitute an offset varint in a real record and repair both wire lengths and CRC.
+    fn with_offset_wire(offset: &[u8], truncate_after_offset: bool) -> RecordBatch {
+        let mut wire = build_batch(&[NewRecord {
+            key: Some(b"k".to_vec()),
+            value: Some(b"v".to_vec()),
+            timestamp: 1,
+        }])
+        .to_vec();
+        let start = RECORD_BATCH_OVERHEAD;
+        assert_eq!(wire[start + 3], 0); // original offset delta
+        wire.splice(start + 3..start + 4, offset.iter().copied());
+        if truncate_after_offset {
+            wire.truncate(start + 3 + offset.len());
+        }
+        wire[start] = ((wire.len() - start - 1) * 2) as u8;
+        let length = (wire.len() - LENGTH_OFFSET - 4) as i32;
+        wire[LENGTH_OFFSET..LENGTH_OFFSET + 4].copy_from_slice(&length.to_be_bytes());
+        let crc = crc32c::crc32c(&wire[ATTRIBUTES_OFFSET..]);
+        wire[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+        let validated = RecordBatch::validated(Bytes::from(wire)).unwrap();
+        RecordBatch::new(validated.as_bytes().clone()).unwrap()
+    }
+
+    #[test]
+    fn kafka_offset_aliases_decode_after_int_truncation() {
+        let cases: &[(&[u8], i32)] = &[
+            (&[0xfe, 0xff, 0xff, 0xff, 0x0f], i32::MAX),
+            (&[0xff, 0xff, 0xff, 0xff, 0x0f], i32::MIN),
+            (&[0x80, 0x00], 0),
+            (&[0x82, 0x80, 0x80, 0x80, 0x00], 1),
+            (&[0x80, 0x80, 0x80, 0x80, 0x20], 0), // 2^32 alias
+            (&[0x80, 0x80, 0x80, 0x80, 0x10], 0),
+            (&[0x82, 0x80, 0x80, 0x80, 0x10], 1),
+            (&[0x81, 0x80, 0x80, 0x80, 0x10], -1),
+            (&[0xfe, 0xff, 0xff, 0xff, 0x1f], i32::MAX),
+            (&[0xff, 0xff, 0xff, 0xff, 0x1f], i32::MIN),
+        ];
+        for &(wire, expected) in cases {
+            let batch = with_offset_wire(wire, false);
+            let record = batch.records().unwrap().next().unwrap().unwrap();
+            assert_eq!(record.offset_delta, expected, "offset bytes {wire:02x?}");
+            assert_eq!(record.key.as_deref(), Some(&b"k"[..]));
+        }
+    }
+
+    #[test]
+    fn offset_varint_must_terminate_within_its_record_and_five_bytes() {
+        for (wire, truncate) in [
+            (&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00][..], false),
+            (&[0x80, 0x80, 0x80, 0x80, 0x80][..], true),
+            (&[0x80, 0x80][..], true),
+        ] {
+            let batch = with_offset_wire(wire, truncate);
+            assert!(
+                matches!(
+                    batch.records().unwrap().next(),
+                    Some(Err(BatchError::TruncatedRecord { .. }))
+                ),
+                "offset bytes {wire:02x?}"
+            );
+        }
     }
 
     #[test]
