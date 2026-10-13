@@ -492,8 +492,17 @@ fn advance_start_offset(group: &str, topic: u32, partition: i32) -> Result<(), H
 }
 
 /// Release acquisitions whose lock has lapsed, and expire silent members: a consumer that
-pub fn expire() -> Result<usize, HandlerError> {
+/// `alive` are members whose heartbeat is parked behind a table lock: seen now, not expired.
+pub fn expire(alive: &[(String, String)]) -> Result<usize, HandlerError> {
     const PER_SWEEP: i64 = 1_000;
+    for (group_id, member_id) in alive {
+        Spi::run_with_args(
+            "UPDATE kafgres_share_members SET last_seen = now()
+              WHERE group_id = $1 AND member_id = $2",
+            &[group_id.as_str().into(), member_id.as_str().into()],
+        )
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    }
     let released: Option<i64> = Spi::get_one_with_args(
         "WITH lapsed AS (
              UPDATE kafgres_share_inflight
@@ -699,7 +708,7 @@ fn kafgres_share_state(
 
 #[pg_extern]
 fn kafgres_share_expire() -> i64 {
-    expire().unwrap_or_else(|e| error!("kafgres: {e}")) as i64
+    expire(&[]).unwrap_or_else(|e| error!("kafgres: {e}")) as i64
 }
 
 #[pg_extern]

@@ -668,8 +668,17 @@ fn upsert_member(
 }
 
 /// Members that stopped heartbeating; their partitions go back into the pool. Bounded per
-pub fn expire_members() -> Result<usize, HandlerError> {
+/// `alive` are members whose heartbeat is parked behind a table lock: seen now, not expired.
+pub fn expire_members(alive: &[(String, String)]) -> Result<usize, HandlerError> {
     const PER_SWEEP: i64 = 500;
+    for (group_id, member_id) in alive {
+        Spi::run_with_args(
+            "UPDATE kafgres_consumer_group_members SET last_seen = now()
+              WHERE group_id = $1 AND member_id = $2",
+            &[group_id.as_str().into(), member_id.as_str().into()],
+        )
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    }
     let gone: Vec<String> = Spi::connect(|client| {
         let rows = client.select(
             "DELETE FROM kafgres_consumer_group_members

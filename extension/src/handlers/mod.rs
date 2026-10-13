@@ -64,6 +64,8 @@ pub enum HandlerError {
     Codec(CodecError),
     TooLarge { what: &'static str, n: usize },
     Internal(String),
+    /// A table lock was held before the request did anything; retry it unchanged.
+    Busy(String),
 }
 
 impl std::fmt::Display for HandlerError {
@@ -72,6 +74,7 @@ impl std::fmt::Display for HandlerError {
             HandlerError::Codec(e) => write!(f, "{e}"),
             HandlerError::TooLarge { what, n } => write!(f, "{what} too large: {n}"),
             HandlerError::Internal(m) => write!(f, "internal: {m}"),
+            HandlerError::Busy(m) => write!(f, "busy: {m}"),
         }
     }
 }

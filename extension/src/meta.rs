@@ -17,8 +17,8 @@ pub struct TopicMeta {
 }
 
 /// Take ACCESS SHARE on the metadata tables, within the wait `dbtx` allows.
-pub fn lock_for_read(wait: crate::dbtx::LockWait) -> Result<(), spi::Error> {
-    wait.lock("kafgres_topics, kafgres_partitions")
+pub fn lock_for_read() -> Result<(), spi::Error> {
+    crate::dbtx::lock_tables("kafgres_topics, kafgres_partitions")
 }
 
 /// Read every topic and its partitions in one ordered query, so a Metadata request is
