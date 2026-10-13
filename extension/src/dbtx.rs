@@ -130,6 +130,38 @@ pub fn atomically_coded<T, E>(
     result
 }
 
+/// Run a read in a subtransaction that is rolled back after it, releasing the relation locks
+/// it took. Otherwise a SQL caller holds them until its transaction ends, and on the table
+/// engine that blocks the broker's segment `CREATE` and `DROP`. `f` must not write.
+pub fn released<T>(f: impl FnOnce() -> T) -> T {
+    use pgrx::pg_sys;
+    use pgrx::pg_sys::pg_try::PgTryBuilder;
+
+    struct Outer(pg_sys::MemoryContext, pg_sys::ResourceOwner);
+    impl Outer {
+        /// SAFETY: inside the subtransaction this was taken before.
+        unsafe fn restore(&self) {
+            pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            pg_sys::MemoryContextSwitchTo(self.0);
+            pg_sys::CurrentResourceOwner = self.1;
+        }
+    }
+    // SAFETY: called inside a transaction; the rollback below runs on both paths.
+    let outer = unsafe {
+        let outer = Outer(pg_sys::CurrentMemoryContext, pg_sys::CurrentResourceOwner);
+        pg_sys::BeginInternalSubTransaction(std::ptr::null_mut());
+        AssertUnwindSafe(outer)
+    };
+    let out = PgTryBuilder::new(AssertUnwindSafe(f))
+        .catch_others(|caught| {
+            unsafe { outer.restore() };
+            caught.rethrow()
+        })
+        .execute();
+    unsafe { outer.restore() };
+    out
+}
+
 fn with_subtransaction<T>(f: impl FnOnce() -> Result<T, HandlerError>) -> Result<T, HandlerError> {
     atomically(f, |message| HandlerError::Internal(format!("query aborted: {message}")))
 }

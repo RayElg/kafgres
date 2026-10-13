@@ -100,8 +100,10 @@ fn kafgres_read(
             .into_iter()
             .map(|p| {
                 let store = crate::storage::open();
-                let range = cursor::resolve(&*store, topic_id, p, &bounds, isolation)
-                    .unwrap_or_else(|e| error!("kafgres: partition {p}: {e}"));
+                let range = crate::dbtx::released(|| {
+                    cursor::resolve(&*store, topic_id, p, &bounds, isolation)
+                })
+                .unwrap_or_else(|e| error!("kafgres: partition {p}: {e}"));
                 RecordCursor::new(store, topic_id, p, range, isolation)
             })
             .collect()
