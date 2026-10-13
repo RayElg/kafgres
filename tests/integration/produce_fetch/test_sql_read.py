@@ -256,3 +256,14 @@ def test_a_scan_does_not_hold_what_it_read_until_the_transaction_ends(topic):
     # psql prints each statement's result: BEGIN, the count, the bytes held, COMMIT.
     held = int(got.splitlines()[2])
     assert held < 4 * 1024 * 1024, f"{held} bytes still held after scanning 20 MB"
+
+
+def test_a_scan_releases_its_locks_on_the_log_before_the_transaction_ends(topic):
+    """Held to transaction end, they block the broker's segment CREATE and DROP (table engine)."""
+    produce(topic, [str(i) for i in range(20)])
+    got = sql(f"""BEGIN;
+                  SELECT count(*) FROM kafgres_read('{topic}');
+                  SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+                   WHERE l.pid = pg_backend_pid() AND c.relname LIKE 'kafgres_log%';
+                  COMMIT;""")
+    assert got.splitlines()[1:3] == ["20", "0"], got

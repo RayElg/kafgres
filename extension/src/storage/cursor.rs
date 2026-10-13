@@ -104,13 +104,10 @@ impl RecordCursor {
     }
 
     fn read_chunk(&mut self) -> StoreResult<()> {
-        let slice = self.store.read(
-            self.topic,
-            self.partition,
-            self.next,
-            CHUNK_BYTES,
-            self.isolation,
-        )?;
+        let slice = crate::dbtx::released(|| {
+            self.store
+                .read(self.topic, self.partition, self.next, CHUNK_BYTES, self.isolation)
+        })?;
         // A batch reaching where the aborted list was cut short is read again from there.
         let judged_below = slice.aborted_cut_at.unwrap_or(i64::MAX);
         let served = !slice.bytes.is_empty();

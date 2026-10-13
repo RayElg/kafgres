@@ -87,6 +87,11 @@ A function in `FROM` runs to completion before the query above it consumes its r
 A long scan is a long statement. While it runs, Postgres cannot prune the rows idempotent
 producers update for every batch, and their produce slows. Bounded ranges keep scans short.
 
+A scan does not hold the log against retention, even inside a longer transaction: each
+read releases its locks when it returns, so the broker can still roll and drop segments.
+A scan that reaches records retention deleted after it started ends with
+`offset out of range`.
+
 ## What `read_committed` hides
 
 Under `read_committed`, the default, `kafgres_read()` returns what a `read_committed` Kafka
