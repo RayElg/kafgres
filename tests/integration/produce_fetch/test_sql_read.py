@@ -124,7 +124,6 @@ def test_time_bounds_follow_offsets_for_times(topic):
     # Time and offset bounds intersect.
     got = read(topic, "0", f"from_time => {ts(marks[1])}", "to_offset => 15")
     assert sorted(got) == list(range(10, 15))
-    # Past the last record, nothing.
     assert read(topic, "0", f"from_time => {ts(int(time.time() * 1000) + 60_000)}") == {}
 
 
@@ -136,7 +135,6 @@ def test_it_composes_with_ordinary_sql(topic):
                     FROM kafgres_read('{topic}', 0, from_offset => 10, to_offset => 20)
                    WHERE convert_from(value, 'UTF8')::jsonb ->> 'kind' = 'odd'""")
     assert got == "11,13,15,17,19"
-    # LATERAL over the partitions report, and a LIMIT on top.
     got = sql(f"""SELECT count(*) FROM kafgres_partition_offsets('{topic}') p,
                          LATERAL kafgres_read('{topic}', p.partition,
                                               from_offset => p.high_watermark - 5) r""")
@@ -259,7 +257,7 @@ def test_a_scan_does_not_hold_what_it_read_until_the_transaction_ends(topic):
 
 
 def test_a_scan_releases_its_locks_on_the_log_before_the_transaction_ends(topic):
-    """Held to transaction end, they block the broker's segment CREATE and DROP (table engine)."""
+    """Held to transaction end, they block the table engine's segment roll."""
     produce(topic, [str(i) for i in range(20)])
     got = sql(f"""BEGIN;
                   SELECT count(*) FROM kafgres_read('{topic}');
