@@ -130,9 +130,8 @@ pub fn atomically_coded<T, E>(
     result
 }
 
-/// Run a read in a subtransaction that is rolled back after it, releasing the relation locks
-/// it took. Otherwise a SQL caller holds them until its transaction ends, and on the table
-/// engine that blocks the broker's segment `CREATE` and `DROP`. `f` must not write.
+/// Run a read in a subtransaction rolled back after it, releasing its relation locks: held to
+/// the caller's transaction end, they block the table engine's segment roll. `f` must not write.
 pub fn released<T>(f: impl FnOnce() -> T) -> T {
     use pgrx::pg_sys;
     use pgrx::pg_sys::pg_try::PgTryBuilder;

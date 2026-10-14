@@ -254,7 +254,6 @@ mod tests {
         assert!(!f.admit(&data(14, 2, 5, true)));
         assert!(!f.admit(&marker(16, 5, false)));
         assert!(!f.admit(&marker(17, 6, true)));
-        // The producer's next transaction is kept.
         assert!(f.admit(&data(18, 1, 5, true)));
     }
 

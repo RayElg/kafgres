@@ -14,11 +14,9 @@ use crate::storage::IsolationLevel;
 /// Microseconds from the Unix epoch to the Postgres one, 2000-01-01.
 const PG_EPOCH_OFFSET_US: i64 = 946_684_800_000_000;
 
-/// One partition's records, or every partition's when `partition` is NULL, within the bounds
-/// ([`ReadBounds`]). The range is fixed when the call starts.
-///
-/// Gated by `GRANT EXECUTE` and, with ACLs on, `READ` on the topic. The log is then read as
-/// the bootstrap superuser, hence the pinned search path.
+/// One partition's records, or every partition's when `partition` is NULL; the range is fixed
+/// when the call starts. Gated by `GRANT EXECUTE` and, with ACLs on, `READ` on the topic, then
+/// read as the bootstrap superuser, hence the pinned search path.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[pg_extern]
 #[search_path(pg_catalog, @extschema@, pg_temp)]
@@ -146,8 +144,7 @@ fn kafgres_read(
     }))
 }
 
-/// Cursors still to read. Each step reads as the bootstrap superuser; rows reach the query
-/// as the caller.
+/// Each step reads as the bootstrap superuser; rows reach the query as the caller.
 struct Rows {
     cursors: VecDeque<RecordCursor>,
     topic: String,
