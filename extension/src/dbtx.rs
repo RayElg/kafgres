@@ -36,8 +36,6 @@ thread_local! {
     static DID_WORK: Cell<bool> = const { Cell::new(false) };
     /// Inside [`guarded_waiting`]: request locks wait up to [`SQL_LOCK_WAIT`].
     static WAIT_FOR_LOCKS: Cell<bool> = const { Cell::new(false) };
-    /// Inside [`released`]: [`read_one`] reads without assigning an xid.
-    static RELEASED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// How long a SQL caller's request locks wait. A waiter is what makes vacuum truncation
@@ -132,78 +130,6 @@ pub fn atomically_coded<T, E>(
     result
 }
 
-/// `Spi::get_one_with_args`, but inside [`released`] read-only, assigning no xid. Elsewhere
-/// read-only would miss the request's own earlier writes.
-pub fn read_one<T: pgrx::FromDatum + pgrx::IntoDatum>(
-    sql: &str,
-    args: &[pgrx::datum::DatumWithOid<'_>],
-) -> Result<Option<T>, pgrx::spi::Error> {
-    if !RELEASED.with(|r| r.get()) {
-        return pgrx::Spi::get_one_with_args(sql, args);
-    }
-    pgrx::Spi::connect(|client| client.select(sql, Some(1), args)?.first().get_one())
-}
-
-/// The `bigint` columns of `sql`'s rows, on a snapshot taken for this query, assigning no xid.
-/// For state that judges log data already read: Kafka transaction metadata, table log start.
-pub fn fresh_int8_rows(
-    sql: &str,
-    args: &[pgrx::datum::DatumWithOid<'_>],
-    columns: usize,
-) -> Result<Vec<Vec<Option<i64>>>, String> {
-    use pgrx::pg_sys;
-
-    let query = std::ffi::CString::new(sql).map_err(|e| e.to_string())?;
-    let mut types: Vec<pg_sys::Oid> = args.iter().map(|a| a.oid()).collect();
-    let mut values: Vec<pg_sys::Datum> = args
-        .iter()
-        .map(|a| a.datum().map_or(pg_sys::Datum::from(0usize), |d| d.sans_lifetime()))
-        .collect();
-    let nulls: Vec<std::os::raw::c_char> = args
-        .iter()
-        .map(|a| if a.datum().is_some() { b' ' } else { b'n' } as std::os::raw::c_char)
-        .collect();
-    pgrx::Spi::connect(|_| {
-        // SAFETY: SPI is connected for this closure, and the tuple table is read before it ends.
-        // `read_only = false` takes the fresh snapshot; pgrx passes it only after assigning
-        // an xid.
-        unsafe {
-            let status = pg_sys::SPI_execute_with_args(
-                query.as_ptr(),
-                args.len() as i32,
-                types.as_mut_ptr(),
-                values.as_mut_ptr(),
-                nulls.as_ptr(),
-                false,
-                0,
-            );
-            if status != pg_sys::SPI_OK_SELECT as i32 {
-                return Err(format!("SPI_execute_with_args returned {status}"));
-            }
-            let table = pg_sys::SPI_tuptable;
-            let desc = (*table).tupdesc;
-            for column in 1..=columns as i32 {
-                if pg_sys::SPI_gettypeid(desc, column) != pg_sys::INT8OID {
-                    return Err(format!("column {column} of {sql:?} is not bigint"));
-                }
-            }
-            let mut rows = Vec::with_capacity(pg_sys::SPI_processed as usize);
-            for i in 0..pg_sys::SPI_processed as usize {
-                let tuple = *(*table).vals.add(i);
-                let row = (1..=columns as i32)
-                    .map(|column| {
-                        let mut null = false;
-                        let datum = pg_sys::SPI_getbinval(tuple, desc, column, &mut null);
-                        (!null).then(|| datum.value() as i64)
-                    })
-                    .collect();
-                rows.push(row);
-            }
-            Ok(rows)
-        }
-    })
-}
-
 /// Run a read in a subtransaction rolled back after it, releasing its relation locks: held to
 /// the caller's transaction end, they block the table engine's segment roll. `f` must not write.
 pub fn released<T>(f: impl FnOnce() -> T) -> T {
@@ -225,15 +151,12 @@ pub fn released<T>(f: impl FnOnce() -> T) -> T {
         pg_sys::BeginInternalSubTransaction(std::ptr::null_mut());
         AssertUnwindSafe(outer)
     };
-    let was_released = RELEASED.with(|r| r.replace(true));
     let out = PgTryBuilder::new(AssertUnwindSafe(f))
         .catch_others(|caught| {
-            RELEASED.with(|r| r.set(was_released));
             unsafe { outer.restore() };
             caught.rethrow()
         })
         .execute();
-    RELEASED.with(|r| r.set(was_released));
     unsafe { outer.restore() };
     out
 }

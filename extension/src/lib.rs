@@ -15,6 +15,7 @@ pub mod config;
 pub mod consume_sql;
 pub mod clock;
 mod dbtx;
+mod fresh;
 mod ddl;
 pub mod group;
 pub mod handlers;

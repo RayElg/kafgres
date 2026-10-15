@@ -84,15 +84,14 @@ fn kafgres_read(
 
     let (topic_id, partitions) = {
         let _owner = AsBootstrapSuperuser::enter();
-        let found = crate::dbtx::released(|| {
-            let id = crate::meta::topic_id_by_name(topic)?;
-            id.map(|id| crate::meta::partition_count(id).map(|n| (id, n))).transpose()
-        });
-        match found {
-            Ok(Some(v)) => v,
+        let topic_id = match crate::meta::topic_id_by_name(topic) {
+            Ok(Some(id)) => id,
             Ok(None) => error!("kafgres: no such topic {topic:?}"),
             Err(e) => error!("kafgres: {e}"),
-        }
+        };
+        let count =
+            crate::meta::partition_count(topic_id).unwrap_or_else(|e| error!("kafgres: {e}"));
+        (topic_id, count)
     };
     let selected: Vec<i32> = match partition {
         Some(p) if !(0..partitions).contains(&p) => {
