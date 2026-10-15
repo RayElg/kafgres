@@ -222,7 +222,7 @@ def main():
              stdin="k1:after-upgrade\n")
         if args.engine == "segment":
             sql("SELECT kafgres_produce('up-sql', 'k9', 'after-upgrade')")
-            if args.old < "0.3.0":
+            if tuple(map(int, args.old.split("."))) < (0, 3, 0):
                 assert "pre-0.3.0 .timeindex" in logs(), "the time index was not migrated"
 
         step("ALTER EXTENSION kafgres UPDATE")
