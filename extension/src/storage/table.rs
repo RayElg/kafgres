@@ -515,13 +515,21 @@ impl LogStore for TableStore {
         partition: i32,
         timestamp: i64,
     ) -> StoreResult<Option<(i64, i64)>> {
-        let blob = Spi::get_one_with_args::<Vec<u8>>(
-            "SELECT (SELECT batch FROM kafgres_log
-              WHERE topic_id = $1::oid AND partition = $2 AND max_timestamp >= $3
-              ORDER BY base_offset
-              LIMIT 1)",
-            &[(topic as i32).into(), partition.into(), timestamp.into()],
-        )
+        let blob = Spi::connect(|client| {
+            let rows = client.select(
+                "SELECT batch FROM kafgres_log
+                  WHERE topic_id = $1::oid AND partition = $2 AND max_timestamp >= $3
+                  ORDER BY base_offset
+                  LIMIT 1",
+                None,
+                &[(topic as i32).into(), partition.into(), timestamp.into()],
+            )?;
+            let mut found = None;
+            for row in rows {
+                found = bytea_column(&row, 1)?;
+            }
+            Ok::<_, spi::Error>(found)
+        })
         .map_err(spi_err)?;
         Ok(blob.and_then(|b| {
             super::first_at_or_after(kafgres_codec::bytes::Bytes::from(b), timestamp)
@@ -555,7 +563,7 @@ impl LogStore for TableStore {
     }
 
     fn high_watermark(&self, topic: TopicId, partition: i32) -> StoreResult<i64> {
-        Spi::get_one_with_args::<i64>(
+        crate::dbtx::read_one::<i64>(
             "SELECT (SELECT next_offset FROM kafgres_partitions
               WHERE topic_id = $1::oid AND partition = $2)",
             &[(topic as i32).into(), partition.into()],
@@ -581,12 +589,17 @@ impl LogStore for TableStore {
     }
 
     fn log_start_offset(&self, topic: TopicId, partition: i32) -> StoreResult<i64> {
-        Spi::get_one_with_args::<i64>(
+        // Fresh, so retention dropping segments ahead of a scan fails it with OffsetOutOfRange
+        // instead of leaving a gap.
+        crate::dbtx::fresh_int8_rows(
             "SELECT (SELECT log_start_offset FROM kafgres_partitions
               WHERE topic_id = $1::oid AND partition = $2)",
             &[(topic as i32).into(), partition.into()],
+            1,
         )
         .map_err(spi_err)?
+        .first()
+        .and_then(|r| r[0])
         .ok_or(StoreError::UnknownTopicOrPartition)
     }
 

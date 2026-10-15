@@ -153,7 +153,7 @@ pub fn all_partitions() -> Result<Vec<(u32, i32)>, spi::Error> {
 
 pub fn topic_id_by_name(name: &str) -> Result<Option<u32>, spi::Error> {
     Ok(
-        Spi::get_one_with_args::<i32>(
+        crate::dbtx::read_one::<i32>(
             // Scalar subquery: NULL when absent — a bare WHERE returns zero rows, which pgrx reports as an error.
             "SELECT (SELECT topic_id::int FROM kafgres_topics WHERE name = $1)",
             &[name.into()],
@@ -314,7 +314,7 @@ pub fn create_topic(
 }
 
 pub fn partition_count(topic_id: u32) -> Result<i32, spi::Error> {
-    Ok(Spi::get_one_with_args::<i32>(
+    Ok(crate::dbtx::read_one::<i32>(
         "SELECT (SELECT num_partitions FROM kafgres_topics WHERE topic_id = $1::oid)",
         &[(topic_id as i32).into()],
     )?

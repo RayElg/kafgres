@@ -237,6 +237,10 @@ def test_reading_takes_a_grant_and_then_the_acls(reader_role):
     ok, out = as_role(query)
     assert ok and out.endswith("secret"), out
 
+    # The ACL check reads without taking an xid either.
+    ok, out = as_role(f"{query}; SELECT pg_current_xact_id_if_assigned() IS NULL")
+    assert ok and out.endswith("t"), out
+
     # The read runs elevated, but nothing after it does.
     ok, out = as_role(f"SELECT count(*) FROM kafgres_read('{topic}'), "
                       f"LATERAL (SELECT current_user::text AS who) u WHERE u.who = '{ROLE}'")
@@ -256,12 +260,39 @@ def test_a_scan_does_not_hold_what_it_read_until_the_transaction_ends(topic):
     assert held < 4 * 1024 * 1024, f"{held} bytes still held after scanning 20 MB"
 
 
-def test_a_scan_releases_its_locks_on_the_log_before_the_transaction_ends(topic):
-    """Held to transaction end, they block the table engine's segment roll."""
+def test_a_scan_leaves_its_transaction_no_locks_on_the_log_and_no_xid(topic):
+    """Held locks block the table engine's segment roll; a held xid slows every producer."""
     produce(topic, [str(i) for i in range(20)])
     got = sql(f"""BEGIN;
-                  SELECT count(*) FROM kafgres_read('{topic}');
+                  SELECT count(*) FROM kafgres_read('{topic}', from_time => now() - interval '1 hour');
                   SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
                    WHERE l.pid = pg_backend_pid() AND c.relname LIKE 'kafgres_log%';
+                  SELECT pg_current_xact_id_if_assigned() IS NULL;
                   COMMIT;""")
-    assert got.splitlines()[1:3] == ["20", "0"], got
+    assert got.splitlines()[1:4] == ["20", "0", "t"], got
+
+
+def test_a_transaction_aborted_during_the_statement_is_still_filtered(topic):
+    """Transaction state is read after the log it judges: on the segment engine the log is live."""
+    import threading
+    produce(topic, [str(i) for i in range(5)])
+    got = {}
+
+    def statement():
+        # The lateral reference runs kafgres_read() after the sleep, in the same statement.
+        got["rows"] = rows(f"""SELECT count(*), count(*) FILTER (WHERE r.is_transactional)
+                                 FROM (SELECT pg_sleep(8), 100000 AS n) s,
+                                      LATERAL kafgres_read('{topic}', 0, max_records => s.n) r""")
+
+    reader = threading.Thread(target=statement)
+    reader.start()
+    time.sleep(1)
+    out = subprocess.run(
+        ["docker", "run", "--rm", "--network", "host", CLIENTS,
+         "sarama-conformance", BROKER, "txn-abort", topic],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert "OK abort" in out.stdout, out.stderr[-800:]
+    reader.join(30)
+    assert got["rows"] == [["5", "0"]], got
+    assert len(read(topic, isolation="read_uncommitted")) > 5
