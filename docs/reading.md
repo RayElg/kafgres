@@ -2,6 +2,7 @@
 
 `kafgres_read()` returns a topic's records as rows, so any SQL can filter, join and
 aggregate them. It is the read-side counterpart of `kafgres_produce()`.
+[demo/read](../demo/read/README.md) investigates a bad deploy with it, one query per step.
 
 ```sql
 SELECT record_offset, convert_from(value, 'UTF8')::jsonb AS event
