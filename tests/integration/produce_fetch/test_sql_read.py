@@ -296,3 +296,14 @@ def test_a_transaction_aborted_during_the_statement_is_still_filtered(topic):
     reader.join(30)
     assert got["rows"] == [["5", "0"]], got
     assert len(read(topic, isolation="read_uncommitted")) > 5
+
+
+def test_read_committed_is_refused_under_repeatable_read(topic):
+    produce(topic, ["a", "b"])
+    for level in ("REPEATABLE READ", "SERIALIZABLE"):
+        with pytest.raises(RuntimeError, match="needs a READ COMMITTED transaction"):
+            sql(f"BEGIN ISOLATION LEVEL {level}; SELECT count(*) FROM kafgres_read('{topic}'); COMMIT")
+        got = sql(f"""BEGIN ISOLATION LEVEL {level};
+                      SELECT count(*) FROM kafgres_read('{topic}', isolation => 'read_uncommitted');
+                      COMMIT""")
+        assert got.splitlines()[1] == "2", got

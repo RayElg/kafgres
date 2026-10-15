@@ -100,6 +100,12 @@ rolled-back `kafgres_produce()` calls, and nothing past the last stable offset i
 `read_uncommitted` returns them too, as it does for a consumer. Control records
 (transaction markers) are never returned.
 
+`read_committed` needs a `READ COMMITTED` transaction, Postgres's default, and is refused
+under `REPEATABLE READ` or `SERIALIZABLE`. Whether a Kafka transaction committed is read at
+the time of each read, but those levels pin every read to the transaction's first snapshot,
+so a Kafka transaction that aborted after it would read as committed. `read_uncommitted`
+works at any level.
+
 ## Who may read
 
 `kafgres_read()` is not executable by `PUBLIC`. Granting `EXECUTE` is how a role is allowed

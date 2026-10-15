@@ -54,6 +54,18 @@ fn kafgres_read(
             "kafgres: isolation must be 'read_committed' or 'read_uncommitted', not {other:?}"
         ),
     };
+    // A REPEATABLE READ snapshot is fixed: a Kafka transaction aborted after it reads as
+    // committed.
+    // SAFETY: a backend global, set for the transaction.
+    let fixed_snapshot = unsafe { pg_sys::XactIsoLevel } >= pg_sys::XACT_REPEATABLE_READ as i32;
+    if fixed_snapshot && matches!(isolation, IsolationLevel::ReadCommitted) {
+        pgrx::ereport!(
+            pgrx::PgLogLevel::ERROR,
+            pgrx::PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
+            "kafgres: kafgres_read() with isolation 'read_committed' needs a READ COMMITTED transaction",
+            "Run it under READ COMMITTED, or pass isolation => 'read_uncommitted'."
+        );
+    }
     let limit = match max_records {
         Some(n) if n < 0 => error!("kafgres: max_records must not be negative"),
         Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
