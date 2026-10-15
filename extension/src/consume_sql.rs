@@ -101,8 +101,12 @@ fn kafgres_read(
         None => (0..partitions).collect(),
     };
 
-    // After a restart the broker may still be truncating a torn tail.
-    crate::server::wait_for_epochs();
+    // Until the broker starts, a segment may still have a pre-0.3.0 time index, which
+    // answers timestamp lookups wrongly. Offsets need no wait.
+    let by_time = bounds.from_time.is_some() || bounds.to_time.is_some();
+    if by_time && crate::storage_engine_guc() == "segment" {
+        crate::server::wait_for_epochs();
+    }
 
     let cursors = {
         let _owner = AsBootstrapSuperuser::enter();

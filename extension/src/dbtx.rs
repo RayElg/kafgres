@@ -153,7 +153,11 @@ pub fn released<T>(f: impl FnOnce() -> T) -> T {
     };
     let out = PgTryBuilder::new(AssertUnwindSafe(f))
         .catch_others(|caught| {
-            unsafe { outer.restore() };
+            // `caught` holds a copy, so Postgres's pending error is flushed before the rollback.
+            unsafe {
+                pg_sys::FlushErrorState();
+                outer.restore();
+            }
             caught.rethrow()
         })
         .execute();
