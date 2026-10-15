@@ -26,7 +26,9 @@ from confluent_kafka import Consumer, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 
 BOOT = os.environ.get("BOOT", "127.0.0.1:9092")
-DSN = "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres"
+# UTC, so the hours SQL buckets by are the ones the checks name.
+DSN = ("host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres "
+       "options='-c TimeZone=UTC'")
 SCALE = float(os.environ.get("SCALE", "1"))
 N_ORDERS = int(200_000 * SCALE)
 RESULTS = []

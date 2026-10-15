@@ -90,8 +90,7 @@ producers update for every batch, and their produce slows. Bounded ranges keep s
 
 A scan does not hold the log against retention, even inside a longer transaction: each
 read releases its locks when it returns, so the broker can still roll and drop segments.
-A scan that reaches records retention deleted after it started ends with
-`offset out of range`.
+Records retention deletes while a scan runs can be missing from its result.
 
 ## What `read_committed` hides
 
