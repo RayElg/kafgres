@@ -989,7 +989,14 @@ pub fn build_control_batch(producer_id: i64, producer_epoch: i16, commit: bool) 
     put_varint_i32(&mut one, 0); // offsetDelta
     put_varint_i32(&mut one, key.len() as i32);
     one.put_slice(&key);
-    put_varint_i32(&mut one, -1); // null value
+    // The value is Kafka's EndTransactionMarker: version (int16) and coordinator epoch
+    // (int32). Kafka always writes it, and Sarama decodes it unconditionally: a null value
+    // fails the whole fetch with "insufficient data to decode packet".
+    let mut value = BytesMut::new();
+    value.put_i16(0); // EndTransactionMarker version
+    value.put_i32(0); // coordinatorEpoch: one broker, one coordinator
+    put_varint_i32(&mut one, value.len() as i32);
+    one.put_slice(&value);
     put_varint_i32(&mut one, 0); // headerCount
 
     let mut body = BytesMut::new();
@@ -1113,6 +1120,14 @@ mod build_tests {
         assert_eq!(commit.record_count(), 1);
         // A marker is a single record; LSO arithmetic depends on it.
         assert_eq!(commit.last_offset_delta(), 0);
+    }
+
+    #[test]
+    fn a_marker_carries_the_end_transaction_value() {
+        // valueLen (varint 6 = 0x0c), version 0 (int16), coordinatorEpoch 0 (int32), headerCount 0.
+        let b = build_control_batch(7, 3, true);
+        assert_eq!(&b[b.len() - 8..], &[0x0c, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(RecordBatch::validated(b).is_ok());
     }
 
     #[test]
