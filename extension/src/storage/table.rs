@@ -449,9 +449,8 @@ impl LogStore for TableStore {
 
         if offset < ceiling {
 
-        Spi::connect(|client| {
             // Start at the batch *containing* `offset`, not the first at or past it: resume
-            let rows = client.select(
+            crate::fresh::rows(
                 "SELECT base_offset, last_offset, batch
                    FROM kafgres_log
                   WHERE topic_id = $1::oid AND partition = $2
@@ -463,33 +462,31 @@ impl LogStore for TableStore {
                     AND base_offset < $4
                   ORDER BY base_offset
                   LIMIT 1000",
-                None,
                 &[
                     (topic as i32).into(),
                     partition.into(),
                     offset.into(),
                     ceiling.into(),
                 ],
-            )?;
-
-            for row in rows {
-                let last: i64 = row.get(2)?.unwrap_or(0);
-                let blob: Vec<u8> = match bytea_column(&row, 3)? {
-                    Some(b) => b,
-                    None => continue,
-                };
-                if !bytes.is_empty() && bytes.len() + blob.len() > max_bytes {
-                    break;
-                }
-                bytes.extend_from_slice(&blob);
-                next_offset = last + 1;
-                if bytes.len() >= max_bytes && ALWAYS_RETURN_FIRST_BATCH {
-                    break;
-                }
-            }
-            Ok::<_, spi::Error>(())
-        })
-        .map_err(spi_err)?;
+                |rows| {
+                    for row in rows {
+                        let last: i64 = row.get(2)?.unwrap_or(0);
+                        let Some(blob) = row.get::<Vec<u8>>(3)? else {
+                            continue;
+                        };
+                        if !bytes.is_empty() && bytes.len() + blob.len() > max_bytes {
+                            break;
+                        }
+                        bytes.extend_from_slice(&blob);
+                        next_offset = last + 1;
+                        if bytes.len() >= max_bytes && ALWAYS_RETURN_FIRST_BATCH {
+                            break;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(spi_err)?;
 
             // Aborted txns from the index, not the batches in hand: a txn spanning fetches reads as committed.
             if matches!(isolation, IsolationLevel::ReadCommitted) {
@@ -515,21 +512,13 @@ impl LogStore for TableStore {
         partition: i32,
         timestamp: i64,
     ) -> StoreResult<Option<(i64, i64)>> {
-        let blob = Spi::connect(|client| {
-            let rows = client.select(
-                "SELECT batch FROM kafgres_log
-                  WHERE topic_id = $1::oid AND partition = $2 AND max_timestamp >= $3
-                  ORDER BY base_offset
-                  LIMIT 1",
-                None,
-                &[(topic as i32).into(), partition.into(), timestamp.into()],
-            )?;
-            let mut found = None;
-            for row in rows {
-                found = bytea_column(&row, 1)?;
-            }
-            Ok::<_, spi::Error>(found)
-        })
+        let blob = crate::fresh::one::<Vec<u8>>(
+            "SELECT (SELECT batch FROM kafgres_log
+              WHERE topic_id = $1::oid AND partition = $2 AND max_timestamp >= $3
+              ORDER BY base_offset
+              LIMIT 1)",
+            &[(topic as i32).into(), partition.into(), timestamp.into()],
+        )
         .map_err(spi_err)?;
         Ok(blob.and_then(|b| {
             super::first_at_or_after(kafgres_codec::bytes::Bytes::from(b), timestamp)
@@ -563,7 +552,7 @@ impl LogStore for TableStore {
     }
 
     fn high_watermark(&self, topic: TopicId, partition: i32) -> StoreResult<i64> {
-        crate::dbtx::read_one::<i64>(
+        crate::fresh::one::<i64>(
             "SELECT (SELECT next_offset FROM kafgres_partitions
               WHERE topic_id = $1::oid AND partition = $2)",
             &[(topic as i32).into(), partition.into()],
@@ -589,17 +578,12 @@ impl LogStore for TableStore {
     }
 
     fn log_start_offset(&self, topic: TopicId, partition: i32) -> StoreResult<i64> {
-        // Fresh, so retention dropping segments ahead of a scan fails it with OffsetOutOfRange
-        // instead of leaving a gap.
-        crate::dbtx::fresh_int8_rows(
+        crate::fresh::one::<i64>(
             "SELECT (SELECT log_start_offset FROM kafgres_partitions
               WHERE topic_id = $1::oid AND partition = $2)",
             &[(topic as i32).into(), partition.into()],
-            1,
         )
         .map_err(spi_err)?
-        .first()
-        .and_then(|r| r[0])
         .ok_or(StoreError::UnknownTopicOrPartition)
     }
 
