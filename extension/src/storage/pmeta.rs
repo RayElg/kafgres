@@ -232,39 +232,35 @@ pub fn committed_markers(
     from: i64,
     to: i64,
 ) -> StoreResult<(std::collections::HashSet<i64>, i64)> {
-    Spi::connect(|client| {
-        let rows = client.select(
-            "SELECT base_offset FROM kafgres_markers
-              WHERE topic_id = $1::oid AND partition = $2
-                AND base_offset >= $3 AND base_offset < $4
-              ORDER BY base_offset LIMIT $5",
-            None,
-            &[
-                (topic as i32).into(),
-                partition.into(),
-                from.into(),
-                to.into(),
-                (MARKERS_PER_FETCH as i64).into(),
-            ],
-        )?;
-        let mut out = std::collections::HashSet::new();
-        let mut highest = from;
-        for row in rows {
-            if let Some(b) = row.get::<i64>(1)? {
-                out.insert(b);
-                highest = highest.max(b);
-            }
-        }
-        // Under the cap the range is covered exhaustively; at the cap, knowledge stops
-        // after the highest marker loaded.
-        let ceiling = if out.len() < MARKERS_PER_FETCH {
-            to
-        } else {
-            (highest + 1).min(to)
-        };
-        Ok::<_, spi::Error>((out, ceiling))
-    })
-    .map_err(spi_err)
+    let rows = crate::dbtx::fresh_int8_rows(
+        "SELECT base_offset FROM kafgres_markers
+          WHERE topic_id = $1::oid AND partition = $2
+            AND base_offset >= $3 AND base_offset < $4
+          ORDER BY base_offset LIMIT $5",
+        &[
+            (topic as i32).into(),
+            partition.into(),
+            from.into(),
+            to.into(),
+            (MARKERS_PER_FETCH as i64).into(),
+        ],
+        1,
+    )
+    .map_err(spi_err)?;
+    let mut out = std::collections::HashSet::new();
+    let mut highest = from;
+    for b in rows.into_iter().filter_map(|r| r[0]) {
+        out.insert(b);
+        highest = highest.max(b);
+    }
+    // Under the cap the range is covered exhaustively; at the cap, knowledge stops
+    // after the highest marker loaded.
+    let ceiling = if out.len() < MARKERS_PER_FETCH {
+        to
+    } else {
+        (highest + 1).min(to)
+    };
+    Ok((out, ceiling))
 }
 
 /// Whether a `kafgres_produce()` batch's marker exists, and whether its writer has finished,
@@ -303,15 +299,17 @@ pub fn aborted_at(topic: TopicId, partition: i32, producer_id: i64, offset: i64)
 
 /// The Last Stable Offset contributed by in-flight Kafka transactions, if any; `None`
 pub fn kafka_txn_lso(topic: TopicId, partition: i32) -> StoreResult<Option<i64>> {
-    Spi::get_one_with_args::<i64>(
+    let rows = crate::dbtx::fresh_int8_rows(
         "SELECT (SELECT MIN(p.first_offset)
                    FROM kafgres_txn_partitions p
                    JOIN kafgres_txns t ON t.producer_id = p.producer_id
                   WHERE p.topic_id = $1::oid AND p.partition = $2
                     AND p.first_offset >= 0 AND t.state = 'ongoing')",
         &[(topic as i32).into(), partition.into()],
+        1,
     )
-    .map_err(spi_err)
+    .map_err(spi_err)?;
+    Ok(rows.first().and_then(|r| r[0]))
 }
 
 /// Register one (topic, partition) as part of this producer's transaction, and begin the
@@ -442,37 +440,30 @@ pub fn aborted_txns(
     from: i64,
     to: i64,
 ) -> StoreResult<(Vec<super::AbortedTxn>, Option<i64>)> {
-    Spi::connect(|client| {
-        let rows = client.select(
-            "SELECT producer_id, first_offset FROM kafgres_txn_aborted
-              WHERE topic_id = $1::oid AND partition = $2
-                AND last_offset >= $3 AND first_offset < $4
-              ORDER BY first_offset
-              LIMIT $5",
-            None,
-            &[
-                (topic as i32).into(),
-                partition.into(),
-                from.into(),
-                to.into(),
-                MAX_ABORTED_PER_FETCH.into(),
-            ],
-        )?;
-        let mut out = Vec::new();
-        for row in rows {
-            if let (Some(p), Some(f)) = (row.get::<i64>(1)?, row.get::<i64>(2)?) {
-                out.push(super::AbortedTxn {
-                    producer_id: p,
-                    first_offset: f,
-                });
-            }
-        }
-        let cut = (out.len() as i64 >= MAX_ABORTED_PER_FETCH)
-            .then(|| out.last().map(|a| a.first_offset))
-            .flatten();
-        Ok::<_, spi::Error>((out, cut))
-    })
-    .map_err(spi_err)
+    let rows = crate::dbtx::fresh_int8_rows(
+        "SELECT producer_id, first_offset FROM kafgres_txn_aborted
+          WHERE topic_id = $1::oid AND partition = $2
+            AND last_offset >= $3 AND first_offset < $4
+          ORDER BY first_offset
+          LIMIT $5",
+        &[
+            (topic as i32).into(),
+            partition.into(),
+            from.into(),
+            to.into(),
+            MAX_ABORTED_PER_FETCH.into(),
+        ],
+        2,
+    )
+    .map_err(spi_err)?;
+    let out: Vec<super::AbortedTxn> = rows
+        .into_iter()
+        .filter_map(|r| Some(super::AbortedTxn { producer_id: r[0]?, first_offset: r[1]? }))
+        .collect();
+    let cut = (out.len() as i64 >= MAX_ABORTED_PER_FETCH)
+        .then(|| out.last().map(|a| a.first_offset))
+        .flatten();
+    Ok((out, cut))
 }
 
 /// Drop abort-index entries for offsets below the log start. Retention and compaction

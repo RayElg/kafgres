@@ -72,14 +72,15 @@ fn kafgres_read(
 
     let (topic_id, partitions) = {
         let _owner = AsBootstrapSuperuser::enter();
-        let topic_id = match crate::meta::topic_id_by_name(topic) {
-            Ok(Some(id)) => id,
+        let found = crate::dbtx::released(|| {
+            let id = crate::meta::topic_id_by_name(topic)?;
+            id.map(|id| crate::meta::partition_count(id).map(|n| (id, n))).transpose()
+        });
+        match found {
+            Ok(Some(v)) => v,
             Ok(None) => error!("kafgres: no such topic {topic:?}"),
             Err(e) => error!("kafgres: {e}"),
-        };
-        let count =
-            crate::meta::partition_count(topic_id).unwrap_or_else(|e| error!("kafgres: {e}"));
-        (topic_id, count)
+        }
     };
     let selected: Vec<i32> = match partition {
         Some(p) if !(0..partitions).contains(&p) => {
@@ -174,9 +175,17 @@ impl Iterator for Rows {
 
 /// The calling role and its address, as `kafgres_produce()` names them to the ACLs.
 fn caller() -> (String, String) {
-    match Spi::get_two::<String, String>(
-        "SELECT current_user::text, COALESCE(host(inet_client_addr()), 'localhost')",
-    ) {
+    // Not `Spi::get_two`, which assigns the caller's transaction an xid.
+    match Spi::connect(|client| {
+        client
+            .select(
+                "SELECT current_user::text, COALESCE(host(inet_client_addr()), 'localhost')",
+                Some(1),
+                &[],
+            )?
+            .first()
+            .get_two::<String, String>()
+    }) {
         Ok((role, host)) => (role.unwrap_or_default(), host.unwrap_or_default()),
         Err(e) => error!("kafgres: {e}"),
     }
