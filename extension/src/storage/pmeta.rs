@@ -9,8 +9,9 @@ fn spi_err(e: impl std::fmt::Display) -> StoreError {
     StoreError::Io(e.to_string())
 }
 
+/// Fresh, so a read inside a longer SQL statement sees retention that committed during it.
 pub fn log_start_offset(topic: TopicId, partition: i32) -> StoreResult<i64> {
-    crate::plan::get_one::<i64>(
+    crate::fresh::one::<i64>(
         "SELECT (SELECT log_start_offset FROM kafgres_partitions
                   WHERE topic_id = $1::oid AND partition = $2)",
         &[(topic as i32).into(), partition.into()],

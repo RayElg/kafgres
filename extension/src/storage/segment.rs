@@ -105,6 +105,9 @@ pub struct Slot {
     max_timestamp_offset: i64,
     /// Timestamp of the active segment's last time-index entry; entries only grow.
     time_indexed_ts: i64,
+    /// Every record below this was unlinked by a committed retention. Compaction unlinks
+    /// without raising it, since its gaps are skipped.
+    unlinked_below: i64,
 }
 
 impl Default for Slot {
@@ -126,6 +129,7 @@ impl Default for Slot {
             max_timestamp_so_far: i64::MIN,
             max_timestamp_offset: -1,
             time_indexed_ts: i64::MIN,
+            unlinked_below: 0,
         }
     }
 }
@@ -386,6 +390,76 @@ fn with_active<T>(
     f(seg)
 }
 
+/// The partition's slot if one is held, without recovering one. Probes the whole shard,
+/// since a dropped partition leaves a hole in the probe chain.
+fn existing_slot(slots: &[Slot; SLOTS_PER_SHARD], topic: TopicId, partition: i32) -> Option<usize> {
+    let start = (partition_hash(topic, partition) as usize) % SLOTS_PER_SHARD;
+    (0..SLOTS_PER_SHARD)
+        .map(|probe| (start + probe) % SLOTS_PER_SHARD)
+        .find(|&i| slots[i].topic == topic && slots[i].partition == partition)
+}
+
+
+/// A segment the current transaction reclaimed, unlinked once it commits.
+struct PendingUnlink {
+    topic: TopicId,
+    partition: i32,
+    base: i64,
+    next_base: i64,
+    subid: pg_sys::SubTransactionId,
+}
+
+thread_local! {
+    /// Unlinked at commit: before it, a read on the old log start would skip the segment,
+    /// and an abort would lose it under an unchanged log start.
+    static PENDING_UNLINKS: std::cell::RefCell<Vec<PendingUnlink>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Unlink the segment at `base` when the transaction commits. False if it already will.
+fn defer_unlink(topic: TopicId, partition: i32, base: i64, next_base: i64) -> bool {
+    // SAFETY: reads the backend's current subtransaction id.
+    let subid = unsafe { pg_sys::GetCurrentSubTransactionId() };
+    PENDING_UNLINKS.with(|p| {
+        let mut pending = p.borrow_mut();
+        if pending
+            .iter()
+            .any(|u| u.topic == topic && u.partition == partition && u.base == base)
+        {
+            return false;
+        }
+        if pending.is_empty() {
+            arm_pending_unlinks();
+        }
+        pending.push(PendingUnlink { topic, partition, base, next_base, subid });
+        true
+    })
+}
+
+/// Once per transaction that reclaims; arming again after the list emptied runs nothing twice.
+fn arm_pending_unlinks() {
+    let take = || PENDING_UNLINKS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Commit, move || {
+        for u in &take() {
+            SegmentStore::unlink_reclaimed(u);
+        }
+    });
+    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Abort, move || {
+        take();
+    });
+    // The broker's sweep reclaims inside a savepoint. Ids are assigned in order, so an
+    // entry at or above the aborted id was made in it or in one of its children.
+    pgrx::register_subxact_callback(pgrx::PgSubXactCallbackEvent::AbortSub, |aborted, _| {
+        PENDING_UNLINKS.with(|p| p.borrow_mut().retain(|u| u.subid < aborted));
+    });
+    // A prepared transaction commits in another backend, which has no list to run.
+    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::PrePrepare, || {
+        if PENDING_UNLINKS.with(|p| !p.borrow().is_empty()) {
+            error!("kafgres: a transaction that reclaimed log segments cannot be prepared");
+        }
+    });
+}
+
 /// Recovers from disk if no process has touched the slot since postmaster start; holds the shard lock.
 fn slot_for(slots: &mut [Slot; SLOTS_PER_SHARD], topic: TopicId, partition: i32)
     -> StoreResult<usize>
@@ -433,6 +507,7 @@ fn slot_for(slots: &mut [Slot; SLOTS_PER_SHARD], topic: TopicId, partition: i32)
         max_timestamp_so_far: recovered.max_timestamp.0,
         max_timestamp_offset: recovered.max_timestamp.1,
         time_indexed_ts: recovered.time_indexed_ts,
+        unlinked_below: 0,
     };
     HINTS
         .lock()
@@ -1711,6 +1786,9 @@ impl SegmentStore {
             None
         };
 
+        // The commit unlinks under this slot's lock, and recovering one there cannot fail safely.
+        Self::with_slot(topic, partition, |_, _| Ok(()))?;
+
         let mut unlinked = 0u64;
         for i in 0..infos.len().saturating_sub(1) {
             if unlinked as usize >= MAX_SEGMENT_UNLINKS {
@@ -1724,30 +1802,42 @@ impl SegmentStore {
                     break;
                 }
             }
-            let path = data_path(&segment_path(topic, partition, infos[i].base, "log"));
-            match std::fs::remove_file(&path) {
-                Ok(()) => unlinked += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(StoreError::Io(format!("unlink {}: {e}", path.display()))),
+            if defer_unlink(topic, partition, infos[i].base, infos[i + 1].base) {
+                unlinked += 1;
             }
-            for ext in ["index", "timeindex"] {
-                let _ = std::fs::remove_file(data_path(&segment_path(
-                    topic,
-                    partition,
-                    infos[i].base,
-                    ext,
-                )));
-            }
-            if let Some(map) = HINTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                if let Some((_, hint)) = map.get_mut(&(topic, partition)) {
-                    hint.remove(&infos[i].base);
-                }
-            }
-            evict_active(topic, partition);
         }
 
         pmeta::advance_log_start(topic, partition, target)?;
         Ok(unlinked)
+    }
+
+    /// A committed reclaim's unlink. Runs in the commit callback, where an ERROR is a PANIC,
+    /// so it only logs, and it uses the slot `reclaim` made sure of rather than recovering one.
+    fn unlink_reclaimed(u: &PendingUnlink) {
+        let path = data_path(&segment_path(u.topic, u.partition, u.base, "log"));
+        {
+            // Under the shard lock, which a read holds from its floor check to its last batch.
+            let mut slots = SHARDS[shard_of(u.topic, u.partition)].exclusive();
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    pgrx::log!("kafgres: WARNING: unlink {}: {e}", path.display());
+                    return;
+                }
+            }
+            // No slot: the partition was dropped in the same transaction, files and all.
+            if let Some(i) = existing_slot(&slots, u.topic, u.partition) {
+                slots[i].unlinked_below = slots[i].unlinked_below.max(u.next_base);
+            }
+            if let Some(map) = HINTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                if let Some((_, hint)) = map.get_mut(&(u.topic, u.partition)) {
+                    hint.remove(&u.base);
+                }
+            }
+        }
+        for ext in ["index", "timeindex"] {
+            let _ = std::fs::remove_file(data_path(&segment_path(u.topic, u.partition, u.base, ext)));
+        }
+        evict_active(u.topic, u.partition);
     }
 
     /// The partition's active segment, its layout generation and committed extent, from an
@@ -1987,9 +2077,12 @@ impl LogStore for SegmentStore {
                 IsolationLevel::ReadUncommitted => (None, ceiling),
             };
             Self::with_slot(topic, partition, |st, hints| {
+                // The log start above can predate a retention that has since committed.
+                if offset < st.unlinked_below {
+                    return Err(StoreError::OffsetOutOfRange);
+                }
                 let mut bases = bases_on_disk;
                 bases.sort_unstable();
-                let mut reclaimed: Vec<i64> = Vec::new();
 
                 for (bi, base) in bases.iter().enumerate() {
                     if let Some(next_base) = bases.get(bi + 1) {
@@ -2001,9 +2094,10 @@ impl LogStore for SegmentStore {
                     let path = data_path(&segment_path(topic, partition, *base, "log"));
                     let vfd = match Vfd::open(&path, false) {
                         Ok(v) => v,
-                        // Reclaimed underneath us: retention runs from user backends too, and a missing file is
-                        Err(_) if bases.get(bi + 1).is_some_and(|nb| *nb <= log_start) => {
-                            reclaimed.push(*base);
+                        // Unlinked since the listing. Not by retention, which would have raised
+                        // the floor checked above, so compaction emptied it: a gap to skip.
+                        Err(_) if !path.exists() => {
+                            hints.remove(base);
                             continue;
                         }
                         Err(e) => return Err(e),
@@ -2093,9 +2187,6 @@ impl LogStore for SegmentStore {
                         }
 
                         if !out.is_empty() && out.len() + total as usize > max_bytes {
-                            for b in reclaimed {
-                                hints.remove(&b);
-                            }
                             return Ok(());
                         }
 
@@ -2108,15 +2199,9 @@ impl LogStore for SegmentStore {
                         pos += total;
 
                         if out.len() >= max_bytes {
-                            for b in reclaimed {
-                                hints.remove(&b);
-                            }
                             return Ok(());
                         }
                     }
-                }
-                for b in reclaimed {
-                    hints.remove(&b);
                 }
                 Ok(())
             })?;

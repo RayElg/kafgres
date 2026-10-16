@@ -488,6 +488,12 @@ impl LogStore for TableStore {
             )
             .map_err(spi_err)?;
 
+            // The check above can predate a retention that committed while the scan waited on
+            // its lock, and the scan then skipped the dropped segment.
+            if self.log_start_offset(topic, partition)? > offset {
+                return Err(StoreError::OffsetOutOfRange);
+            }
+
             // Aborted txns from the index, not the batches in hand: a txn spanning fetches reads as committed.
             if matches!(isolation, IsolationLevel::ReadCommitted) {
                 (aborted, aborted_cut_at) =
