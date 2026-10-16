@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from conftest import BROKER_HOST, BROKER_PORT, sql
+from conftest import BROKER_HOST, BROKER_PORT, PSQL, sql
 from support.docker import CLIENTS
 
 BROKER = f"{BROKER_HOST}:{BROKER_PORT}"
@@ -53,6 +53,18 @@ def read(topic, *args, isolation=None):
     call = ", ".join([f"'{topic}'"] + named)
     return {int(o): v for o, v in rows(
         f"SELECT record_offset, convert_from(value, 'UTF8') FROM kafgres_read({call})")}
+
+
+def script(statements):
+    """Each statement's output lines, command tags included. Before Postgres 15, `psql -c`
+    prints only the last statement's, so the script goes in on stdin."""
+    out = subprocess.run(
+        PSQL[:-1] + ["-tA", "-v", "ON_ERROR_STOP=1"],
+        input=statements, capture_output=True, text=True, timeout=60,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(f"psql failed: {out.stderr.strip()}")
+    return out.stdout.splitlines()
 
 
 def offset_at(topic, when_ms):
@@ -202,6 +214,7 @@ def reader_role(topic):
     yield topic
     sql("ALTER SYSTEM SET kafgres.acls_enabled = off")
     sql("SELECT pg_reload_conf()")
+    time.sleep(1.5)
     sql(f"DELETE FROM kafgres_acls WHERE principal = 'User:{ROLE}'")
     sql(f"DROP OWNED BY {ROLE}; DROP ROLE {ROLE}")
 
@@ -247,29 +260,31 @@ def test_reading_takes_a_grant_and_then_the_acls(reader_role):
     assert ok and out.endswith("1"), out
 
 
+@pytest.mark.skipif(int(sql("SHOW server_version_num")) < 140000,
+                    reason="pg_backend_memory_contexts is Postgres 14+")
 def test_a_scan_does_not_hold_what_it_read_until_the_transaction_ends(topic):
     """A scan frees each batch as it goes, not at transaction end."""
     produce(topic, ["x" * 4000] * 5000)  # 20 MB, toasted on the table engine
-    got = sql(f"""BEGIN;
-                  SELECT count(*) FROM kafgres_read('{topic}');
-                  SELECT sum(total_bytes) FROM pg_backend_memory_contexts
-                   WHERE name = 'TopTransactionContext';
-                  COMMIT;""")
-    # psql prints each statement's result: BEGIN, the count, the bytes held, COMMIT.
-    held = int(got.splitlines()[2])
+    got = script(f"""BEGIN;
+                     SELECT count(*) FROM kafgres_read('{topic}');
+                     SELECT sum(total_bytes) FROM pg_backend_memory_contexts
+                      WHERE name = 'TopTransactionContext';
+                     COMMIT;""")
+    # BEGIN, the count, the bytes held, COMMIT.
+    held = int(got[2])
     assert held < 4 * 1024 * 1024, f"{held} bytes still held after scanning 20 MB"
 
 
 def test_a_scan_leaves_its_transaction_no_locks_on_the_log_and_no_xid(topic):
     """Held locks block the table engine's segment roll; a held xid slows every producer."""
     produce(topic, [str(i) for i in range(20)])
-    got = sql(f"""BEGIN;
-                  SELECT count(*) FROM kafgres_read('{topic}', from_time => now() - interval '1 hour');
-                  SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
-                   WHERE l.pid = pg_backend_pid() AND c.relname LIKE 'kafgres_log%';
-                  SELECT pg_current_xact_id_if_assigned() IS NULL;
-                  COMMIT;""")
-    assert got.splitlines()[1:4] == ["20", "0", "t"], got
+    got = script(f"""BEGIN;
+                     SELECT count(*) FROM kafgres_read('{topic}', from_time => now() - interval '1 hour');
+                     SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+                      WHERE l.pid = pg_backend_pid() AND c.relname LIKE 'kafgres_log%';
+                     SELECT pg_current_xact_id_if_assigned() IS NULL;
+                     COMMIT;""")
+    assert got[1:4] == ["20", "0", "t"], got
 
 
 def test_a_transaction_aborted_during_the_statement_is_still_filtered(topic):
@@ -303,7 +318,7 @@ def test_read_committed_is_refused_under_repeatable_read(topic):
     for level in ("REPEATABLE READ", "SERIALIZABLE"):
         with pytest.raises(RuntimeError, match="needs a READ COMMITTED transaction"):
             sql(f"BEGIN ISOLATION LEVEL {level}; SELECT count(*) FROM kafgres_read('{topic}'); COMMIT")
-        got = sql(f"""BEGIN ISOLATION LEVEL {level};
-                      SELECT count(*) FROM kafgres_read('{topic}', isolation => 'read_uncommitted');
-                      COMMIT""")
-        assert got.splitlines()[1] == "2", got
+        got = script(f"""BEGIN ISOLATION LEVEL {level};
+                         SELECT count(*) FROM kafgres_read('{topic}', isolation => 'read_uncommitted');
+                         COMMIT;""")
+        assert got[1] == "2", got
