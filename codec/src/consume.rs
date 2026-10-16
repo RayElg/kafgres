@@ -18,7 +18,7 @@ pub struct AbortFilter {
 impl AbortFilter {
     pub fn new(aborted: impl IntoIterator<Item = (i64, i64)>) -> Self {
         let mut pending: Vec<(i64, i64)> = aborted.into_iter().collect();
-        pending.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        pending.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
         AbortFilter {
             pending,
             aborted: HashSet::new(),
