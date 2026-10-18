@@ -49,7 +49,7 @@ every partition alike. Time bounds are the ones that mean the same thing across 
 | `timestamp_type` | `text` | `CreateTime` or `LogAppendTime` |
 | `key` | `bytea` | NULL for a null key |
 | `value` | `bytea` | NULL for a tombstone |
-| `header_keys` | `text[]` | in record order |
+| `header_keys` | `text[]` | in record order; bytes that are not UTF-8 read as U+FFFD, as a Java consumer decodes them |
 | `header_values` | `bytea[]` | in the same order; an element is NULL for a null value |
 | `leader_epoch` | `int` | the partition leader epoch the batch was written under |
 | `producer_id` | `bigint` | NULL outside idempotent and transactional producers |
@@ -109,7 +109,7 @@ works at any level.
 ## Who may read
 
 `kafgres_read()` is not executable by `PUBLIC`. Granting `EXECUTE` is how a role is allowed
-to read:
+to read, and with `kafgres.acls_enabled` off, the default, it allows reading every topic:
 
 ```sql
 GRANT EXECUTE ON FUNCTION kafgres_read TO reporting;

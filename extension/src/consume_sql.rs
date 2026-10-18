@@ -54,8 +54,7 @@ fn kafgres_read(
             "kafgres: isolation must be 'read_committed' or 'read_uncommitted', not {other:?}"
         ),
     };
-    // A REPEATABLE READ snapshot is fixed: a Kafka transaction aborted after it reads as
-    // committed.
+    // REPEATABLE READ fixes the snapshot, so a Kafka transaction aborted since reads committed.
     // SAFETY: a backend global, set for the transaction.
     let fixed_snapshot = unsafe { pg_sys::XactIsoLevel } >= pg_sys::XACT_REPEATABLE_READ as i32;
     if fixed_snapshot && matches!(isolation, IsolationLevel::ReadCommitted) {

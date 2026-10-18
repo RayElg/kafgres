@@ -184,6 +184,27 @@ def test_aborted_kafka_transactions_are_filtered_like_a_consumer_would(topic):
     assert len(read(topic)) < len(read(topic, isolation="read_uncommitted"))
 
 
+def test_a_full_abort_list_is_not_mistaken_for_one_cut_short(topic):
+    """Exactly the cap of aborted transactions overlapping a record lists them all; one
+    more cannot be listed in one read. The entries are planted, under another producer."""
+    produce(topic, ["only"])
+    for count, readable in ((1000, True), (1001, False)):
+        sql(f"""DELETE FROM kafgres_txn_aborted
+                 WHERE topic_id = (SELECT topic_id FROM kafgres_topics WHERE name = '{topic}');
+                INSERT INTO kafgres_txn_aborted
+                       (topic_id, partition, producer_id, first_offset, last_offset)
+                SELECT topic_id, 0, 999999, -n, 1000000
+                  FROM kafgres_topics, generate_series(0, {count - 1}) n
+                 WHERE name = '{topic}'""")
+        if readable:
+            assert read(topic) == {0: "only"}
+        else:
+            with pytest.raises(RuntimeError, match="more aborted transactions overlap"):
+                read(topic)
+    sql(f"""DELETE FROM kafgres_txn_aborted
+             WHERE topic_id = (SELECT topic_id FROM kafgres_topics WHERE name = '{topic}')""")
+
+
 @pytest.mark.skipif(sql("SHOW kafgres.storage_engine") != "segment",
                     reason="kafgres_produce() is the segment engine's")
 def test_a_rolled_back_sql_produce_is_read_only_uncommitted(topic):
@@ -206,15 +227,23 @@ def test_bad_arguments_are_refused(topic):
         sql("SELECT * FROM kafgres_read('sqlread-no-such-topic')")
 
 
+def set_acls(value):
+    """Set `kafgres.acls_enabled` and wait until a new session sees it."""
+    sql(f"ALTER SYSTEM SET kafgres.acls_enabled = {value}")
+    sql("SELECT pg_reload_conf()")
+    deadline = time.monotonic() + 30
+    while sql("SHOW kafgres.acls_enabled") != value:
+        assert time.monotonic() < deadline, f"kafgres.acls_enabled never became {value}"
+        time.sleep(0.1)
+
+
 @pytest.fixture
 def reader_role(topic):
     if sql(f"SELECT count(*) FROM pg_roles WHERE rolname = '{ROLE}'") == "1":
         sql(f"DROP OWNED BY {ROLE}; DROP ROLE {ROLE}")
     sql(f"CREATE ROLE {ROLE}")
     yield topic
-    sql("ALTER SYSTEM SET kafgres.acls_enabled = off")
-    sql("SELECT pg_reload_conf()")
-    time.sleep(1.5)
+    set_acls("off")
     sql(f"DELETE FROM kafgres_acls WHERE principal = 'User:{ROLE}'")
     sql(f"DROP OWNED BY {ROLE}; DROP ROLE {ROLE}")
 
@@ -239,9 +268,7 @@ def test_reading_takes_a_grant_and_then_the_acls(reader_role):
     ok, out = as_role(query)
     assert ok and out.endswith("secret"), out
 
-    sql("ALTER SYSTEM SET kafgres.acls_enabled = on")
-    sql("SELECT pg_reload_conf()")
-    time.sleep(1.5)
+    set_acls("on")
     ok, out = as_role(query)
     assert not ok and "not allowed to READ" in out, out
 

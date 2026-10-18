@@ -136,6 +136,8 @@ impl RecordCursor {
         }
         // Nothing served below the end: the rest of the range was compacted away.
         self.next = if served { advanced } else { self.range.end };
+        // Rebuilt per chunk, like a Fetch response: each read lists every abort overlapping its
+        // start, since an entry is kept until the log start passes its marker.
         self.filter = match self.isolation {
             IsolationLevel::ReadCommitted => Some(AbortFilter::new(
                 slice

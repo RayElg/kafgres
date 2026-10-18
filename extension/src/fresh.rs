@@ -152,7 +152,7 @@ mod tests {
         assert_eq!(no_xid, Ok(Some(true)));
     }
 
-    /// Inside a subtransaction with no xid of its own, where `SpiClient::select` would not.
+    /// Even in a subtransaction with no xid, where `SpiClient::select` misses them.
     #[pg_test]
     fn reads_see_the_transactions_own_writes() {
         Spi::run("CREATE TEMP TABLE fresh_own_writes (x int)").unwrap();

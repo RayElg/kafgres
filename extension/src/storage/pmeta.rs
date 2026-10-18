@@ -253,8 +253,7 @@ pub fn committed_markers(
                     highest = highest.max(b);
                 }
             }
-            // Under the cap the range is covered exhaustively; at the cap, knowledge stops
-            // after the highest marker loaded.
+            // At the cap, the range is known only up to the highest marker loaded.
             let ceiling = if out.len() < MARKERS_PER_FETCH {
                 to
             } else {
@@ -433,8 +432,9 @@ pub fn record_aborted_txn(
 /// How many aborted transactions one Fetch reports, per partition. A row count, so it
 pub const MAX_ABORTED_PER_FETCH: i64 = 1_000;
 
-/// Aborted transactions overlapping `[from, to)`, oldest first. `last_offset >= from`
-/// Also where the cap cut the list short: entries starting there or later may be missing.
+/// Aborted transactions overlapping `[from, to)`, oldest first, at most
+/// `MAX_ABORTED_PER_FETCH`. Second, where the cap cut the list short: every entry starting
+/// below it is listed, and entries starting there or later are not.
 pub fn aborted_txns(
     topic: TopicId,
     partition: i32,
@@ -446,7 +446,7 @@ pub fn aborted_txns(
           WHERE topic_id = $1::oid AND partition = $2
             AND last_offset >= $3 AND first_offset < $4
           ORDER BY first_offset
-          LIMIT $5",
+          LIMIT $5 + 1",
         &[
             (topic as i32).into(),
             partition.into(),
@@ -464,8 +464,9 @@ pub fn aborted_txns(
                     });
                 }
             }
-            let cut = (out.len() as i64 >= MAX_ABORTED_PER_FETCH)
-                .then(|| out.last().map(|a| a.first_offset))
+            // `first_offset` is unique per partition, so everything below the extra row is in.
+            let cut = (out.len() as i64 > MAX_ABORTED_PER_FETCH)
+                .then(|| out.pop().map(|a| a.first_offset))
                 .flatten();
             Ok((out, cut))
         },
