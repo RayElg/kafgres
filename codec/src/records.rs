@@ -975,6 +975,10 @@ pub fn build_batch_as(records: &[NewRecord], producer_id: i64) -> bytes::Bytes {
 /// Bit 5 of the batch attributes: `isControl`.
 pub const CONTROL_BATCH_FLAG: i16 = 0x20;
 
+/// Kafka's `EndTransactionMarker` value: int16 version 0, then int32 coordinator epoch 0 (one
+/// broker, one coordinator). Required: some clients decode it unconditionally.
+const END_TXN_MARKER_VALUE: [u8; 6] = [0, 0, 0, 0, 0, 0];
+
 /// A transaction marker: the batch a broker appends to every partition a transaction
 pub fn build_control_batch(producer_id: i64, producer_epoch: i16, commit: bool) -> bytes::Bytes {
     use bytes::{BufMut, BytesMut};
@@ -989,7 +993,8 @@ pub fn build_control_batch(producer_id: i64, producer_epoch: i16, commit: bool) 
     put_varint_i32(&mut one, 0); // offsetDelta
     put_varint_i32(&mut one, key.len() as i32);
     one.put_slice(&key);
-    put_varint_i32(&mut one, -1); // null value
+    put_varint_i32(&mut one, END_TXN_MARKER_VALUE.len() as i32);
+    one.put_slice(&END_TXN_MARKER_VALUE);
     put_varint_i32(&mut one, 0); // headerCount
 
     let mut body = BytesMut::new();
@@ -1113,6 +1118,18 @@ mod build_tests {
         assert_eq!(commit.record_count(), 1);
         // A marker is a single record; LSO arithmetic depends on it.
         assert_eq!(commit.last_offset_delta(), 0);
+    }
+
+    #[test]
+    fn a_marker_value_decodes_as_an_end_transaction_marker() {
+        for commit in [true, false] {
+            let batch = RecordBatch::validated(build_control_batch(7, 3, commit)).expect("valid");
+            let rec = batch.records().expect("uncompressed").next().expect("one record").expect("decodes");
+            let value = rec.value.expect("a marker has a value");
+            assert_eq!(value.len(), 6, "int16 version + int32 coordinatorEpoch");
+            assert_eq!(i16::from_be_bytes([value[0], value[1]]), 0, "version");
+            assert_eq!(i32::from_be_bytes([value[2], value[3], value[4], value[5]]), 0, "epoch");
+        }
     }
 
     #[test]

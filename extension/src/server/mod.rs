@@ -614,6 +614,9 @@ fn poll_connections(srv: &mut Server, cfg: &ClusterConfig, ready: Option<&HashSe
 
         match read_outcome {
             ReadResult::Closed => {
+                // Kafka serves requests already received from a closing peer; without this an
+                // acks=0 produce sent just before a close is lost.
+                serve_frames(srv, id, cfg);
                 closed.push(id);
                 continue;
             }

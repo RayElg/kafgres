@@ -526,6 +526,15 @@ impl LogStore for TableStore {
         .ok_or(StoreError::UnknownTopicOrPartition)
     }
 
+    /// The start of the oldest open Kafka transaction, else the high watermark; the same
+    /// bound `read` computes for Fetch.
+    fn last_stable_offset(&self, topic: TopicId, partition: i32) -> StoreResult<i64> {
+        let high_watermark = self.high_watermark(topic, partition)?;
+        Ok(pmeta::kafka_txn_lso(topic, partition)?
+            .filter(|o| *o >= 0)
+            .map_or(high_watermark, |o| o.min(high_watermark)))
+    }
+
     fn last_stable_offset_if_tracked(
         &self,
         topic: TopicId,

@@ -78,7 +78,7 @@ pub fn handle(
             }
             partitions.push(match topic_id {
                 None => err_partition(p.partition_index, ErrorCode::UnknownTopicOrPartition),
-                Some(tid) => resolve(store, tid, p.partition_index, p.timestamp),
+                Some(tid) => resolve(store, tid, p.partition_index, p.timestamp, req.isolation_level == 1),
             });
         }
 
@@ -101,6 +101,7 @@ fn resolve(
     topic: u32,
     partition: i32,
     timestamp: i64,
+    read_committed: bool,
 ) -> ListOffsetsPartitionResponse {
     let epoch = store.leader_epoch(topic, partition).unwrap_or(-1);
 
@@ -134,6 +135,10 @@ fn resolve(
     // (offset, timestamp): a lookup by time answers with the record's own timestamp.
     let result = match timestamp {
         TIMESTAMP_EARLIEST => store.log_start_offset(topic, partition).map(|o| Some((o, -1))),
+        // A read_committed consumer cannot read past an open transaction, so its end is the LSO.
+        TIMESTAMP_LATEST if read_committed => {
+            store.last_stable_offset(topic, partition).map(|o| Some((o, -1)))
+        }
         TIMESTAMP_LATEST => store.high_watermark(topic, partition).map(|o| Some((o, -1))),
         // No remote tier, so the local log is the whole log: this is the log start.
         TIMESTAMP_EARLIEST_LOCAL => {
