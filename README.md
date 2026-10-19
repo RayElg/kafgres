@@ -36,7 +36,7 @@ The following all work today:
 - Consumers truncate rather than read divergent data when an async replica is promoted,
   verified against a real physical standby.
 - The conformance suite drives five real clients (Java, librdkafka, Sarama, franz-go,
-  kafka-python) through some 140 scenarios against kafgres and a reference Kafka
+  kafka-python) through some 180 scenarios against kafgres and a reference Kafka
   and diffs the observable results; it runs in CI on every pull request, and every intended
   difference is catalogued in [docs/conformance.md](docs/conformance.md).
 - The segment engine (the default) passes the same conformance suite, survives `kill -9`
@@ -264,7 +264,7 @@ back to `Metadata`. Anything else that differs is treated as a bug, and the scri
 it rather than absorbing it.
 
 The demo is a summary; `tests/conformance/` is the gate. It runs the five clients through
-about 140 scenarios and replays KIP-890 transaction frames against both brokers in
+about 180 scenarios and replays KIP-890 transaction frames against both brokers in
 eighteen more tests, in CI on every pull request.
 
 ## Documentation

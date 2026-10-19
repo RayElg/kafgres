@@ -9,7 +9,8 @@ SCENARIOS = scenarios(
     "txn-fenced", "group-two-members", "group-resume", "group-rebalance-leave",
     "group-static", "group-cooperative", "group-kip848", "group-admin", "admin-topics",
     "admin-configs", "admin-cluster", "admin-delete-records", "admin-offsets", "metadata",
-    "unknown-topic",
+    "unknown-topic", "topic-recreate", "topic-limits", "many-partitions", "many-records",
+    "seek-into-batch", "group-partition-growth", "group-pattern", "compacted-null-key",
 )
 
 

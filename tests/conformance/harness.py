@@ -48,6 +48,7 @@ PARTITIONS = {
     "group-static": 3,
     "group-cooperative": 3,
     "group-kip848": 3,
+    "many-partitions": 50,
 }
 
 
@@ -73,6 +74,11 @@ KNOWN_GAPS = {
     ("sarama", "offsets-by-time"): (
         "Sarama's producer sends a batch header with max timestamp -1 and Kafka recomputes it "
         "on append; kafgres stores the header and CRC verbatim, so time lookups miss Sarama data"
+    ),
+    ("java", "txn-timeout"): (
+        "an expired transaction fences its producer, deliberately, so a slow producer cannot "
+        "write on; the producer's late commit then fails with PRODUCER_FENCED where Kafka "
+        "answers INVALID_TXN_STATE"
     ),
     ("sarama", "admin-offsets"): "the same batch-header max timestamp as sarama/offsets-by-time",
 }

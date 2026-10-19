@@ -59,7 +59,14 @@ func adminTopics(broker, topic string) error {
 		}
 	}
 	out = append(out, "grow="+errName(a.CreatePartitions(t, 5, nil, false)))
-	ds, _ = a.DescribeTopics([]string{t})
+	// Metadata may lag the growth by a moment; read until it reflects it.
+	for i := 0; i < 40; i++ {
+		ds, _ = a.DescribeTopics([]string{t})
+		if len(ds) == 1 && len(ds[0].Partitions) == 5 {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 	out = append(out, fmt.Sprintf("grown=%d", len(ds[0].Partitions)))
 	out = append(out, "shrink="+errName(a.CreatePartitions(t, 2, nil, false)))
 	out = append(out, "grow_missing="+errName(a.CreatePartitions(t+"-nope", 2, nil, false)))

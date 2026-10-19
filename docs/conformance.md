@@ -46,11 +46,11 @@ comparison.
 
 | Client | Runner | Scenarios | Why |
 |---|---|---|---|
-| Java (`kafka-clients`) | `tests/clients/java/` | 32 | Defines correct behaviour in practice. Only client for share groups, the KIP-848 consumer protocol and the producer and transaction admin APIs. |
-| librdkafka (`confluent-kafka`) | `tests/clients/librdkafka/` | 29 | Most widely deployed: `kcat` and the Python, .NET, Node and Rust bindings. The integration suites also use it via `kcat`. |
-| Sarama (Go) | `tests/clients/sarama/` | 28 | Shares no code with the others. Pins its API version, so it breaks on an advertised but unimplemented version; decodes transaction markers unconditionally. |
-| franz-go | `tests/clients/franz/` | 30 | Used by Redpanda Console and much of the Go ecosystem. Speaks the newest version of every API both sides advertise; treats a missing API key as an old broker. |
-| kafka-python | `tests/clients/python/` | 22 | Probes and downgrades rather than pinning, so it exercises older API versions. No transactions or idempotence. |
+| Java (`kafka-clients`) | `tests/clients/java/` | 43 | Defines correct behaviour in practice. Only client for share groups, the KIP-848 consumer protocol and the producer and transaction admin APIs. |
+| librdkafka (`confluent-kafka`) | `tests/clients/librdkafka/` | 37 | Most widely deployed: `kcat` and the Python, .NET, Node and Rust bindings. The integration suites also use it via `kcat`. |
+| Sarama (Go) | `tests/clients/sarama/` | 35 | Shares no code with the others. Pins its API version, so it breaks on an advertised but unimplemented version; decodes transaction markers unconditionally. |
+| franz-go | `tests/clients/franz/` | 37 | Used by Redpanda Console and much of the Go ecosystem. Speaks the newest version of every API both sides advertise; treats a missing API key as an old broker. |
+| kafka-python | `tests/clients/python/` | 29 | Probes and downgrades rather than pinning, so it exercises older API versions. No transactions or idempotence. |
 
 The Java tooling (`kafka-*.sh`) is additionally driven by the integration suites, and by
 `test_the_advertised_api_surface_is_a_subset_of_kafkas`, which asserts every advertised
@@ -67,6 +67,9 @@ version range stays inside Kafka's own.
 | Groups | `group-consume`, `group-two-members`, `group-rebalance-leave`, `group-resume` (committed offsets and their metadata), `group-static` (KIP-345), `group-cooperative` (KIP-429), `group-kip848` (the consumer protocol), `group-admin` (list, describe, offsets, delete) |
 | Share groups | `share-consume` (KIP-932: accept, release and reject, and the delivery count on redelivery) |
 | Admin | `admin-topics` (create with configs, every refusal, describe, grow, shrink, delete), `admin-configs` (defaults, set, delete, refusals), `admin-cluster`, `admin-delete-records`, `admin-offsets`, `admin-producers` (`DescribeProducers`, `ListTransactions`, `DescribeTransactions`, abort), `admin-quotas` |
+| Limits and scale | `topic-limits` (a per-topic `max.message.bytes` refuses what the broker default would take), `many-partitions` (50 partitions: one metadata, one `ListOffsets` and one assignment across all of them), `many-records` (20,000 records in batches, by checksum), `seek-into-batch` (a seek to the middle of a 100-record batch, past the end, and an offset lookup by time inside it) |
+| Lifecycle | `topic-recreate` (delete and recreate under the same name: new topic id, offsets restart at 0, none of the old data), `group-partition-growth` (a member picks up partitions added to a topic it consumes), `group-pattern` (regex subscription, including a topic created after the group formed), `group-list-filters` (list groups by state), `compacted-null-key` (a compacted topic refuses a null key and accepts a tombstone) |
+| Failure | `commit-stale-generation` (a member that missed a rebalance has its commit refused and nothing stored), `txn-timeout` (a transaction abandoned past its timeout is aborted and stops holding the last stable offset) |
 | Metadata | `metadata`, `unknown-topic` |
 
 ## Advertised API surface
@@ -230,6 +233,11 @@ its paragraph here are removed.
   the batch header. Kafka recomputes it on append; kafgres stores header and CRC verbatim,
   so time lookups miss Sarama's records. `offsets-by-time`, `admin-offsets`, Sarama.
 
+- **A producer whose transaction expired is fenced.** kafgres aborts a transaction past its
+  timeout and fences the producer, so a slow producer cannot write into a closed
+  transaction. Its late `EndTxn` fails with `PRODUCER_FENCED`; Kafka answers
+  `INVALID_TXN_STATE`. Both fail the producer, with different classes. `txn-timeout`, Java.
+
 ## Debezium parity
 
 For a consumer written against Debezium, mappings cover most of what it provides. What
@@ -274,6 +282,11 @@ Stated so the suite is not read as broader than it is.
   a real physical standby.
 - **Anything a scenario does not do.** The scenario count is a floor, not a ceiling.
   When a client reports a bug, the fix is a new scenario here first.
+- **ACLs.** A diff needs a reference broker with an authorizer and a mapping from Postgres
+  roles to Kafka principals. `tests/integration/security/` covers them.
+- **Timing-dependent broker behaviour.** Compaction, retention and quota throttling run on
+  each broker's own schedule. Scenarios compare what a client is told (a null key refused,
+  a tombstone accepted), not when compaction runs.
 - **Clients not in the matrix.** .NET (Confluent.Kafka), Node (KafkaJS) and Rust
   (`rdkafka`, `kafka-rust`). Confluent.Kafka and `rdkafka` sit on librdkafka.
 

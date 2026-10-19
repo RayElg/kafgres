@@ -69,6 +69,17 @@ public class Scenarios {
         all.put("admin-producers", Scenarios::adminProducers);
         all.put("admin-quotas", Scenarios::adminQuotas);
         all.put("share-consume", Scenarios::shareConsume);
+        all.put("commit-stale-generation", Scenarios::commitStaleGeneration);
+        all.put("topic-recreate", Scenarios::topicRecreate);
+        all.put("topic-limits", Scenarios::topicLimits);
+        all.put("many-partitions", Scenarios::manyPartitions);
+        all.put("many-records", Scenarios::manyRecords);
+        all.put("seek-into-batch", Scenarios::seekIntoBatch);
+        all.put("group-partition-growth", Scenarios::groupPartitionGrowth);
+        all.put("group-pattern", Scenarios::groupPattern);
+        all.put("group-list-filters", Scenarios::groupListFilters);
+        all.put("txn-timeout", Scenarios::txnTimeout);
+        all.put("compacted-null-key", Scenarios::compactedNullKey);
         all.put("metadata", Scenarios::metadata);
         all.put("unknown-topic", Scenarios::unknownTopic);
 
@@ -1147,6 +1158,329 @@ public class Scenarios {
             for (int i = 0; i < 3; i++) extra += c.poll(Duration.ofMillis(1000)).count();
             Collections.sort(first);
             return "first=" + String.join(",", first) + " redelivered=" + redelivered + " extra=" + extra;
+        }
+    }
+
+    /** A Member polled on its own thread, for scenarios where the main thread has other work. */
+    static class BgMember {
+        final Member m;
+        volatile Set<TopicPartition> ownedSnap = Set.of();
+        volatile List<String> gotSnap = List.of();
+        volatile boolean stop;
+        final Thread t;
+
+        BgMember(String group, Properties extra) {
+            m = new Member(group, extra);
+            t = new Thread(() -> {
+                while (!stop) {
+                    try {
+                        m.poll();
+                    } catch (Exception e) {
+                        if (stop) return;
+                    }
+                    ownedSnap = new HashSet<>(m.owned);
+                    gotSnap = new ArrayList<>(m.got);
+                }
+            });
+            t.setDaemon(true);
+            t.start();
+        }
+
+        Set<TopicPartition> owned() { return ownedSnap; }
+
+        List<String> received() { return gotSnap; }
+
+        void close() throws InterruptedException {
+            stop = true;
+            t.join(30000);
+            m.c.close();
+        }
+    }
+
+    static void createTopic(Admin a, String name, int partitions, Map<String, String> configs) throws Exception {
+        a.createTopics(List.of(new NewTopic(name, partitions, (short) 1).configs(configs))).all().get();
+    }
+
+    /** A member that stops polling while another joins misses a generation; its commit must be refused. */
+    static String commitStaleGeneration() throws Exception {
+        String g = topic + "-g";
+        try (KafkaProducer<byte[], byte[]> p = producer()) {
+            for (int i = 0; i < 3; i++) send(p, topic, 0, "c" + i);
+        }
+        Properties slow = new Properties();
+        slow.put("group.id", g);
+        slow.put("max.poll.interval.ms", "3000");
+        slow.put("session.timeout.ms", "10000");
+        slow.put("heartbeat.interval.ms", "1000");
+        KafkaConsumer<byte[], byte[]> c1 = consumer(slow);
+        BgMember c2 = null;
+        try {
+            c1.subscribe(List.of(topic));
+            List<ConsumerRecord<byte[], byte[]>> got = drain(c1, 3, 60000);
+            // c1 stops polling; c2 joins, and the group waits out c1's poll interval.
+            c2 = new BgMember(g, new Properties());
+            Thread.sleep(8000);
+            String outcome;
+            try {
+                c1.commitSync(Map.of(tp(0), new OffsetAndMetadata(3)));
+                outcome = "committed";
+            } catch (Exception e) {
+                outcome = err(e);
+            }
+            try (Admin a = admin()) {
+                OffsetAndMetadata stored = a.listConsumerGroupOffsets(g).partitionsToOffsetAndMetadata().get().get(tp(0));
+                return "read=" + got.size() + " commit=" + outcome + " stored=" + (stored == null ? "none" : stored.offset());
+            }
+        } finally {
+            try { c1.close(Duration.ofSeconds(5)); } catch (Exception ignored) { }
+            if (c2 != null) c2.close();
+        }
+    }
+
+    static String topicRecreate() throws Exception {
+        try (KafkaProducer<byte[], byte[]> p = producer(); Admin a = admin()) {
+            for (int i = 0; i < 3; i++) send(p, topic, 0, "old" + i);
+            Uuid before = a.describeTopics(List.of(topic)).allTopicNames().get().get(topic).topicId();
+            a.deleteTopics(List.of(topic)).all().get();
+            for (int i = 0; i < 60; i++) {
+                if (attempt(() -> a.describeTopics(List.of(topic)).allTopicNames().get()).equals("UnknownTopicOrPartitionException")) break;
+                Thread.sleep(250);
+            }
+            String created = "TopicExistsException";
+            for (int i = 0; i < 60 && created.equals("TopicExistsException"); i++) {
+                created = attempt(() -> createTopic(a, topic, 1, Map.of()));
+                if (!created.equals("ok")) Thread.sleep(250);
+            }
+            Uuid after = a.describeTopics(List.of(topic)).allTopicNames().get().get(topic).topicId();
+            // A fresh producer, since the first caches the old topic's metadata.
+            try (KafkaProducer<byte[], byte[]> p2 = producer()) {
+                long o0 = send(p2, topic, 0, "new0").offset();
+                long o1 = send(p2, topic, 0, "new1").offset();
+                try (KafkaConsumer<byte[], byte[]> c = consumer(new Properties())) {
+                    c.assign(List.of(tp(0)));
+                    return "recreated=" + created + " new_id=" + !before.equals(after) + " offsets=" + o0 + "," + o1
+                            + " read=" + values(drain(c, 2, 30000))
+                            + " begin=" + c.beginningOffsets(List.of(tp(0))).get(tp(0))
+                            + " end=" + c.endOffsets(List.of(tp(0))).get(tp(0));
+                }
+            }
+        }
+    }
+
+    static String topicLimits() throws Exception {
+        String t = topic + "-lim";
+        try (Admin a = admin()) {
+            createTopic(a, t, 1, Map.of("max.message.bytes", "2048"));
+            ConfigResource r = new ConfigResource(ConfigResource.Type.TOPIC, t);
+            ConfigEntry e = a.describeConfigs(List.of(r)).all().get().get(r).get("max.message.bytes");
+            try (KafkaProducer<byte[], byte[]> p = producer()) {
+                String big = "none";
+                try {
+                    send(p, new ProducerRecord<>(t, 0, null, new byte[4000]));
+                } catch (Exception ex) {
+                    big = err(ex);
+                }
+                long small = send(p, new ProducerRecord<>(t, 0, null, new byte[1000])).offset();
+                return "config=" + e.value() + "/" + e.source() + " over_limit=" + big + " under_limit_offset=" + small;
+            }
+        }
+    }
+
+    static String manyPartitions() throws Exception {
+        int n = 50;
+        try (KafkaProducer<byte[], byte[]> p = producer()) {
+            for (int i = 0; i < n; i++) send(p, topic, i, "mp" + i);
+        }
+        List<TopicPartition> tps = new ArrayList<>();
+        for (int i = 0; i < n; i++) tps.add(tp(i));
+        try (Admin a = admin(); KafkaConsumer<byte[], byte[]> c = consumer(new Properties())) {
+            int described = a.describeTopics(List.of(topic)).allTopicNames().get().get(topic).partitions().size();
+            long total = 0;
+            Map<TopicPartition, OffsetSpec> specs = new HashMap<>();
+            for (TopicPartition t : tps) specs.put(t, OffsetSpec.latest());
+            for (ListOffsetsResult.ListOffsetsResultInfo i : a.listOffsets(specs).all().get().values()) total += i.offset();
+            c.assign(tps);
+            Set<Integer> seen = new TreeSet<>();
+            for (ConsumerRecord<byte[], byte[]> r : drain(c, n, 60000)) seen.add(r.partition());
+            return "described=" + described + " end_sum=" + total + " read_partitions=" + seen.size();
+        }
+    }
+
+    static String manyRecords() throws Exception {
+        int n = 20000;
+        Properties pp = new Properties();
+        pp.put("linger.ms", "20");
+        pp.put("batch.size", "65536");
+        List<byte[]> sent = new ArrayList<>();
+        try (KafkaProducer<byte[], byte[]> p = producer(pp)) {
+            List<Future<RecordMetadata>> f = new ArrayList<>();
+            for (int i = 0; i < n; i++) {
+                byte[] v = b(String.format("%08d-", i).repeat(10));
+                sent.add(v);
+                f.add(p.send(new ProducerRecord<>(topic, 0, null, v)));
+            }
+            p.flush();
+            for (Future<RecordMetadata> x : f) x.get(60, TimeUnit.SECONDS);
+        }
+        try (KafkaConsumer<byte[], byte[]> c = consumer(new Properties())) {
+            c.assign(List.of(tp(0)));
+            List<byte[]> got = drain(c, n, 120000).stream().map(ConsumerRecord::value).collect(Collectors.toList());
+            return "count=" + got.size() + " crc=" + crc(got) + " same=" + crc(got).equals(crc(sent));
+        }
+    }
+
+    static String seekIntoBatch() throws Exception {
+        long t0 = 1_700_000_000_000L;
+        Properties pp = new Properties();
+        pp.put("linger.ms", "1000");
+        pp.put("batch.size", "1048576");
+        List<Future<RecordMetadata>> f = new ArrayList<>();
+        try (KafkaProducer<byte[], byte[]> p = producer(pp)) {
+            for (int i = 0; i < 100; i++) f.add(p.send(new ProducerRecord<>(topic, 0, t0 + i, null, b("b" + i))));
+            p.flush();
+        }
+        boolean oneBatch = true;
+        for (Future<RecordMetadata> x : f) oneBatch &= x.get().offset() == f.indexOf(x);
+        try (KafkaConsumer<byte[], byte[]> c = consumer(new Properties())) {
+            c.assign(List.of(tp(0)));
+            c.seek(tp(0), 37);
+            ConsumerRecord<byte[], byte[]> first = drain(c, 1, 30000).get(0);
+            c.seek(tp(0), 37);
+            String five = values(drain(c, 5, 30000).subList(0, 5));
+            c.seek(tp(0), 99);
+            String last = values(drain(c, 1, 30000));
+            c.seek(tp(0), 100);
+            int past = c.poll(Duration.ofMillis(1500)).count();
+            OffsetAndTimestamp mid = c.offsetsForTimes(Map.of(tp(0), t0 + 50)).get(tp(0));
+            return "contiguous=" + oneBatch + " first=" + first.offset() + " five=" + five + " last=" + last
+                    + " past_end=" + past + " by_time_mid=" + mid.offset();
+        }
+    }
+
+    static String groupPartitionGrowth() throws Exception {
+        String g = topic + "-g";
+        Properties cp = new Properties();
+        cp.put("metadata.max.age.ms", "1000");
+        BgMember m = new BgMember(g, cp);
+        try (Admin a = admin()) {
+            long deadline = System.currentTimeMillis() + 60000;
+            while (m.owned().isEmpty() && System.currentTimeMillis() < deadline) Thread.sleep(200);
+            int before = m.owned().size();
+            a.createPartitions(Map.of(topic, NewPartitions.increaseTo(3))).all().get();
+            while (m.owned().size() < 3 && System.currentTimeMillis() < deadline) Thread.sleep(200);
+            int after = m.owned().size();
+            produceSpread(9);
+            while (m.received().size() < 9 && System.currentTimeMillis() < deadline) Thread.sleep(200);
+            Thread.sleep(1500);
+            return "before=" + before + " after=" + after + " consumed=" + m.received().size()
+                    + " unique=" + new HashSet<>(m.received()).size();
+        } finally {
+            m.close();
+        }
+    }
+
+    static String groupPattern() throws Exception {
+        String g = topic + "-g";
+        String prefix = topic + "-p";
+        try (Admin a = admin()) {
+            createTopic(a, prefix + "1", 1, Map.of());
+            createTopic(a, prefix + "2", 1, Map.of());
+            Properties cp = new Properties();
+            cp.put("group.id", g);
+            cp.put("metadata.max.age.ms", "1000");
+            try (KafkaConsumer<byte[], byte[]> c = consumer(cp)) {
+                c.subscribe(java.util.regex.Pattern.compile(java.util.regex.Pattern.quote(prefix) + "\\d"));
+                long deadline = System.currentTimeMillis() + 60000;
+                while (c.assignment().size() < 2 && System.currentTimeMillis() < deadline) c.poll(Duration.ofMillis(200));
+                int before = c.assignment().size();
+                createTopic(a, prefix + "3", 1, Map.of());
+                while (c.assignment().size() < 3 && System.currentTimeMillis() < deadline) c.poll(Duration.ofMillis(200));
+                int after = c.assignment().size();
+                try (KafkaProducer<byte[], byte[]> p = producer()) {
+                    for (int i = 1; i <= 3; i++) send(p, prefix + i, 0, "pat" + i);
+                }
+                List<String> got = drain(c, 3, 60000).stream().map(r -> s(r.value())).sorted().collect(Collectors.toList());
+                return "before=" + before + " after=" + after + " read=" + String.join(",", got);
+            }
+        }
+    }
+
+    static String groupListFilters() throws Exception {
+        String stable = topic + "-gs", empty = topic + "-ge";
+        try (KafkaProducer<byte[], byte[]> p = producer()) {
+            send(p, topic, 0, "lf");
+        }
+        Properties ep = new Properties();
+        ep.put("group.id", empty);
+        try (KafkaConsumer<byte[], byte[]> c = consumer(ep)) {
+            c.subscribe(List.of(topic));
+            drain(c, 1, 60000);
+            c.commitSync();
+        }
+        BgMember m = new BgMember(stable, new Properties());
+        try (Admin a = admin()) {
+            long deadline = System.currentTimeMillis() + 60000;
+            while (m.received().isEmpty() && System.currentTimeMillis() < deadline) Thread.sleep(200);
+            Set<String> emptyNow = Set.of();
+            for (int i = 0; i < 40; i++) {
+                emptyNow = a.listGroups(new ListGroupsOptions().inGroupStates(Set.of(GroupState.EMPTY))).all().get()
+                        .stream().map(GroupListing::groupId).collect(Collectors.toSet());
+                if (emptyNow.contains(empty)) break;
+                Thread.sleep(250);
+            }
+            Set<String> stableNow = a.listGroups(new ListGroupsOptions().inGroupStates(Set.of(GroupState.STABLE))).all().get()
+                    .stream().map(GroupListing::groupId).collect(Collectors.toSet());
+            Collection<GroupListing> all = a.listGroups().all().get();
+            GroupListing one = all.stream().filter(x -> x.groupId().equals(stable)).findFirst().get();
+            return "stable_filter=[stable=" + stableNow.contains(stable) + ",empty=" + stableNow.contains(empty)
+                    + "] empty_filter=[stable=" + emptyNow.contains(stable) + ",empty=" + emptyNow.contains(empty)
+                    + "] type=" + one.type().orElse(null) + " state=" + one.groupState().orElse(null);
+        } finally {
+            m.close();
+        }
+    }
+
+    static String txnTimeout() throws Exception {
+        Properties pp = new Properties();
+        pp.put("transactional.id", "java-timeout-" + topic);
+        pp.put("transaction.timeout.ms", "5000");
+        Properties committed = new Properties();
+        committed.put("isolation.level", "read_committed");
+        try (KafkaProducer<byte[], byte[]> t = producer(pp)) {
+            t.initTransactions();
+            t.beginTransaction();
+            send(t, topic, 0, "abandoned");
+            try (KafkaConsumer<byte[], byte[]> c = consumer(committed)) {
+                c.assign(List.of(tp(0)));
+                long held = c.endOffsets(List.of(tp(0))).get(tp(0));
+                long end = held;
+                long deadline = System.currentTimeMillis() + 90000;
+                while (end == held && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(500);
+                    end = c.endOffsets(List.of(tp(0))).get(tp(0));
+                }
+                String commit = attempt(t::commitTransaction);
+                return "held_at=" + held + " released_at=" + end + " commit_after_expiry=" + commit
+                        + " read_committed=[" + state(committed) + "]";
+            }
+        }
+    }
+
+    static String compactedNullKey() throws Exception {
+        String t = topic + "-c";
+        try (Admin a = admin()) {
+            createTopic(a, t, 1, Map.of("cleanup.policy", "compact"));
+            try (KafkaProducer<byte[], byte[]> p = producer()) {
+                String nullKey = "none";
+                try {
+                    send(p, new ProducerRecord<>(t, 0, null, b("v")));
+                } catch (Exception e) {
+                    nullKey = err(e);
+                }
+                long keyed = send(p, new ProducerRecord<>(t, 0, b("k"), b("v"))).offset();
+                long tomb = send(p, new ProducerRecord<>(t, 0, b("k"), (byte[]) null)).offset();
+                return "null_key=" + nullKey + " keyed_offset=" + keyed + " tombstone_offset=" + tomb;
+            }
         }
     }
 

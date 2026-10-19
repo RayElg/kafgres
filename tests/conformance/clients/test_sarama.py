@@ -12,6 +12,8 @@ SCENARIOS = scenarios(
     "txn-consume-transform-produce", "txn-fenced", "group-two-members", "group-resume",
     "group-rebalance-leave", "group-static", "group-admin", "admin-topics", "admin-configs",
     "admin-cluster", "admin-delete-records", "admin-offsets", "metadata", "unknown-topic",
+    "topic-recreate", "topic-limits", "many-partitions", "many-records", "seek-into-batch",
+    "group-partition-growth", "compacted-null-key",
 )
 
 

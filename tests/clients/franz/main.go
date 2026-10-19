@@ -178,7 +178,7 @@ func admin(broker string) (*kadm.Client, func(), error) {
 }
 
 func scenarios() map[string]scenarioFunc {
-	return map[string]scenarioFunc{
+	all := map[string]scenarioFunc{
 		"produce-consume":               produceConsume,
 		"records-shape":                 recordsShape,
 		"compression":                   compression,
@@ -210,7 +210,13 @@ func scenarios() map[string]scenarioFunc {
 		"metadata":                      metadata,
 		"unknown-topic":                 unknownTopic,
 	}
+	for name, fn := range extra {
+		all[name] = fn
+	}
+	return all
 }
+
+func sortStrings(s []string) { sort.Strings(s) }
 
 func produceConsume(broker, topic string) (string, error) {
 	cl, err := newClient(broker)

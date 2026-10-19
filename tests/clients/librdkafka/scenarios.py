@@ -10,7 +10,7 @@ import zlib
 
 from confluent_kafka import (
     OFFSET_BEGINNING, OFFSET_END, Consumer, ConsumerGroupTopicPartitions, KafkaError,
-    KafkaException, Producer, TopicPartition,
+    KafkaException, Producer, TopicCollection, TopicPartition,
 )
 from confluent_kafka.admin import (
     AdminClient, AlterConfigOpType, ConfigEntry, ConfigResource, NewPartitions, NewTopic,
@@ -697,7 +697,7 @@ def admin_topics():
     out.append(f"rf2={ok(r(NewTopic(t + '-r', 1, 2)))}")
     out.append(f"bad_config={ok(r(NewTopic(t + '-c', 1, 1, config={'no.such.config': '1'})))}")
     out.append(f"bad_name={ok(r(NewTopic('bad name!', 1, 1)))}")
-    d = a.describe_topics(__import__("confluent_kafka").TopicCollection([t]))[t].result(timeout=30)
+    d = a.describe_topics(TopicCollection([t]))[t].result(timeout=30)
     pt = d.partitions[0]
     out.append(f"partitions={len(d.partitions)} rf={len(pt.replicas)} isr={len(pt.isr)} "
                f"has_id={d.topic_id is not None}")
@@ -706,7 +706,7 @@ def admin_topics():
     e = cfg["retention.ms"]
     out.append(f"retention.ms={e.value}/{e.source}")
     done(a.create_partitions([NewPartitions(t, 5)]))
-    out.append(f"grown={len(a.describe_topics(__import__('confluent_kafka').TopicCollection([t]))[t].result(30).partitions)}")
+    out.append(f"grown={len(a.describe_topics(TopicCollection([t]))[t].result(30).partitions)}")
     out.append(f"shrink={ok(list(done(a.create_partitions([NewPartitions(t, 2)])).values())[0])}")
     out.append(f"grow_missing={ok(list(done(a.create_partitions([NewPartitions(t + '-nope', 2)])).values())[0])}")
     done(a.delete_topics([t]))
@@ -815,6 +815,170 @@ def unknown_topic():
     return f"partitions={len(t.partitions)} error={t.error.name() if t.error else 'none'}"
 
 
+# ---- limits, scale, lifecycle ---------------------------------------------------
+
+def make_topic(a, name, partitions=1, config=None):
+    res = done(a.create_topics([NewTopic(name, partitions, 1, config=config or {})]))
+    assert res[name] is None, res
+
+
+def topic_recreate():
+    a = admin()
+    p = producer()
+    for i in range(3):
+        produce_ok(p, TOPIC, f"old{i}".encode())
+    before = a.describe_topics(TopicCollection([TOPIC]))[TOPIC].result(30).topic_id
+    done(a.delete_topics([TOPIC]))
+    created = "TOPIC_ALREADY_EXISTS"
+    for _ in range(60):
+        if TOPIC not in a.list_topics(timeout=30).topics or a.list_topics(TOPIC, timeout=30).topics[TOPIC].error:
+            res = done(a.create_topics([NewTopic(TOPIC, 1, 1)]))[TOPIC]
+            created = "ok" if res is None else res
+            if created != "TOPIC_ALREADY_EXISTS":
+                break
+        time.sleep(0.25)
+    after = None
+    for _ in range(40):
+        try:
+            after = a.describe_topics(TopicCollection([TOPIC]))[TOPIC].result(30).topic_id
+            break
+        except Exception:  # noqa: BLE001
+            time.sleep(0.25)
+    p2 = producer()
+    o0 = produce_ok(p2, TOPIC, b"new0").offset()
+    o1 = produce_ok(p2, TOPIC, b"new1").offset()
+    c = consumer()
+    assign_all(c)
+    got = drain(c, 2)
+    lo, hi = c.get_watermark_offsets(TopicPartition(TOPIC, 0), timeout=30)
+    c.close()
+    return (f"recreated={created} new_id={before != after} offsets={o0},{o1} read={vals(got)} "
+            f"begin={lo} end={hi}")
+
+
+def topic_limits():
+    t, a = TOPIC + "-lim", admin()
+    make_topic(a, t, 1, {"max.message.bytes": "2048"})
+    cfg = list(a.describe_configs([ConfigResource(ConfigResource.Type.TOPIC, t)]).values())[0].result(30)
+    e = cfg["max.message.bytes"]
+    p = producer(**{"message.max.bytes": 1_000_000})
+    err, _ = produce_sync(p, t, bytes(4000))
+    small = produce_ok(p, t, bytes(1000)).offset()
+    return f"config={e.value}/{e.source} over_limit={err.name() if err else 'none'} under_limit_offset={small}"
+
+
+def many_partitions():
+    n = 50
+    p = producer()
+    for i in range(n):
+        produce_ok(p, TOPIC, f"mp{i}".encode(), partition=i)
+    a = admin()
+    d = a.describe_topics(TopicCollection([TOPIC]))[TOPIC].result(30)
+    ends = a.list_offsets({TopicPartition(TOPIC, i): OffsetSpec.latest() for i in range(n)})
+    total = sum(f.result(30).offset for f in ends.values())
+    c = consumer()
+    assign_all(c, range(n))
+    seen = {m.partition() for m in drain(c, n, 60000)}
+    c.close()
+    return f"described={len(d.partitions)} end_sum={total} read_partitions={len(seen)}"
+
+
+def many_records():
+    n = 20000
+    p = producer(**{"linger.ms": 20, "batch.size": 65536, "queue.buffering.max.messages": 100000})
+    sent, reports = [], []
+    for i in range(n):
+        v = (f"{i:08d}-" * 10).encode()
+        sent.append(v)
+        p.produce(TOPIC, v, partition=0, on_delivery=lambda e, m: reports.append(e))
+        if i % 5000 == 0:
+            p.poll(0)
+    p.flush(120)
+    assert len(reports) == n and not any(reports)
+    c = consumer()
+    assign_all(c)
+    got = [m.value() for m in drain(c, n, 120000)]
+    c.close()
+    return f"count={len(got)} crc={crc(got)} same={crc(got) == crc(sent)}"
+
+
+def seek_into_batch():
+    t0 = 1_700_000_000_000
+    p = producer(**{"linger.ms": 1000, "batch.size": 1048576})
+    reports = []
+    for i in range(100):
+        p.produce(TOPIC, f"b{i}".encode(), partition=0, timestamp=t0 + i,
+                  on_delivery=lambda e, m: reports.append((e, m.offset())))
+    p.flush(60)
+    contiguous = sorted(o for _, o in reports) == list(range(100))
+    c = consumer()
+    assign_all(c)
+    c.seek(TopicPartition(TOPIC, 0, 37))
+    first = drain(c, 1)[0]
+    c.seek(TopicPartition(TOPIC, 0, 37))
+    five = vals(drain(c, 5)[:5])
+    c.seek(TopicPartition(TOPIC, 0, 99))
+    last = vals(drain(c, 1))
+    c.seek(TopicPartition(TOPIC, 0, 100))
+    past = len(drain(c, 1, 1500))
+    mid = c.offsets_for_times([TopicPartition(TOPIC, 0, t0 + 50)], timeout=30)[0].offset
+    c.close()
+    return (f"contiguous={contiguous} first={first.offset()} five={five} last={last} "
+            f"past_end={past} by_time_mid={mid}")
+
+
+def group_partition_growth():
+    g = f"{TOPIC}-g"
+    m = Member(g, **{"topic.metadata.refresh.interval.ms": 1000})
+    try:
+        deadline = time.time() + 60
+        while not m.owned() and time.time() < deadline:
+            m.poll()
+        before = len(m.owned())
+        a = admin()
+        done(a.create_partitions([NewPartitions(TOPIC, 3)]))
+        while len(m.owned()) < 3 and time.time() < deadline:
+            m.poll()
+        after = len(m.owned())
+        produce_spread(9)
+        return f"before={before} after={after} {consume_all(9, m)}"
+    finally:
+        m.c.close()
+
+
+def group_pattern():
+    g, prefix = f"{TOPIC}-g", f"{TOPIC}-p"
+    a = admin()
+    make_topic(a, prefix + "1")
+    make_topic(a, prefix + "2")
+    c = consumer(**{"group.id": g, "topic.metadata.refresh.interval.ms": 1000})
+    c.subscribe(["^" + prefix.replace(".", "\\.") + "[0-9]$"])  # POSIX ERE: librdkafka has no \d
+    deadline = time.time() + 60
+    while len(c.assignment()) < 2 and time.time() < deadline:
+        c.poll(0.2)
+    before = len(c.assignment())
+    make_topic(a, prefix + "3")
+    while len(c.assignment()) < 3 and time.time() < deadline:
+        c.poll(0.2)
+    after = len(c.assignment())
+    p = producer()
+    for i in range(1, 4):
+        produce_ok(p, prefix + str(i), f"pat{i}".encode())
+    got = sorted(m.value().decode() for m in drain(c, 3, 60000))
+    c.close()
+    return f"before={before} after={after} read={','.join(got)}"
+
+
+def compacted_null_key():
+    t, a = TOPIC + "-c", admin()
+    make_topic(a, t, 1, {"cleanup.policy": "compact"})
+    p = producer()
+    err, _ = produce_sync(p, t, b"v")
+    keyed = produce_ok(p, t, b"v", key=b"k").offset()
+    tomb = produce_ok(p, t, None, key=b"k").offset()
+    return f"null_key={err.name() if err else 'none'} keyed_offset={keyed} tombstone_offset={tomb}"
+
+
 SCENARIOS = {
     "produce-consume": produce_consume,
     "records-shape": records_shape,
@@ -845,6 +1009,14 @@ SCENARIOS = {
     "admin-offsets": admin_offsets,
     "metadata": metadata,
     "unknown-topic": unknown_topic,
+    "topic-recreate": topic_recreate,
+    "topic-limits": topic_limits,
+    "many-partitions": many_partitions,
+    "many-records": many_records,
+    "seek-into-batch": seek_into_batch,
+    "group-partition-growth": group_partition_growth,
+    "group-pattern": group_pattern,
+    "compacted-null-key": compacted_null_key,
 }
 
 

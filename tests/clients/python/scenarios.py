@@ -587,6 +587,144 @@ def admin_offsets(broker, topic):
     print("OK " + " ".join(out))
 
 
+def make_topic(a, name, partitions=1, config=None):
+    a.create_topics([NewTopic(name, partitions, 1, topic_configs=config or {})])
+
+
+def topic_recreate(broker, topic):
+    a = admin(broker)
+    p = producer(broker)
+    for i in range(3):
+        send(p, topic, f"old{i}".encode())
+    p.close()
+    before = a.describe_topics([topic])[0].get("topic_id")
+    a.delete_topics([topic])
+    created = "TopicAlreadyExistsError"
+    for _ in range(60):
+        created = attempt(lambda: make_topic(a, topic))
+        if created != "TopicAlreadyExistsError":
+            break
+        time.sleep(0.25)
+    p2 = producer(broker)
+    o0 = send(p2, topic, b"new0").offset
+    o1 = send(p2, topic, b"new1").offset
+    p2.close()
+    got = read_from(broker, topic, 0, 2)
+    c = consumer(broker)
+    lo = c.beginning_offsets([tp(topic)])[tp(topic)]
+    hi = c.end_offsets([tp(topic)])[tp(topic)]
+    c.close()
+    a.close()
+    print(f"OK recreated={created if created != 'ok' else 'ok'} offsets={o0},{o1} read={vals(got)} begin={lo} end={hi}")
+
+
+def topic_limits(broker, topic):
+    t, a = topic + "-lim", admin(broker)
+    make_topic(a, t, 1, {"max.message.bytes": "2048"})
+    cfg = {e[0]: e[1] for e in a.describe_configs([ConfigResource(ConfigResourceType.TOPIC, t)])[0].resources[0][4]}
+    p = producer(broker)
+    over = "none"
+    try:
+        send(p, t, bytes(4000))
+    except Exception as e:  # noqa: BLE001
+        over = err_name(e)
+    small = send(p, t, bytes(1000)).offset
+    p.close()
+    a.close()
+    print(f"OK config={cfg.get('max.message.bytes')} over_limit={over} under_limit_offset={small}")
+
+
+def many_partitions(broker, topic):
+    n = 50
+    p = producer(broker)
+    for i in range(n):
+        send(p, topic, f"mp{i}".encode(), i)
+    p.close()
+    c = consumer(broker)
+    tps = [tp(topic, i) for i in range(n)]
+    c.assign(tps)
+    seen = {m.partition for m in drain(c, n, 60000)}
+    total = sum(c.end_offsets(tps).values())
+    parts = len(c.partitions_for_topic(topic))
+    c.close()
+    print(f"OK described={parts} end_sum={total} read_partitions={len(seen)}")
+
+
+def many_records(broker, topic):
+    n = 20000
+    p = producer(broker, linger_ms=20, batch_size=65536)
+    sent, futs = [], []
+    for i in range(n):
+        v = (f"{i:08d}-" * 10).encode()
+        sent.append(v)
+        futs.append(p.send(topic, v, partition=0))
+    p.flush()
+    for f in futs:
+        f.get(timeout=60)
+    p.close()
+    got = [m.value for m in read_from(broker, topic, 0, n)]
+    print(f"OK count={len(got)} crc={crc(got)} same={crc(got) == crc(sent)}")
+
+
+def seek_into_batch(broker, topic):
+    t0 = 1_700_000_000_000
+    p = producer(broker, linger_ms=1000, batch_size=1048576)
+    futs = [p.send(topic, f"b{i}".encode(), partition=0, timestamp_ms=t0 + i) for i in range(100)]
+    p.flush()
+    contiguous = [f.get(timeout=30).offset for f in futs] == list(range(100))
+    p.close()
+    c = consumer(broker)
+    c.assign([tp(topic)])
+    c.seek(tp(topic), 37)
+    first = drain(c, 1)[0]
+    c.seek(tp(topic), 37)
+    five = vals(drain(c, 5)[:5])
+    c.seek(tp(topic), 99)
+    last = vals(drain(c, 1))
+    c.seek(tp(topic), 100)
+    past = len(drain(c, 1, 1500))
+    mid = c.offsets_for_times({tp(topic): t0 + 50})[tp(topic)].offset
+    c.close()
+    print(f"OK contiguous={contiguous} first={first.offset} five={five} last={last} "
+          f"past_end={past} by_time_mid={mid}")
+
+
+def group_partition_growth(broker, topic):
+    g = f"{topic}-g"
+    m = Member(broker, topic, g, metadata_max_age_ms=1000)
+    a = admin(broker)
+    try:
+        deadline = time.time() + 60
+        while not m.owned() and time.time() < deadline:
+            time.sleep(0.2)
+        before = len(m.owned())
+        a.create_partitions({topic: NewPartitions(3)})
+        while len(m.owned()) < 3 and time.time() < deadline:
+            time.sleep(0.2)
+        after = len(m.owned())
+        produce_spread(broker, topic, 9)
+        print(f"OK before={before} after={after} {consume_all(9, m)}")
+    finally:
+        m.close()
+        a.close()
+
+
+def compacted_null_key(broker, topic):
+    t, a = topic + "-c", admin(broker)
+    make_topic(a, t, 1, {"cleanup.policy": "compact"})
+    p = producer(broker)
+    null_key = "none"
+    try:
+        send(p, t, b"v")
+    except Exception as e:  # noqa: BLE001
+        null_key = err_name(e)
+    keyed = send(p, t, b"v", key=b"k").offset
+    tomb = send(p, t, None, key=b"k").offset
+    p.close()
+    a.close()
+    print(f"OK null_key={null_key} keyed_offset={keyed} tombstone_offset={tomb}")
+
+
 SCENARIOS = {
     "produce-consume": produce_consume,
     "group-consume": group_consume,
@@ -610,6 +748,13 @@ SCENARIOS = {
     "admin-configs": admin_configs,
     "admin-cluster": admin_cluster,
     "admin-offsets": admin_offsets,
+    "topic-recreate": topic_recreate,
+    "topic-limits": topic_limits,
+    "many-partitions": many_partitions,
+    "many-records": many_records,
+    "seek-into-batch": seek_into_batch,
+    "group-partition-growth": group_partition_growth,
+    "compacted-null-key": compacted_null_key,
 }
 
 def main():

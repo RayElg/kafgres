@@ -42,5 +42,12 @@ func scenarios() map[string]scenarioFunc {
 		"admin-cluster":                 adminCluster,
 		"admin-delete-records":          adminDeleteRecords,
 		"admin-offsets":                 adminOffsets,
+		"topic-recreate":                topicRecreate,
+		"topic-limits":                  topicLimits,
+		"many-partitions":               manyPartitions,
+		"many-records":                  manyRecords,
+		"seek-into-batch":               seekIntoBatch,
+		"group-partition-growth":        groupPartitionGrowth,
+		"compacted-null-key":            compactedNullKey,
 	}
 }
