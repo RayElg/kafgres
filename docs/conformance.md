@@ -14,21 +14,24 @@ docker compose up -d
 docker build -t kafgres-clients tests/clients
 pip install -r requirements.txt
 
-pytest tests/conformance/                       # matrix only; reference diffs skip
+pytest tests/conformance/clients/               # every client, kafgres only
+pytest tests/conformance/clients/test_sarama.py # one client
 
 docker compose --profile conformance up -d kafka
-pytest tests/conformance/                       # matrix + reference diff
+pytest tests/conformance/clients/               # every client, and the reference diff
 ```
 
-Two halves. The **matrix** runs each client's scenarios against kafgres and needs
-nothing but the broker. The **reference diff** runs the identical scenarios against
-`apache/kafka:4.3.1` and compares the observable results. The reference half is
-profile-gated because it needs a second broker, and it skips rather than fails when the
-broker is absent. CI runs both halves.
+Each scenario has two halves. The **matrix** runs it against kafgres alone. The
+**reference diff** runs it against `apache/kafka:4.3.1` (profile-gated) and requires the
+identical result line; it skips when that broker is absent. CI runs both.
+
+CI runs one job per client file and storage engine; `test_kip890.py` and
+`test_api_surface.py` are protocol-level and run in the sharded extension job.
 
 `codec/KAFKA_VERSION` pins the message schemas the codec is generated from. The
 reference image tag is matched to that version manually, in `docker-compose.yml`,
-`demo/parity-demo.sh`, and `tests/conformance/test_clients.py`. An unpinned older
+`demo/parity-demo.sh`, `tests/conformance/harness.py` and `tests/clients/Dockerfile`, which
+compiles the Java runner against the jars of that image. An unpinned older
 broker turns version skew into false deviations: 4.1.0 serves OffsetCommit and
 OffsetFetch only up to v9, so a correct v10 advertisement looks like over-advertising.
 
@@ -41,16 +44,30 @@ comparison.
 
 ## Clients in the matrix
 
-| Client | Where it runs | Why |
-|---|---|---|
-| librdkafka / `kcat` | integration suites throughout | Most widely deployed. |
-| Java (`kafka-*.sh`) | integration suites, plus an API-surface test here | Defines correct behaviour in practice; exercises admin APIs no library touches. |
-| Sarama (Go) | `tests/clients/sarama/` | Independent implementation sharing no code with the other three. It pins its API version, so it breaks when kafgres advertises something it does not implement. |
-| kafka-python | `tests/clients/python/` | Probes and downgrades rather than pinning, so it exercises older API versions. |
+| Client | Runner | Scenarios | Why |
+|---|---|---|---|
+| Java (`kafka-clients`) | `tests/clients/java/` | 32 | Defines correct behaviour in practice. Only client for share groups, the KIP-848 consumer protocol and the producer and transaction admin APIs. |
+| librdkafka (`confluent-kafka`) | `tests/clients/librdkafka/` | 29 | Most widely deployed: `kcat` and the Python, .NET, Node and Rust bindings. The integration suites also use it via `kcat`. |
+| Sarama (Go) | `tests/clients/sarama/` | 28 | Shares no code with the others. Pins its API version, so it breaks on an advertised but unimplemented version; decodes transaction markers unconditionally. |
+| franz-go | `tests/clients/franz/` | 30 | Used by Redpanda Console and much of the Go ecosystem. Speaks the newest version of every API both sides advertise; treats a missing API key as an old broker. |
+| kafka-python | `tests/clients/python/` | 22 | Probes and downgrades rather than pinning, so it exercises older API versions. No transactions or idempotence. |
 
-The Java tooling additionally gets
+The Java tooling (`kafka-*.sh`) is additionally driven by the integration suites, and by
 `test_the_advertised_api_surface_is_a_subset_of_kafkas`, which asserts every advertised
 version range stays inside Kafka's own.
+
+### What the scenarios cover
+
+| Area | Scenarios |
+|---|---|
+| Records | `records-shape` (keys, null and empty values, headers including duplicates and null values, timestamps), `compression` (none, gzip, snappy, lz4, zstd, each round-tripped by checksum), `large-records` (a 900 kB record and 200 batched 10 kB ones, the first-batch-whole fetch rule), `record-too-large` (the error, and that the connection survives it) |
+| Producing | `produce-consume`, `acks` (0, 1, all), `idempotent-produce` (contiguous offsets across pipelined batches), `multi-partition` (explicit partitions, per-partition offsets and watermarks) |
+| Consuming | `seek` (to an offset, to the end, to the start), `long-poll` (an empty fetch is not an error and a record arriving mid-wait ends it), `offset-out-of-range` (each reset policy), `offsets-by-time` |
+| Transactions | `txn-read-committed` (committed, aborted, non-transactional and still-open transactions, as `read_committed` and `read_uncommitted` consumers see them), `txn-consume-transform-produce` (offsets committed with the transaction, and left alone by an abort), `txn-fenced` (a second producer on the same `transactional.id`) |
+| Groups | `group-consume`, `group-two-members`, `group-rebalance-leave`, `group-resume` (committed offsets and their metadata), `group-static` (KIP-345), `group-cooperative` (KIP-429), `group-kip848` (the consumer protocol), `group-admin` (list, describe, offsets, delete) |
+| Share groups | `share-consume` (KIP-932: accept, release and reject, and the delivery count on redelivery) |
+| Admin | `admin-topics` (create with configs, every refusal, describe, grow, shrink, delete), `admin-configs` (defaults, set, delete, refusals), `admin-cluster`, `admin-delete-records`, `admin-offsets`, `admin-producers` (`DescribeProducers`, `ListTransactions`, `DescribeTransactions`, abort), `admin-quotas` |
+| Metadata | `metadata`, `unknown-topic` |
 
 ## Advertised API surface
 
@@ -197,6 +214,22 @@ from, so a reset moves where the next acquire begins.
   must return the first batch whole, so an oversized batch could be produced but never
   fetched, which stalls the partition silently.
 
+## Known gaps
+
+Each is a `KNOWN_GAPS` entry in `tests/conformance/harness.py`, run as an expected
+failure. When the scenario stops differing from Kafka, the run fails until the entry and
+its paragraph here are removed.
+
+- **Static membership (KIP-345) is not enforced.** A member joining with a used
+  `group.instance.id` does not fence the first; Kafka answers the first `FENCED_INSTANCE_ID`.
+  `group-static` (Java, librdkafka, Sarama, franz-go); leave and rejoin matches.
+- **`OffsetCommit` does not validate the member.** Accepted: no member id with generation
+  -1 while the group has members (Kafka: `UNKNOWN_MEMBER_ID`), and a fenced member or stale
+  generation (Kafka: `ILLEGAL_GENERATION`). `group-admin`, Java.
+- **Sarama-produced batches are not searchable by time.** Sarama sends max timestamp -1 in
+  the batch header. Kafka recomputes it on append; kafgres stores header and CRC verbatim,
+  so time lookups miss Sarama's records. `offsets-by-time`, `admin-offsets`, Sarama.
+
 ## Debezium parity
 
 For a consumer written against Debezium, mappings cover most of what it provides. What
@@ -234,16 +267,15 @@ Stated so the suite is not read as broader than it is.
 
 - **Throughput and latency.** Performance is measured separately and is not part of
   this suite.
-- **Compression codecs end to end.** The integration suite asserts record-bytes
-  round-tripping per codec; the conformance scenarios do not vary compression.
 - **TLS and SASL under the matrix.** Covered by
   `tests/integration/security/test_tls.py` and the neighbouring auth and ACL suites,
-  against librdkafka and the Java tooling. The Sarama and kafka-python runners speak
-  PLAINTEXT.
+  against librdkafka and the Java tooling. Every runner in the sweep speaks PLAINTEXT.
 - **Failover.** `tests/integration/replication/test_failover.py`, behind the `failover` profile, needs
   a real physical standby.
 - **Anything a scenario does not do.** The scenario count is a floor, not a ceiling.
   When a client reports a bug, the fix is a new scenario here first.
+- **Clients not in the matrix.** .NET (Confluent.Kafka), Node (KafkaJS) and Rust
+  (`rdkafka`, `kafka-rust`). Confluent.Kafka and `rdkafka` sit on librdkafka.
 
 ## Adding a deviation
 
@@ -251,3 +283,18 @@ If a reference-diff test fails and the difference is intended, it does not get a
 normalizer in the test. It gets an entry above, with the reason. The test asserting
 exact equality is what keeps this document honest; weakening the assertion to make a
 diff go away removes the only mechanism that does that.
+
+## Adding a scenario
+
+A scenario is a runner function that prints one `OK ...` line of observable facts, or
+`ERROR ...`. Use one name across runners and list it in each client's test file.
+
+- Print what a program would decide on: counts, offsets, values, error classes or codes.
+  Never a non-record timestamp, a generated id, or error text.
+- List multi-partition scenarios in `PARTITIONS` in the harness. Name extra topics
+  `{topic}-<suffix>`; the harness removes everything under that prefix, groups included.
+- Wait for conditions, not durations: assignments covering the topic once and staying so;
+  transaction offsets appearing (Kafka writes markers asynchronously).
+- Run the scenario against the reference first. The harness reports one that fails on
+  Kafka as a bad scenario, not a deviation.
+- Turn off topic auto-creation in the runner; the reference has it off.
