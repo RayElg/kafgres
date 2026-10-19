@@ -227,14 +227,19 @@ def test_bad_arguments_are_refused(topic):
         sql("SELECT * FROM kafgres_read('sqlread-no-such-topic')")
 
 
-def set_acls(value):
-    """Set `kafgres.acls_enabled` and wait until a new session sees it."""
+def set_acls(value, topic):
+    """Set `kafgres.acls_enabled` and wait until new sessions and the broker both see it. The
+    broker reloads in its own loop, and anonymous Metadata for `topic` shows which it has."""
     sql(f"ALTER SYSTEM SET kafgres.acls_enabled = {value}")
     sql("SELECT pg_reload_conf()")
     deadline = time.monotonic() + 30
-    while sql("SHOW kafgres.acls_enabled") != value:
+    while True:
+        meta = kcat("-L", "-t", topic, timeout=30)
+        denied = "authorization failed" in (meta.stdout + meta.stderr).lower()
+        if sql("SHOW kafgres.acls_enabled") == value and denied == (value == "on"):
+            return
         assert time.monotonic() < deadline, f"kafgres.acls_enabled never became {value}"
-        time.sleep(0.1)
+        time.sleep(0.2)
 
 
 @pytest.fixture
@@ -243,7 +248,7 @@ def reader_role(topic):
         sql(f"DROP OWNED BY {ROLE}; DROP ROLE {ROLE}")
     sql(f"CREATE ROLE {ROLE}")
     yield topic
-    set_acls("off")
+    set_acls("off", topic)
     sql(f"DELETE FROM kafgres_acls WHERE principal = 'User:{ROLE}'")
     sql(f"DROP OWNED BY {ROLE}; DROP ROLE {ROLE}")
 
@@ -268,7 +273,7 @@ def test_reading_takes_a_grant_and_then_the_acls(reader_role):
     ok, out = as_role(query)
     assert ok and out.endswith("secret"), out
 
-    set_acls("on")
+    set_acls("on", topic)
     ok, out = as_role(query)
     assert not ok and "not allowed to READ" in out, out
 
