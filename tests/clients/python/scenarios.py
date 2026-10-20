@@ -429,10 +429,12 @@ def group_two_members(broker, topic):
 def group_rebalance_leave(broker, topic):
     g = f"{topic}-g"
     a, b = Member(broker, topic, g), Member(broker, topic, g)
+    members = [a, b]
     try:
         settle(3, a, b)
         before = sizes(a, b)
         b.close()
+        members.remove(b)
         deadline = time.time() + 60
         while len(a.owned()) < 3 and time.time() < deadline:
             time.sleep(0.2)
@@ -440,7 +442,8 @@ def group_rebalance_leave(broker, topic):
         produce_spread(broker, topic, 9)
         print(f"OK before={before} after_leave={after} {consume_all(9, a)}")
     finally:
-        a.close()
+        for m in members:
+            m.close()
 
 
 def group_resume(broker, topic):

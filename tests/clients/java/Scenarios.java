@@ -694,16 +694,19 @@ public class Scenarios {
         String g = topic + "-g";
         Member a = new Member(g, new Properties());
         Member b = new Member(g, new Properties());
+        boolean bOpen = true;
         try {
             settle(3, a, b);
             String before = sizes(a, b);
             b.c.close();
+            bOpen = false;
             long deadline = System.currentTimeMillis() + 60000;
             while (a.owned.size() < 3 && System.currentTimeMillis() < deadline) a.poll();
             String after = String.valueOf(a.owned.size());
             produceSpread(9);
             return "before=" + before + " after_leave=" + after + " " + consumeAll(9, a);
         } finally {
+            if (bOpen) b.c.close();
             a.c.close();
         }
     }

@@ -91,6 +91,8 @@ struct Conn {
     awaiting_sync: bool,
     /// A request is parked behind a held table lock; later ones wait (Kafka runs them in order).
     retrying: bool,
+    /// The peer closed: its buffered requests are still served and their responses discarded.
+    peer_closed: bool,
     /// The frame parked to retry, no longer in `reserved`, so counted against budgets here.
     parked_bytes: usize,
 
@@ -110,6 +112,10 @@ impl Conn {
     /// Drain `outbuf` unless a durability barrier holds it; returns false on a fatal write
     /// error. The transport is pumped either way so a TLS handshake keeps moving.
     fn flush_unless_held(&mut self) -> bool {
+        if self.peer_closed {
+            self.outbuf.clear();
+            return true;
+        }
         if self.awaiting_sync {
             return self.stream.pump();
         }
@@ -355,12 +361,13 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         watched.clear();
         // Write interest only for bytes that may actually go out: a connection held
         // behind the durability barrier would otherwise wake the loop every pass while
-        // a failing fsync is retried. Read interest is off while a connection waits for budget.
+        // a failing fsync is retried. Read interest is off while a connection waits for budget,
+        // and once the peer closed: a socket at EOF is always readable.
         watched.extend(srv.conns.iter().map(|(id, c)| {
             (
                 c.stream.raw_fd(),
                 *id,
-                c.muted_since.is_none(),
+                c.muted_since.is_none() && !c.peer_closed,
                 !c.outbuf.is_empty() && !c.awaiting_sync,
             )
         }));
@@ -478,6 +485,7 @@ fn accept_new(listener: &TcpListener, srv: &mut Server) {
                         last_read: Instant::now(),
                         awaiting_sync: false,
                         retrying: false,
+                        peer_closed: false,
                         parked_bytes: 0,
                         outbuf: BytesMut::new(),
                         next_seq: 0,
@@ -547,6 +555,13 @@ fn poll_connections(srv: &mut Server, cfg: &ClusterConfig, ready: Option<&HashSe
             }
         }
 
+        if srv.conns.get(&id).is_some_and(|c| c.peer_closed) {
+            if drain_closed(srv, id, cfg) {
+                closed.push(id);
+            }
+            continue;
+        }
+
         let read_outcome = {
             let conn = match srv.conns.get_mut(&id) {
                 Some(c) => c,
@@ -614,10 +629,12 @@ fn poll_connections(srv: &mut Server, cfg: &ClusterConfig, ready: Option<&HashSe
 
         match read_outcome {
             ReadResult::Closed => {
-                // Kafka serves requests already received from a closing peer; without this an
-                // acks=0 produce sent just before a close is lost.
-                serve_frames(srv, id, cfg);
-                closed.push(id);
+                if let Some(c) = srv.conns.get_mut(&id) {
+                    c.peer_closed = true;
+                }
+                if drain_closed(srv, id, cfg) {
+                    closed.push(id);
+                }
                 continue;
             }
             ReadResult::Fatal(why) => {
@@ -637,6 +654,21 @@ fn poll_connections(srv: &mut Server, cfg: &ClusterConfig, ready: Option<&HashSe
     for id in closed {
         drop_conn(srv, id);
     }
+}
+
+/// Serve a closed peer's buffered requests; true once none is complete or awaiting a retry.
+fn drain_closed(srv: &mut Server, id: i32, cfg: &ClusterConfig) -> bool {
+    if !serve_frames(srv, id, cfg) {
+        return true;
+    }
+    let Some(c) = srv.conns.get(&id) else {
+        return true;
+    };
+    let complete_frame = c.inbuf.len() >= 4 && {
+        let len = i32::from_be_bytes([c.inbuf[0], c.inbuf[1], c.inbuf[2], c.inbuf[3]]);
+        len >= 0 && c.inbuf.len() >= 4 + len as usize
+    };
+    !c.retrying && !complete_frame
 }
 
 /// Remove a connection and every parked fetch that belonged to it: a parked entry outliving its connection would complete into a closed socket — or, connection ids being reused, another peer's socket.
@@ -710,6 +742,10 @@ fn read_available(conn: &mut Conn, cap: usize) -> ReadResult {
         let want = (cap - conn.inbuf.len()).min(READ_CHUNK_BYTES);
         match conn.stream.read(&mut chunk[..want]) {
             Ok(0) => return ReadResult::Closed,
+            // rustls, on a TCP close without close_notify: the plaintext before it is whole.
+            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return ReadResult::Closed
+            }
             Ok(n) => {
                 conn.inbuf.extend_from_slice(&chunk[..n]);
                 conn.last_read = Instant::now();

@@ -293,16 +293,14 @@ pub fn describe_producers(
                 continue;
             };
 
-            // Open transactions only: the producer's first offset in this partition, else the
-            // LSO. The full LSO, since the lock-free variant ignores Kafka-protocol transactions.
-            let lso = store.last_stable_offset(topic_id, p).unwrap_or(-1);
+            // The open transaction's first offset here, or -1 (none open, or nothing written here).
             let states: Vec<ProducerState> = Spi::connect(|client| {
                 let rows = client.select(
                     "SELECT DISTINCT ON (b.producer_id)
                             b.producer_id, b.producer_epoch, b.last_seq,
                             (EXTRACT(epoch FROM b.appended_at) * 1000)::bigint,
-                            (t.producer_id IS NOT NULL),
-                            COALESCE(tp.first_offset, -1)
+                            CASE WHEN t.producer_id IS NOT NULL AND tp.first_offset >= 0
+                                 THEN tp.first_offset ELSE -1 END
                        FROM kafgres_producer_batches b
                        LEFT JOIN kafgres_txns t
                               ON t.producer_id = b.producer_id AND t.state = 'ongoing'
@@ -310,20 +308,18 @@ pub fn describe_producers(
                               ON tp.producer_id = b.producer_id
                              AND tp.topic_id = b.topic_id AND tp.partition = b.partition
                       WHERE b.topic_id = $1::oid AND b.partition = $2
-                        AND (t.producer_id IS NULL OR tp.producer_id IS NOT NULL)
                       ORDER BY b.producer_id, b.added_seq DESC",
                     None,
                     &[(topic_id as i32).into(), p.into()],
                 )?;
                 let mut v = Vec::new();
                 for r in rows {
-                    if let (Some(pid), Some(epoch), Some(last_seq), Some(ts), Some(open), Some(first)) = (
+                    if let (Some(pid), Some(epoch), Some(last_seq), Some(ts), Some(first)) = (
                         r.get::<i64>(1)?,
                         r.get::<i16>(2)?,
                         r.get::<i32>(3)?,
                         r.get::<i64>(4)?,
-                        r.get::<bool>(5)?,
-                        r.get::<i64>(6)?,
+                        r.get::<i64>(5)?,
                     ) {
                         v.push(ProducerState {
                             producer_id: pid,
@@ -332,11 +328,7 @@ pub fn describe_producers(
                             last_timestamp: ts,
                             // Kafka's is the transaction coordinator's epoch; this embedded coordinator has none.
                             coordinator_epoch: -1,
-                            current_txn_start_offset: match (open, first) {
-                                (false, _) => -1,
-                                (true, f) if f >= 0 => f,
-                                (true, _) => lso,
-                            },
+                            current_txn_start_offset: first,
                             ..Default::default()
                         });
                     }

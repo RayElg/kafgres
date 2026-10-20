@@ -534,10 +534,12 @@ def group_two_members():
 def group_rebalance_leave():
     g = f"{TOPIC}-g"
     a, b = Member(g), Member(g)
+    members = [a, b]
     try:
         settle(3, a, b)
         before = sizes(a, b)
         b.c.close()
+        members.remove(b)
         deadline = time.time() + 60
         while len(a.owned()) < 3 and time.time() < deadline:
             a.poll()
@@ -545,7 +547,8 @@ def group_rebalance_leave():
         produce_spread(9)
         return f"before={before} after_leave={after} {consume_all(9, a)}"
     finally:
-        a.c.close()
+        for m in members:
+            m.c.close()
 
 
 def group_resume():

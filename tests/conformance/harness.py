@@ -176,6 +176,10 @@ def drop_prefixed(prefix, reference):
                             REFERENCE, "--delete", "--group", name)
 
 
+class Mismatch(AssertionError):
+    """Both brokers answered OK with different lines: the only failure a known gap covers."""
+
+
 def check_scenario(client, scenario):
     """A `KNOWN_GAPS` scenario xfails while it differs and fails once it matches."""
     gap = KNOWN_GAPS.get((client, scenario.name))
@@ -185,7 +189,7 @@ def check_scenario(client, scenario):
         pytest.skip("a known gap is only meaningful against the reference broker")
     try:
         _check_scenario(client, scenario)
-    except AssertionError:
+    except Mismatch:
         pytest.xfail(gap)
     pytest.fail(f"{client}/{scenario.name} now matches the reference; delete its KNOWN_GAPS "
                 "entry and its paragraph in docs/conformance.md")
@@ -206,12 +210,13 @@ def _check_scenario(client, scenario):
         assert theirs.startswith("OK "), (
             f"{client}/{scenario.name} against the reference broker: {theirs}\n"
             "A scenario that fails on Kafka is a bad scenario, not a deviation.")
-        assert ours == theirs, (
-            f"{client}/{scenario.name} differs from the reference broker.\n"
-            f"  kafgres: {ours}\n"
-            f"  kafka:   {theirs}\n"
-            "If this is intended, record it in docs/conformance.md as an accepted "
-            "deviation with a reason. An uncatalogued diff is a bug.")
+        if ours != theirs:
+            raise Mismatch(
+                f"{client}/{scenario.name} differs from the reference broker.\n"
+                f"  kafgres: {ours}\n"
+                f"  kafka:   {theirs}\n"
+                "If this is intended, record it in docs/conformance.md as an accepted "
+                "deviation with a reason. An uncatalogued diff is a bug.")
     finally:
         drop_prefixed(topic, reference)
 

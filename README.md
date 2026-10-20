@@ -157,6 +157,10 @@ From 0.2.0, the first start on the segment engine removes the log's old-format
 `.timeindex` files. Nothing is lost: timestamp lookups scan the segments written before
 the upgrade instead, and segments written after it are indexed.
 
+Transaction markers written by 0.3.0 and earlier have no value. They are served as stored,
+so a Sarama `read_committed` consumer fails over a range that holds one until retention
+removes it. Other clients do not read the value.
+
 ## CDC without Debezium
 
 A table's changes reach a topic without Kafka Connect, a second JVM, or a network hop.
