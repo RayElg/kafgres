@@ -222,7 +222,7 @@ pub(super) fn dispatch(
         // Classic consumer groups and offsets.
         offset_commit_request::OffsetCommitRequest::API_KEY => {
             c.tx(|r: &offset_commit_request::OffsetCommitRequest, e| {
-                handlers::offsets::offset_commit(r, &e.authz)
+                handlers::offsets::offset_commit(r, e.version, &e.authz)
             })
         }
         offset_fetch_request::OffsetFetchRequest::API_KEY => {
@@ -545,9 +545,10 @@ pub(super) fn dispatch(
 fn serve_produce(c: &mut Ctx) -> Result<Disposition, HandlerError> {
     let request: ProduceRequest = c.decode()?;
     let authz = c.authz();
+    let version = c.req.api_version;
     let outcome = guarded_tx(|| {
         let mut store = crate::storage::open();
-        handlers::produce::handle(&request, &mut *store, &authz)
+        handlers::produce::handle(&request, version, &mut *store, &authz)
     })?;
     // Ring the doorbell before answering: a consumer parked on this partition
     c.srv.appended.extend(outcome.appended.iter().copied());

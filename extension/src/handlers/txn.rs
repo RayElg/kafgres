@@ -114,49 +114,8 @@ pub fn handle_add_partitions(
         .map_or(ErrorCode::None, |v| v.code(version));
 
     if code == ErrorCode::None {
-        // A transaction *begins* here if this producer's row is not already `ongoing`.
-        let beginning: bool = Spi::get_one_with_args::<bool>(
-            "SELECT (SELECT COALESCE(
-                        (SELECT state <> 'ongoing' FROM kafgres_txns WHERE producer_id = $1),
-                        true))",
-            &[producer_id.into()],
-        )
-        .map_err(|e| HandlerError::Internal(e.to_string()))?
-        .unwrap_or(true);
-        if beginning {
-            for table in ["kafgres_txn_partitions", "kafgres_txn_offsets"] {
-                Spi::run_with_args(
-                    &format!("DELETE FROM {table} WHERE producer_id = $1"),
-                    &[producer_id.into()],
-                )
-                .map_err(|e| HandlerError::Internal(e.to_string()))?;
-            }
-        }
-
-        Spi::run_with_args(
-            "INSERT INTO kafgres_txns
-                    (producer_id, producer_epoch, transactional_id, state, started_at)
-             VALUES ($1, $2, $3, 'ongoing', $4)
-             ON CONFLICT (producer_id) DO UPDATE
-                SET producer_epoch = EXCLUDED.producer_epoch,
-                    state = 'ongoing',
-                    -- Only when a transaction actually *begins*. A producer reuses its
-                    -- row, so leaving `started_at` alone means its second transaction
-                    -- inherits the first one's clock and the expiry sweep aborts it while
-                    -- it is live — a working producer failing for no reason it can see.
-                    -- Already 'ongoing' means this is a later `AddPartitionsToTxn` inside
-                    -- the same transaction, which must not extend its deadline either.
-                    started_at = CASE WHEN kafgres_txns.state = 'ongoing'
-                                      THEN kafgres_txns.started_at
-                                      ELSE EXCLUDED.started_at END",
-            &[
-                producer_id.into(),
-                (epoch as i32).into(),
-                txn_id.clone().into(),
-                now_millis().into(),
-            ],
-        )
-        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        begin_or_continue(producer_id, epoch, &txn_id)
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
 
         for topic in &topics {
             let topic_id = crate::meta::topic_id_by_name(&topic.name)
@@ -169,12 +128,8 @@ pub fn handle_add_partitions(
                 if *partition < 0 || *partition >= count {
                     continue;
                 }
-                Spi::run_with_args(
-                    "INSERT INTO kafgres_txn_partitions (producer_id, topic_id, partition)
-                     VALUES ($1, $2::oid, $3) ON CONFLICT DO NOTHING",
-                    &[producer_id.into(), (topic_id as i32).into(), (*partition).into()],
-                )
-                .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                add_partition(producer_id, topic_id, *partition)
+                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
             }
         }
     }
@@ -203,6 +158,136 @@ pub fn handle_add_partitions(
         results_by_transaction: Vec::new(),
         ..Default::default()
     })
+}
+
+/// Mark the transaction ongoing at `epoch`; a new one clears the previous one's rows.
+fn begin_or_continue(producer_id: i64, epoch: i16, txn_id: &str) -> Result<(), pgrx::spi::Error> {
+    let beginning: bool = Spi::get_one_with_args::<bool>(
+        "SELECT (SELECT COALESCE(
+                    (SELECT state <> 'ongoing' FROM kafgres_txns WHERE producer_id = $1),
+                    true))",
+        &[producer_id.into()],
+    )?
+    .unwrap_or(true);
+    if beginning {
+        for table in ["kafgres_txn_partitions", "kafgres_txn_offsets"] {
+            Spi::run_with_args(
+                &format!("DELETE FROM {table} WHERE producer_id = $1"),
+                &[producer_id.into()],
+            )?;
+        }
+    }
+
+    Spi::run_with_args(
+        "INSERT INTO kafgres_txns
+                (producer_id, producer_epoch, transactional_id, state, started_at)
+         VALUES ($1, $2, $3, 'ongoing', $4)
+         ON CONFLICT (producer_id) DO UPDATE
+            SET producer_epoch = EXCLUDED.producer_epoch,
+                state = 'ongoing',
+                -- Only when a transaction actually *begins*. A producer reuses its
+                -- row, so leaving `started_at` alone means its second transaction
+                -- inherits the first one's clock and the expiry sweep aborts it while
+                -- it is live — a working producer failing for no reason it can see.
+                -- Already 'ongoing' means this is a later `AddPartitionsToTxn` inside
+                -- the same transaction, which must not extend its deadline either.
+                started_at = CASE WHEN kafgres_txns.state = 'ongoing'
+                                  THEN kafgres_txns.started_at
+                                  ELSE EXCLUDED.started_at END",
+        &[
+            producer_id.into(),
+            (epoch as i32).into(),
+            txn_id.into(),
+            now_millis().into(),
+        ],
+    )
+}
+
+fn add_partition(producer_id: i64, topic_id: u32, partition: i32) -> Result<(), pgrx::spi::Error> {
+    Spi::run_with_args(
+        "INSERT INTO kafgres_txn_partitions (producer_id, topic_id, partition)
+         VALUES ($1, $2::oid, $3) ON CONFLICT DO NOTHING",
+        &[producer_id.into(), (topic_id as i32).into(), partition.into()],
+    )
+}
+
+/// A transactional batch checked against its transaction before append (KIP-890).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProduceTxn {
+    Added,
+    /// Produce v12+: the append adds the partition and begins the transaction if needed.
+    AddsPartition,
+    Refused(ErrorCode),
+}
+
+const PRODUCE_ADDS_PARTITION_FROM: i16 = 12;
+const PRODUCE_ABORTABLE_FROM: i16 = 11;
+
+/// Codes as apache/kafka 4.3.1 answers them: an unmapped producer is
+/// INVALID_PRODUCER_ID_MAPPING, any other epoch INVALID_PRODUCER_EPOCH, and a partition
+/// not added INVALID_TXN_STATE (TRANSACTION_ABORTABLE at v11).
+pub fn verify_produce(
+    transactional_id: Option<&str>,
+    producer_id: i64,
+    epoch: i16,
+    topic_id: u32,
+    partition: i32,
+    version: i16,
+) -> Result<ProduceTxn, pgrx::spi::Error> {
+    let Some(txn_id) = transactional_id else {
+        return Ok(ProduceTxn::Refused(ErrorCode::TransactionalIdAuthorizationFailed));
+    };
+    let row: Option<String> = crate::plan::get_one(
+        "SELECT (SELECT p.producer_epoch || '|' || (p.transactional_id = $2)::text || '|'
+                        || COALESCE(t.state = 'ongoing' AND t.producer_epoch = $3
+                                    AND EXISTS (SELECT 1 FROM kafgres_txn_partitions tp
+                                                 WHERE tp.producer_id = p.producer_id
+                                                   AND tp.topic_id = $4::oid
+                                                   AND tp.partition = $5), false)::text
+                   FROM kafgres_producers p
+                   LEFT JOIN kafgres_txns t ON t.producer_id = p.producer_id
+                  WHERE p.producer_id = $1)",
+        &[
+            producer_id.into(),
+            txn_id.into(),
+            (epoch as i32).into(),
+            (topic_id as i32).into(),
+            partition.into(),
+        ],
+    )?;
+    // A NULL transactional id (a plain idempotent producer) concatenates to NULL.
+    let Some(row) = row else {
+        return Ok(ProduceTxn::Refused(ErrorCode::InvalidProducerIdMapping));
+    };
+    let mut it = row.split('|');
+    let current: Option<i32> = it.next().and_then(|x| x.parse().ok());
+    let mapped = it.next() == Some("true");
+    let added = it.next() == Some("true");
+    Ok(if !mapped {
+        ProduceTxn::Refused(ErrorCode::InvalidProducerIdMapping)
+    } else if current != Some(epoch as i32) {
+        ProduceTxn::Refused(ErrorCode::InvalidProducerEpoch)
+    } else if added {
+        ProduceTxn::Added
+    } else if version >= PRODUCE_ADDS_PARTITION_FROM {
+        ProduceTxn::AddsPartition
+    } else if version >= PRODUCE_ABORTABLE_FROM {
+        ProduceTxn::Refused(ErrorCode::TransactionAbortable)
+    } else {
+        ProduceTxn::Refused(ErrorCode::InvalidTxnState)
+    })
+}
+
+/// A produce v12+ append's `AddPartitionsToTxn`, once `verify_produce` said `AddsPartition`.
+pub fn add_partition_from_produce(
+    producer_id: i64,
+    epoch: i16,
+    transactional_id: &str,
+    topic_id: u32,
+    partition: i32,
+) -> Result<(), pgrx::spi::Error> {
+    begin_or_continue(producer_id, epoch, transactional_id)?;
+    add_partition(producer_id, topic_id, partition)
 }
 
 /// Commit or abort: write a marker to every partition the transaction touched. Markers
@@ -632,57 +717,82 @@ pub fn handle_txn_offset_commit(
         .map_err(|e| HandlerError::Internal(e.to_string()))?;
     }
 
-    if code == ErrorCode::None {
-        for topic in &req.topics {
-            let Some(topic_id) = crate::meta::topic_id_by_name(&topic.name)
-                .map_err(|e| HandlerError::Internal(e.to_string()))?
-            else {
-                continue;
+    // KIP-447: the v3+ member fields fence a zombie consumer; before v3 they default to none.
+    let group = if code == ErrorCode::None {
+        let committer = super::offsets::Committer {
+            group_id: &req.group_id,
+            generation: req.generation_id,
+            member_id: &req.member_id,
+            instance_id: req.group_instance_id.as_deref(),
+        };
+        Some(
+            super::offsets::validate_commit(&committer, true, version)
+                .map_err(|e| HandlerError::Internal(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+
+    let mut topics = Vec::with_capacity(req.topics.len());
+    for topic in &req.topics {
+        let topic_id = crate::meta::topic_id_by_name(&topic.name)
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        let count = match topic_id {
+            Some(id) => crate::meta::partition_count(id)
+                .map_err(|e| HandlerError::Internal(e.to_string()))?,
+            None => 0,
+        };
+        let mut partitions = Vec::with_capacity(topic.partitions.len());
+        for part in &topic.partitions {
+            let index = part.partition_index;
+            let part_code = match (topic_id, &group) {
+                // An empty transactional id is refused before any topic lookup.
+                _ if code == ErrorCode::InvalidRequest => code,
+                (None, _) => ErrorCode::UnknownTopicOrPartition,
+                _ if index < 0 || index >= count => ErrorCode::UnknownTopicOrPartition,
+                (Some(id), Some(g)) if code == ErrorCode::None => g.code_for(id, index),
+                _ => code,
             };
-            for part in &topic.partitions {
-                Spi::run_with_args(
-                    "INSERT INTO kafgres_txn_offsets
-                            (producer_id, group_id, topic_id, partition, committed_offset,
-                             committed_leader_epoch, metadata)
-                     VALUES ($1, $2, $3::oid, $4, $5, $6, $7)
-                     ON CONFLICT (producer_id, group_id, topic_id, partition) DO UPDATE SET
-                        committed_offset = EXCLUDED.committed_offset,
-                        committed_leader_epoch = EXCLUDED.committed_leader_epoch,
-                        metadata = EXCLUDED.metadata",
-                    &[
-                        req.producer_id.into(),
-                        req.group_id.clone().into(),
-                        (topic_id as i32).into(),
-                        part.partition_index.into(),
-                        part.committed_offset.into(),
-                        part.committed_leader_epoch.into(),
-                        part.committed_metadata.clone().into(),
-                    ],
-                )
-                .map_err(|e| HandlerError::Internal(e.to_string()))?;
+            partitions.push(TxnOffsetCommitResponsePartition {
+                partition_index: index,
+                error_code: part_code.code(),
+                ..Default::default()
+            });
+            if part_code != ErrorCode::None {
+                continue;
             }
+            let Some(topic_id) = topic_id else { continue };
+            Spi::run_with_args(
+                "INSERT INTO kafgres_txn_offsets
+                        (producer_id, group_id, topic_id, partition, committed_offset,
+                         committed_leader_epoch, metadata)
+                 VALUES ($1, $2, $3::oid, $4, $5, $6, $7)
+                 ON CONFLICT (producer_id, group_id, topic_id, partition) DO UPDATE SET
+                    committed_offset = EXCLUDED.committed_offset,
+                    committed_leader_epoch = EXCLUDED.committed_leader_epoch,
+                    metadata = EXCLUDED.metadata",
+                &[
+                    req.producer_id.into(),
+                    req.group_id.clone().into(),
+                    (topic_id as i32).into(),
+                    index.into(),
+                    part.committed_offset.into(),
+                    part.committed_leader_epoch.into(),
+                    part.committed_metadata.clone().into(),
+                ],
+            )
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
         }
+        topics.push(TxnOffsetCommitResponseTopic {
+            name: topic.name.clone(),
+            partitions,
+            ..Default::default()
+        });
     }
 
     Ok(TxnOffsetCommitResponse {
         throttle_time_ms: 0,
-        topics: req
-            .topics
-            .iter()
-            .map(|t| TxnOffsetCommitResponseTopic {
-                name: t.name.clone(),
-                partitions: t
-                    .partitions
-                    .iter()
-                    .map(|p| TxnOffsetCommitResponsePartition {
-                        partition_index: p.partition_index,
-                        error_code: code.code(),
-                        ..Default::default()
-                    })
-                    .collect(),
-                ..Default::default()
-            })
-            .collect(),
+        topics,
         ..Default::default()
     })
 }
