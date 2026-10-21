@@ -1,5 +1,5 @@
 use kafgres_codec::errors::ErrorCode;
-use kafgres_codec::generated::offset_commit_request::OffsetCommitRequest;
+use kafgres_codec::generated::offset_commit_request::{OffsetCommitRequest, OffsetCommitRequestPartition};
 use kafgres_codec::generated::offset_commit_response::{
     OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
 };
@@ -13,9 +13,12 @@ use kafgres_codec::generated::offset_fetch_response::{
     OffsetFetchResponsePartitions, OffsetFetchResponseTopic, OffsetFetchResponseTopics,
 };
 use kafgres_codec::Uuid;
+use std::collections::HashSet;
+
 use pgrx::prelude::*;
 
 use super::HandlerError;
+use crate::group::GroupState;
 use crate::meta;
 
 const OFFSET_FETCH_BATCHED_FROM: i16 = 8;
@@ -28,8 +31,168 @@ const MAX_METADATA_BYTES: usize = 4096;
 
 const MAX_OFFSET_PARTITIONS: usize = 4096;
 
+pub struct Committer<'a> {
+    pub group_id: &'a str,
+    pub generation: i32,
+    pub member_id: &'a str,
+    pub instance_id: Option<&'a str>,
+}
+
+pub enum GroupVerdict {
+    Accept,
+    Refuse(ErrorCode),
+    /// A KIP-848 member behind its current epoch may still commit what it holds (KIP-1251).
+    HeldOnly(HashSet<(u32, i32)>),
+}
+
+impl GroupVerdict {
+    pub fn code_for(&self, topic_id: u32, partition: i32) -> ErrorCode {
+        match self {
+            GroupVerdict::Accept => ErrorCode::None,
+            GroupVerdict::Refuse(code) => *code,
+            GroupVerdict::HeldOnly(held) if held.contains(&(topic_id, partition)) => ErrorCode::None,
+            GroupVerdict::HeldOnly(_) => ErrorCode::StaleMemberEpoch,
+        }
+    }
+}
+
+/// From v9 a missing group is GROUP_ID_NOT_FOUND, and KIP-848 members may commit.
+const OFFSET_COMMIT_GROUP_AWARE_FROM: i16 = 9;
+
+/// Kafka's `validateOffsetCommit` for each group type: refuses an evicted member's commit.
+pub fn validate_commit(
+    c: &Committer<'_>,
+    transactional: bool,
+    version: i16,
+) -> Result<GroupVerdict, spi::Error> {
+    let kind: String = Spi::get_one_with_args(
+        "SELECT CASE
+                  WHEN EXISTS (SELECT 1 FROM kafgres_share_groups WHERE group_id = $1) THEN 'share'
+                  WHEN EXISTS (SELECT 1 FROM kafgres_consumer_groups WHERE group_id = $1) THEN 'consumer'
+                  WHEN EXISTS (SELECT 1 FROM kafgres_groups WHERE group_id = $1) THEN 'classic'
+                  WHEN EXISTS (SELECT 1 FROM kafgres_offsets WHERE group_id = $1) THEN 'simple'
+                  ELSE 'none' END",
+        &[c.group_id.into()],
+    )?
+    .unwrap_or_default();
+    let refuse = |code| -> Result<GroupVerdict, spi::Error> { Ok(GroupVerdict::Refuse(code)) };
+    match kind.as_str() {
+        "share" => refuse(ErrorCode::GroupIdNotFound),
+        "consumer" => validate_consumer_group(c, transactional, version),
+        "classic" => {
+            let Some(g) = crate::group::load(c.group_id)? else {
+                return refuse(ErrorCode::UnknownMemberId);
+            };
+            let members = crate::group::members(c.group_id)?;
+            let verdict = validate_classic(c, transactional, g.state, g.generation, &members);
+            let live = matches!(g.state, GroupState::Stable | GroupState::PreparingRebalance);
+            if !transactional && live && matches!(verdict, GroupVerdict::Accept) {
+                // Kafka's commit keeps a classic member's session alive in these states.
+                crate::group::touch_heartbeat(c.group_id, c.member_id)?;
+            }
+            Ok(verdict)
+        }
+        // Offsets with no group row: the simple group Kafka would hold, empty.
+        "simple" => Ok(validate_classic(c, transactional, GroupState::Empty, 0, &[])),
+        // No group row is created: it would refuse a later KIP-848 consumer under this id.
+        _ if c.generation < 0 => Ok(GroupVerdict::Accept),
+        _ if !transactional && version >= OFFSET_COMMIT_GROUP_AWARE_FROM => {
+            refuse(ErrorCode::GroupIdNotFound)
+        }
+        _ => refuse(ErrorCode::IllegalGeneration),
+    }
+}
+
+fn validate_classic(
+    c: &Committer<'_>,
+    transactional: bool,
+    state: GroupState,
+    generation: i32,
+    members: &[crate::group::Member],
+) -> GroupVerdict {
+    use GroupVerdict::{Accept, Refuse};
+    if c.generation < 0 && state == GroupState::Empty {
+        return Accept;
+    }
+    if c.generation >= 0 || !c.member_id.is_empty() || c.instance_id.is_some() {
+        if let Some(instance) = c.instance_id {
+            match members.iter().find(|m| m.group_instance_id.as_deref() == Some(instance)) {
+                None => return Refuse(ErrorCode::UnknownMemberId),
+                Some(m) if m.member_id != c.member_id => {
+                    return Refuse(ErrorCode::FencedInstanceId)
+                }
+                Some(_) => {}
+            }
+        }
+        if !members.iter().any(|m| m.member_id == c.member_id) {
+            return Refuse(ErrorCode::UnknownMemberId);
+        }
+        if c.generation != generation {
+            return Refuse(ErrorCode::IllegalGeneration);
+        }
+    } else if !transactional && state != GroupState::Empty {
+        return Refuse(ErrorCode::UnknownMemberId);
+    }
+    if !transactional && state == GroupState::CompletingRebalance {
+        return Refuse(ErrorCode::RebalanceInProgress);
+    }
+    Accept
+}
+
+fn validate_consumer_group(
+    c: &Committer<'_>,
+    transactional: bool,
+    version: i16,
+) -> Result<GroupVerdict, spi::Error> {
+    let members: i64 = Spi::get_one_with_args(
+        "SELECT count(*) FROM kafgres_consumer_group_members WHERE group_id = $1",
+        &[c.group_id.into()],
+    )?
+    .unwrap_or(0);
+    if c.generation < 0 && members == 0 {
+        return Ok(GroupVerdict::Accept);
+    }
+    if transactional && c.generation == -1 && c.member_id.is_empty() && c.instance_id.is_none() {
+        return Ok(GroupVerdict::Accept);
+    }
+    let row = Spi::connect(|client| {
+        let rows = client.select(
+            "SELECT member_epoch, owned || granted
+               FROM kafgres_consumer_group_members WHERE group_id = $1 AND member_id = $2",
+            Some(1),
+            &[c.group_id.into(), c.member_id.into()],
+        )?;
+        for row in rows {
+            let epoch = row.get::<i32>(1)?.unwrap_or(0);
+            let held = row.get::<Vec<String>>(2)?.unwrap_or_default();
+            return Ok::<_, spi::Error>(Some((epoch, held)));
+        }
+        Ok(None)
+    })?;
+    let Some((epoch, held)) = row else {
+        return Ok(GroupVerdict::Refuse(ErrorCode::UnknownMemberId));
+    };
+    if !transactional && version < OFFSET_COMMIT_GROUP_AWARE_FROM {
+        return Ok(GroupVerdict::Refuse(ErrorCode::UnsupportedVersion));
+    }
+    Ok(match c.generation.cmp(&epoch) {
+        std::cmp::Ordering::Equal => GroupVerdict::Accept,
+        std::cmp::Ordering::Greater => GroupVerdict::Refuse(ErrorCode::StaleMemberEpoch),
+        // Kafka also checks the partition's assignment epoch, which is not stored here.
+        std::cmp::Ordering::Less => GroupVerdict::HeldOnly(
+            held.iter()
+                .filter_map(|s| {
+                    let (t, p) = s.split_once(':')?;
+                    Some((t.parse().ok()?, p.parse().ok()?))
+                })
+                .collect(),
+        ),
+    })
+}
+
 pub fn offset_commit(
     req: &OffsetCommitRequest,
+    version: i16,
     authz: &crate::acl::Authz,
 ) -> Result<OffsetCommitResponse, HandlerError> {
     let group_denied = authz.check(crate::acl::Operation::Read, crate::acl::ResourceType::Group, &req.group_id).err();
@@ -49,6 +212,14 @@ pub fn offset_commit(
     }
 
     let mut topics = Vec::with_capacity(req.topics.len());
+    let committer = Committer {
+        group_id: &req.group_id,
+        generation: req.generation_id_or_member_epoch,
+        member_id: &req.member_id,
+        instance_id: req.group_instance_id.as_deref(),
+    };
+    // Only asked once a partition passes the topic checks, as in Kafka.
+    let mut verdict: Option<GroupVerdict> = None;
 
     for t in &req.topics {
         let denied = group_denied.or_else(|| {
@@ -61,6 +232,10 @@ pub fn offset_commit(
                 .err()
         });
         let resolved = meta::resolve_topic(&t.name, &t.topic_id.0)?;
+        let count = match &resolved {
+            Some(r) => meta::partition_count(r.topic_id)?,
+            None => 0,
+        };
         let mut partitions = Vec::with_capacity(t.partitions.len());
 
         for p in &t.partitions {
@@ -80,25 +255,24 @@ pub fn offset_commit(
 
             let code = match &resolved {
                 None => ErrorCode::UnknownTopicOrPartition,
-                Some(_) if oversized => ErrorCode::OffsetMetadataTooLarge,
+                Some(_) if p.partition_index < 0 || p.partition_index >= count => {
+                    ErrorCode::UnknownTopicOrPartition
+                }
                 Some(r) => {
-                    match commit_one(
-                        &req.group_id,
-                        r.topic_id,
-                        p.partition_index,
-                        p.committed_offset,
-                        p.committed_leader_epoch,
-                        p.committed_metadata.as_deref(),
-                    ) {
-                        Ok(()) => ErrorCode::None,
-                        Err(e) => {
-                            pgrx::log!(
-                                "kafgres: offset commit failed for {}-{}: {e}",
-                                t.name,
-                                p.partition_index
-                            );
-                            ErrorCode::UnknownServerError
-                        }
+                    let v = match &verdict {
+                        Some(v) => v,
+                        None => verdict.insert(validate_commit(&committer, false, version)?),
+                    };
+                    // Kafka's order: the group, then the metadata size, then the held partition.
+                    match v {
+                        GroupVerdict::Refuse(code) => *code,
+                        _ if oversized => ErrorCode::OffsetMetadataTooLarge,
+                        v => match v.code_for(r.topic_id, p.partition_index) {
+                            ErrorCode::None => {
+                                commit_and_report(&req.group_id, &t.name, r.topic_id, p)
+                            }
+                            code => code,
+                        },
                     }
                 }
             };
@@ -125,6 +299,31 @@ pub fn offset_commit(
         topics,
         unknown_tagged_fields: Vec::new(),
     })
+}
+
+fn commit_and_report(
+    group_id: &str,
+    topic: &str,
+    topic_id: u32,
+    p: &OffsetCommitRequestPartition,
+) -> ErrorCode {
+    match commit_one(
+        group_id,
+        topic_id,
+        p.partition_index,
+        p.committed_offset,
+        p.committed_leader_epoch,
+        p.committed_metadata.as_deref(),
+    ) {
+        Ok(()) => ErrorCode::None,
+        Err(e) => {
+            pgrx::log!(
+                "kafgres: offset commit failed for {topic}-{}: {e}",
+                p.partition_index
+            );
+            ErrorCode::UnknownServerError
+        }
+    }
 }
 
 fn commit_one(

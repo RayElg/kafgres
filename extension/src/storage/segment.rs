@@ -2839,47 +2839,69 @@ mod tests {
         );
     }
 
-    /// A transaction-V2 producer never sends AddPartitionsToTxn, so the first transactional
-    /// append is what begins the transaction. `register_txn_partition` is that append's bookkeeping.
+    /// Only a produce v12+ append at the current epoch may begin a transaction.
     #[pg_test]
-    fn pg_a_transactional_append_begins_the_transaction() {
+    fn pg_only_a_verified_append_joins_a_transaction() {
+        use crate::handlers::txn::{add_partition_from_produce, verify_produce, ProduceTxn};
+        use kafgres_codec::errors::ErrorCode;
+
         crate::ensure_tables_exist();
         let created = crate::meta::create_topic("txn-register", 1, &[])
             .expect("topic creation failed");
         let topic = created.topic_id;
+        let id = Some("pg-register");
 
-        Spi::run_with_args(
+        Spi::run(
             "INSERT INTO kafgres_producers (producer_id, producer_epoch, transactional_id)
-             VALUES (424242, 0, 'pg-register')",
-            &[],
+             VALUES (424242, 1, 'pg-register')",
         )
         .expect("producer insert failed");
-        Spi::run_with_args(
+        Spi::run(
             "INSERT INTO kafgres_txns
                     (producer_id, producer_epoch, transactional_id, state, started_at)
-             VALUES (424242, 0, 'pg-register', 'empty', 1)",
-            &[],
+             VALUES (424242, 1, 'pg-register', 'empty', 1)",
         )
         .expect("txn insert failed");
+        let state = || -> String {
+            Spi::get_one("SELECT (SELECT state FROM kafgres_txns WHERE producer_id = 424242)")
+                .expect("state query failed")
+                .expect("txn row missing")
+        };
+        let verify = |epoch: i16, version: i16| {
+            verify_produce(id, 424242, epoch, topic, 0, version).expect("verify failed")
+        };
 
-        crate::storage::pmeta::register_txn_partition(424242, 0, topic, 0, 7)
+        for version in [3, 10, 11, 12] {
+            assert_eq!(verify(0, version), ProduceTxn::Refused(ErrorCode::InvalidProducerEpoch));
+        }
+        assert_eq!(verify(2, 12), ProduceTxn::Refused(ErrorCode::InvalidProducerEpoch));
+        assert_eq!(
+            verify_produce(Some("other-id"), 424242, 1, topic, 0, 12).expect("verify failed"),
+            ProduceTxn::Refused(ErrorCode::InvalidProducerIdMapping)
+        );
+        assert_eq!(
+            verify_produce(id, 434343, 1, topic, 0, 12).expect("verify failed"),
+            ProduceTxn::Refused(ErrorCode::InvalidProducerIdMapping)
+        );
+        assert_eq!(
+            verify_produce(None, 424242, 1, topic, 0, 12).expect("verify failed"),
+            ProduceTxn::Refused(ErrorCode::TransactionalIdAuthorizationFailed)
+        );
+
+        assert_eq!(verify(1, 10), ProduceTxn::Refused(ErrorCode::InvalidTxnState));
+        assert_eq!(verify(1, 11), ProduceTxn::Refused(ErrorCode::TransactionAbortable));
+        assert_eq!(verify(1, 12), ProduceTxn::AddsPartition);
+        assert_eq!(state(), "empty", "verification alone must not begin a transaction");
+
+        add_partition_from_produce(424242, 1, "pg-register", topic, 0).expect("add failed");
+        crate::storage::pmeta::register_txn_partition(424242, topic, 0, 7)
             .expect("register failed");
-        let state: String = Spi::get_one(
-            "SELECT (SELECT state FROM kafgres_txns WHERE producer_id = 424242)",
-        )
-        .expect("state query failed")
-        .expect("txn row missing");
-        assert_eq!(state, "ongoing", "the append must begin an empty transaction");
-        let first: i64 = Spi::get_one(
-            "SELECT (SELECT first_offset FROM kafgres_txn_partitions
-                      WHERE producer_id = 424242)",
-        )
-        .expect("first offset query failed")
-        .expect("partition row missing");
-        assert_eq!(first, 7);
+        assert_eq!(state(), "ongoing", "the v12 append begins the transaction");
+        assert_eq!(verify(1, 3), ProduceTxn::Added);
+        assert_eq!(verify(0, 3), ProduceTxn::Refused(ErrorCode::InvalidProducerEpoch));
 
         // A later batch in the same transaction keeps the first batch's offset.
-        crate::storage::pmeta::register_txn_partition(424242, 0, topic, 0, 9)
+        crate::storage::pmeta::register_txn_partition(424242, topic, 0, 9)
             .expect("second register failed");
         let first: i64 = Spi::get_one(
             "SELECT (SELECT first_offset FROM kafgres_txn_partitions
@@ -2889,18 +2911,15 @@ mod tests {
         .expect("partition row missing");
         assert_eq!(first, 7);
 
-        // The next transaction, after the previous one finished, begins fresh: the finished
-        // transaction's partition rows must not feed this one's marker write or LSO.
+        // A finished transaction's partitions no longer count as added.
         Spi::run("UPDATE kafgres_txns SET state = 'committed' WHERE producer_id = 424242")
             .expect("state update failed");
-        crate::storage::pmeta::register_txn_partition(424242, 1, topic, 0, 11)
+        assert_eq!(verify(1, 10), ProduceTxn::Refused(ErrorCode::InvalidTxnState));
+        assert_eq!(verify(1, 12), ProduceTxn::AddsPartition);
+        add_partition_from_produce(424242, 1, "pg-register", topic, 0).expect("add failed");
+        crate::storage::pmeta::register_txn_partition(424242, topic, 0, 11)
             .expect("third register failed");
-        let state: String = Spi::get_one(
-            "SELECT (SELECT state FROM kafgres_txns WHERE producer_id = 424242)",
-        )
-        .expect("state query failed")
-        .expect("txn row missing");
-        assert_eq!(state, "ongoing");
+        assert_eq!(state(), "ongoing");
         let first: i64 = Spi::get_one(
             "SELECT (SELECT first_offset FROM kafgres_txn_partitions
                       WHERE producer_id = 424242)",

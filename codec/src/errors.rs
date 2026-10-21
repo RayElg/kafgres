@@ -119,6 +119,7 @@ pub enum ErrorCode {
     OffsetNotAvailable = 78,
     MemberIdRequired = 79,
     GroupMaxSizeReached = 81,
+    FencedInstanceId = 82,
     /// The preferred replica is already the leader, so there is nothing to elect.
     ElectionNotNeeded = 84,
     /// Cancel of a reassignment that was not in flight: replication is Postgres's here, so
@@ -146,6 +147,8 @@ pub enum ErrorCode {
     UnreleasedInstanceId = 111,
     UnsupportedAssignor = 112,
     StaleMemberEpoch = 113,
+    /// Produce v11's answer for a partition not in the transaction.
+    TransactionAbortable = 120,
     InvalidRecordState = 121,
     ShareSessionNotFound = 122,
     InvalidShareSessionEpoch = 123,

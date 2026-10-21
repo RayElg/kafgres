@@ -142,6 +142,9 @@ from, so a reset moves where the next acquire begins.
   than RE2J: ordinary patterns, and leading options such as `(?i)`, behave the same; one
   Postgres cannot compile, such as
   `\p{L}+`, is refused with `INVALID_REGULAR_EXPRESSION` rather than matching nothing.
+  A commit at an older member epoch (KIP-1251) is accepted for any partition the member
+  still holds or has been granted. Kafka also refuses it when the epoch is older than the
+  epoch that partition was assigned at, and kafgres does not store that epoch.
 - **`ListOffsets` serves the full 1 to 11.** v7's `MAX_TIMESTAMP` (KIP-734) returns the
   offset of the record with the greatest timestamp, decoded from the winning batch rather
   than taken from its base offset; the two differ when a producer stamps timestamps out

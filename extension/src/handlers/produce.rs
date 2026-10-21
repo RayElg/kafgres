@@ -10,6 +10,7 @@ use kafgres_codec::generated::produce_response::{
 
 use kafgres_codec::records::{BatchIter, RecordBatch};
 
+use super::txn::ProduceTxn;
 use super::HandlerError;
 use crate::meta;
 use crate::producer::{self, SequenceCheck, NO_PRODUCER_ID, NO_SEQUENCE};
@@ -58,6 +59,8 @@ enum AppendError {
     Aborted,
     /// A resend of a batch whose window row never learned its offset.
     DuplicateUnknownOffset,
+    /// Refused by transaction verification (KIP-890).
+    Txn(ErrorCode),
 }
 
 impl AppendError {
@@ -74,6 +77,7 @@ impl AppendError {
             AppendError::NullKeyOnCompacted => ErrorCode::InvalidRecord,
             // Kafka's answer for a duplicate it cannot place; clients treat it as success.
             AppendError::DuplicateUnknownOffset => ErrorCode::DuplicateSequenceNumber,
+            AppendError::Txn(code) => *code,
         }
     }
 }
@@ -109,6 +113,7 @@ impl std::fmt::Display for AppendError {
             AppendError::DuplicateUnknownOffset => {
                 write!(f, "duplicate of a batch whose offset was never recorded")
             }
+            AppendError::Txn(code) => write!(f, "transaction verification failed: {code:?}"),
         }
     }
 }
@@ -147,6 +152,7 @@ impl From<HandlerError> for Abandon {
 /// Produce in one savepoint for the whole request; on a partition failure, roll back and
 pub fn handle(
     req: &ProduceRequest,
+    version: i16,
     store: &mut dyn LogStore,
     authz: &crate::acl::Authz,
 ) -> Result<ProduceOutcome, HandlerError> {
@@ -168,14 +174,14 @@ pub fn handle(
     LANDED.with(|l| *l.borrow_mut() = segment.then(HashMap::new));
 
     let attempt = crate::dbtx::atomically(
-        || build(req, store, authz, Isolation::Shared),
+        || build(req, version, store, authz, Isolation::Shared),
         |_| Abandon::PartitionFailed,
     );
 
     match attempt {
         Ok(outcome) => Ok(outcome),
         Err(Abandon::Fatal(e)) => Err(e),
-        Err(Abandon::PartitionFailed) => build(req, store, authz, Isolation::PerPartition).map_err(|e| {
+        Err(Abandon::PartitionFailed) => build(req, version, store, authz, Isolation::PerPartition).map_err(|e| {
             match e {
                 Abandon::Fatal(e) => e,
                 Abandon::PartitionFailed => {
@@ -215,6 +221,8 @@ struct Idem {
     first_seq: i32,
     last_seq: i32,
     transactional: bool,
+    /// Produce v12+: this append adds its partition to the transaction.
+    adds_partition: bool,
 }
 
 /// What to do with one batch, decided before anything is written.
@@ -258,6 +266,7 @@ struct Pending {
 /// landed in `LANDED` and records it rather than appending it again.
 fn build(
     req: &ProduceRequest,
+    version: i16,
     store: &mut dyn LogStore,
     authz: &crate::acl::Authz,
     isolation: Isolation,
@@ -330,7 +339,11 @@ fn build(
             }
 
             // Phase 1: a partition that fails here never reaches the store.
-            match plan_partition(tid, pd.index, pd.records.as_ref()) {
+            let txn = TxnCtx {
+                transactional_id: req.transactional_id.as_deref(),
+                version,
+            };
+            match plan_partition(tid, pd.index, pd.records.as_ref(), txn) {
                 Ok(plan) => {
                     // Phase 3 fills this in.
                     partitions.push(PartitionProduceResponse::default());
@@ -372,7 +385,7 @@ fn build(
         Isolation::Shared => {
             // Phase 2 for every partition before phase 3 for any.
             for p in &pending {
-                if let Err(e) = reserve_partition(&p.plan) {
+                if let Err(e) = reserve_partition(&p.plan, req.transactional_id.as_deref()) {
                     pgrx::log!("kafgres: produce reservation failed, retrying per partition: {e}");
                     return Err(Abandon::PartitionFailed);
                 }
@@ -390,7 +403,7 @@ fn build(
                 let attempt = |store: &mut dyn LogStore| {
                     crate::dbtx::atomically(
                         || {
-                            reserve_partition(&p.plan)?;
+                            reserve_partition(&p.plan, req.transactional_id.as_deref())?;
                             Ok(write_partition(store, &p.plan, at))
                         },
                         |_| AppendError::Aborted,
@@ -467,12 +480,19 @@ fn finish(
     topics[p.topic].partition_responses[p.slot] = response;
 }
 
+#[derive(Clone, Copy)]
+struct TxnCtx<'a> {
+    transactional_id: Option<&'a str>,
+    version: i16,
+}
+
 /// Phase 1: decode every batch and decide it against the producer's window. Nothing is
 /// written here.
 fn plan_partition(
     tid: u32,
     index: i32,
     records: Option<&kafgres_codec::bytes::Bytes>,
+    txn: TxnCtx<'_>,
 ) -> Result<PartitionPlan, AppendError> {
     let mut batches: Vec<(RecordBatch, Decision)> = Vec::new();
     let Some(records) = records.filter(|r| !r.is_empty()) else {
@@ -491,13 +511,31 @@ fn plan_partition(
             batches.push((view, Decision::Plain));
             continue;
         }
+        let transactional = view.is_transactional() && !view.is_control();
+        // Before the window check, which lets any epoch through an empty window.
+        let adds_partition = transactional
+            && match crate::handlers::txn::verify_produce(
+                txn.transactional_id,
+                producer_id,
+                view.producer_epoch(),
+                tid,
+                index,
+                txn.version,
+            )
+            .map_err(|e| AppendError::ProducerState(e.to_string()))?
+            {
+                ProduceTxn::Added => false,
+                ProduceTxn::AddsPartition => true,
+                ProduceTxn::Refused(code) => return Err(AppendError::Txn(code)),
+            };
         let idem = Idem {
             producer_id,
             epoch: view.producer_epoch(),
             first_seq,
             // Not `first_seq + delta`: the client's sequence counter wraps through zero at int32.
             last_seq: producer::increment_sequence(first_seq, view.last_offset_delta()),
-            transactional: view.is_transactional() && !view.is_control(),
+            transactional,
+            adds_partition,
         };
 
         // A batch earlier in this request is not in the window yet; the batch after it is
@@ -582,16 +620,26 @@ fn decide_after(
 }
 
 /// Phase 2: the window rows and the transaction registration, offsets still unknown.
-fn reserve_partition(plan: &PartitionPlan) -> Result<(), AppendError> {
+fn reserve_partition(
+    plan: &PartitionPlan,
+    transactional_id: Option<&str>,
+) -> Result<(), AppendError> {
     for (_, decision) in &plan.batches {
         let Decision::Append(idem) = decision else { continue };
         producer::record(
             idem.producer_id, idem.epoch, plan.tid, plan.index, idem.first_seq, idem.last_seq, -1,
         )
         .map_err(|e| AppendError::ProducerState(e.to_string()))?;
+        if idem.adds_partition {
+            let txn_id = transactional_id.unwrap_or_default();
+            crate::handlers::txn::add_partition_from_produce(
+                idem.producer_id, idem.epoch, txn_id, plan.tid, plan.index,
+            )
+            .map_err(|e| AppendError::ProducerState(e.to_string()))?;
+        }
         if idem.transactional {
             crate::storage::pmeta::register_txn_partition(
-                idem.producer_id, idem.epoch, plan.tid, plan.index, -1,
+                idem.producer_id, plan.tid, plan.index, -1,
             )
             .map_err(|e| AppendError::ProducerState(e.to_string()))?;
         }
