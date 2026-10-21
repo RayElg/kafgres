@@ -6,7 +6,7 @@ use kafgres_codec::generated::list_offsets_response::{
 
 use super::HandlerError;
 use crate::meta;
-use crate::storage::LogStore;
+use crate::storage::{LogStore, StoreResult};
 
 /// Matches the Fetch and OffsetCommit per-consumer data-path limit.
 const MAX_LIST_OFFSETS_PARTITIONS: usize = 4096;
@@ -78,7 +78,7 @@ pub fn handle(
             }
             partitions.push(match topic_id {
                 None => err_partition(p.partition_index, ErrorCode::UnknownTopicOrPartition),
-                Some(tid) => resolve(store, tid, p.partition_index, p.timestamp),
+                Some(tid) => resolve(store, tid, p.partition_index, p.timestamp, req.isolation_level == 1),
             });
         }
 
@@ -101,39 +101,25 @@ fn resolve(
     topic: u32,
     partition: i32,
     timestamp: i64,
+    read_committed: bool,
 ) -> ListOffsetsPartitionResponse {
     let epoch = store.leader_epoch(topic, partition).unwrap_or(-1);
 
-    // MAX_TIMESTAMP is the only sentinel that reports a real timestamp back.
-    if timestamp == TIMESTAMP_MAX {
-        return match store.max_timestamp_offset(topic, partition) {
-            Ok(Some((offset, ts))) => ListOffsetsPartitionResponse {
-                partition_index: partition,
-                error_code: ErrorCode::None.code(),
-                timestamp: ts,
-                offset,
-                leader_epoch: epoch,
-                ..Default::default()
-            },
-            // An empty log answers offset -1 with no error, matching Kafka.
-            Ok(None) => ListOffsetsPartitionResponse {
-                partition_index: partition,
-                error_code: ErrorCode::None.code(),
-                timestamp: -1,
-                offset: OFFSET_NOT_FOUND,
-                leader_epoch: epoch,
-                ..Default::default()
-            },
-            Err(e) => {
-                pgrx::log!("kafgres: list_offsets max_timestamp {topic}-{partition}: {e}");
-                err_partition(partition, e.error_code())
-            }
-        };
-    }
-
     // (offset, timestamp): a lookup by time answers with the record's own timestamp.
     let result = match timestamp {
+        // The only sentinel that reports a real timestamp back. An empty log answers -1.
+        TIMESTAMP_MAX => committed_only(
+            store,
+            topic,
+            partition,
+            read_committed,
+            store.max_timestamp_offset(topic, partition),
+        ),
         TIMESTAMP_EARLIEST => store.log_start_offset(topic, partition).map(|o| Some((o, -1))),
+        // A read_committed consumer cannot read past an open transaction, so its end is the LSO.
+        TIMESTAMP_LATEST if read_committed => {
+            store.last_stable_offset(topic, partition).map(|o| Some((o, -1)))
+        }
         TIMESTAMP_LATEST => store.high_watermark(topic, partition).map(|o| Some((o, -1))),
         // No remote tier, so the local log is the whole log: this is the log start.
         TIMESTAMP_EARLIEST_LOCAL => {
@@ -145,7 +131,13 @@ fn resolve(
             pgrx::log!("kafgres: list_offsets: unsupported timestamp sentinel {ts}");
             return err_partition(partition, ErrorCode::UnsupportedVersion);
         }
-        ts => store.offset_for_timestamp(topic, partition, ts),
+        ts => committed_only(
+            store,
+            topic,
+            partition,
+            read_committed,
+            store.offset_for_timestamp(topic, partition, ts),
+        ),
     };
 
     match result {
@@ -162,6 +154,23 @@ fn resolve(
             err_partition(partition, e.error_code())
         }
     }
+}
+
+/// Under read_committed Kafka answers a lookup that lands at or past the LSO with no offset.
+fn committed_only(
+    store: &dyn LogStore,
+    topic: u32,
+    partition: i32,
+    read_committed: bool,
+    found: StoreResult<Option<(i64, i64)>>,
+) -> StoreResult<Option<(i64, i64)>> {
+    let Some((offset, ts)) = found? else {
+        return Ok(None);
+    };
+    if read_committed && offset >= store.last_stable_offset(topic, partition)? {
+        return Ok(None);
+    }
+    Ok(Some((offset, ts)))
 }
 
 fn err_partition(index: i32, code: ErrorCode) -> ListOffsetsPartitionResponse {

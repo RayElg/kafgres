@@ -224,6 +224,13 @@ pub fn lock_for_read() -> Result<(), pgrx::spi::Error> {
     crate::dbtx::lock_tables("kafgres_log, kafgres_log_segments")
 }
 
+/// The read_committed ceiling: the oldest open Kafka transaction's start, capped at the HWM.
+fn stable_bound(topic: TopicId, partition: i32, high_watermark: i64) -> StoreResult<i64> {
+    Ok(pmeta::kafka_txn_lso(topic, partition)?
+        .filter(|o| *o >= 0)
+        .map_or(high_watermark, |o| o.min(high_watermark)))
+}
+
 fn spi_err(e: impl std::fmt::Display) -> StoreError {
     StoreError::Io(e.to_string())
 }
@@ -395,9 +402,7 @@ impl LogStore for TableStore {
     ) -> StoreResult<FetchSlice> {
         let high_watermark = self.high_watermark(topic, partition)?;
         let log_start = self.log_start_offset(topic, partition)?;
-        let lso = pmeta::kafka_txn_lso(topic, partition)?
-            .filter(|o| *o >= 0)
-            .map_or(high_watermark, |o| o.min(high_watermark));
+        let lso = stable_bound(topic, partition, high_watermark)?;
         let ceiling = match isolation {
             IsolationLevel::ReadCommitted => lso,
             IsolationLevel::ReadUncommitted => high_watermark,
@@ -524,6 +529,11 @@ impl LogStore for TableStore {
         )
         .map_err(spi_err)?
         .ok_or(StoreError::UnknownTopicOrPartition)
+    }
+
+    /// The start of the oldest open Kafka transaction, else the high watermark.
+    fn last_stable_offset(&self, topic: TopicId, partition: i32) -> StoreResult<i64> {
+        stable_bound(topic, partition, self.high_watermark(topic, partition)?)
     }
 
     fn last_stable_offset_if_tracked(

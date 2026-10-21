@@ -708,6 +708,15 @@ fn set_role_password(name: &str, verifier: Option<&str>) -> Result<(), String> {
 
 const ENFORCED_QUOTAS: [&str; 2] = ["producer_byte_rate", "consumer_byte_rate"];
 
+/// Every quota key Kafka defines for user and client-id entities; the ones outside
+/// `ENFORCED_QUOTAS` are refused as unenforced.
+const KAFKA_QUOTAS: [&str; 4] = [
+    "producer_byte_rate",
+    "consumer_byte_rate",
+    "request_percentage",
+    "controller_mutation_rate",
+];
+
 /// `49 AlterClientQuotas` — stores quotas in `kafgres_client_quotas`, which `quota.rs`
 pub fn alter_client_quotas(
     req: &AlterClientQuotasRequest,
@@ -772,6 +781,13 @@ fn apply_quota_entry(
         ));
     }
     for op in &e.ops {
+        // Kafka answers an undefined key INVALID_REQUEST, not INVALID_CONFIG.
+        if !KAFKA_QUOTAS.contains(&op.key.as_str()) {
+            return Err((
+                ErrorCode::InvalidRequest,
+                format!("{:?} is not a quota Kafka defines", op.key),
+            ));
+        }
         if !ENFORCED_QUOTAS.contains(&op.key.as_str()) {
             return Err((
                 ErrorCode::InvalidConfig,

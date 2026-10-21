@@ -36,34 +36,12 @@ func main() {
 	}
 	broker, scenario, topic := os.Args[1], os.Args[2], os.Args[3]
 
-	var err error
-	switch scenario {
-	case "produce-consume":
-		err = produceConsume(broker, topic)
-	case "group-consume":
-		err = groupConsume(broker, topic)
-	case "metadata":
-		err = metadata(broker, topic)
-	case "txn-commit":
-		err = transaction(broker, topic, true)
-	case "txn-abort":
-		err = transaction(broker, topic, false)
-	case "txn-abort-big":
-		err = transactionBig(broker, topic)
-	case "txn-open":
-		err = transactionHeldOpen(broker, topic)
-	case "txn-second":
-		err = transactionThenOpenAnother(broker, topic)
-	case "txn-offsets-commit":
-		err = transactionWithOffsets(broker, topic, true)
-	case "txn-offsets-abort":
-		err = transactionWithOffsets(broker, topic, false)
-	case "unknown-topic":
-		err = unknownTopic(broker)
-	default:
+	run, ok := scenarios()[scenario]
+	if !ok {
 		fmt.Printf("ERROR unknown scenario %s\n", scenario)
 		os.Exit(2)
 	}
+	err := run(broker, topic)
 	if err != nil {
 		fmt.Printf("ERROR %v\n", err)
 		os.Exit(1)
@@ -172,13 +150,13 @@ func metadata(broker, topic string) error {
 	return nil
 }
 
-func unknownTopic(broker string) error {
+func unknownTopic(broker, topic string) error {
 	client, err := sarama.NewClient([]string{broker}, config())
 	if err != nil {
 		return fmt.Errorf("client: %w", err)
 	}
 	defer client.Close()
-	_, err = client.Partitions("definitely-no-such-topic-conformance")
+	_, err = client.Partitions(topic + "-missing")
 	if err == nil {
 		return fmt.Errorf("expected an error for an unknown topic")
 	}
