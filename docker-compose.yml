@@ -93,8 +93,10 @@ services:
       KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
       # Scenarios backdate records to 2023, which the 7-day retention deletes on its next
-      # check, even from the active segment. A broker setting, so no scenario sees it.
+      # check, even from the active segment. A broker setting, so no scenario sees it. The
+      # first check runs after the initial task delay (30s), not the interval.
       KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 86400000
+      KAFKA_LOG_INITIAL_TASK_DELAY_MS: 86400000
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       # Auto-creation off, to match kafgres: a scenario that silently creates its topic
       # on one broker and errors on the other is not a comparison of anything.
