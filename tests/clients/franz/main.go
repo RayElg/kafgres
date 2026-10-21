@@ -1275,8 +1275,11 @@ func groupAdmin(broker, topic string) (string, error) {
 	for len(m.received()) < 6 && time.Now().Before(deadline) {
 		time.Sleep(200 * time.Millisecond)
 	}
-	time.Sleep(6 * time.Second) // autocommit
 	adm := kadm.NewClient(p)
+	// Until the auto-commit covers all six records.
+	for committedOffset(adm, g, topic) != "6" && time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+	}
 	ctx, cancel := ctxFor(30 * time.Second)
 	defer cancel()
 	var out []string

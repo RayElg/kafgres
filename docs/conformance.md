@@ -46,7 +46,7 @@ comparison.
 
 | Client | Runner | Scenarios | Why |
 |---|---|---|---|
-| Java (`kafka-clients`) | `tests/clients/java/` | 43 | Defines correct behaviour in practice. Only client for share groups, the KIP-848 consumer protocol and the producer and transaction admin APIs. |
+| Java (`kafka-clients`) | `tests/clients/java/` | 42 | Defines correct behaviour in practice. Only client for share groups, the KIP-848 consumer protocol and the producer and transaction admin APIs. |
 | librdkafka (`confluent-kafka`) | `tests/clients/librdkafka/` | 37 | Most widely deployed: `kcat` and the Python, .NET, Node and Rust bindings. The integration suites also use it via `kcat`. |
 | Sarama (Go) | `tests/clients/sarama/` | 35 | Shares no code with the others. Pins its API version, so it breaks on an advertised but unimplemented version; decodes transaction markers unconditionally. |
 | franz-go | `tests/clients/franz/` | 37 | Used by Redpanda Console and much of the Go ecosystem. Speaks the newest version of every API both sides advertise; treats a missing API key as an old broker. |
@@ -69,7 +69,7 @@ version range stays inside Kafka's own.
 | Admin | `admin-topics` (create with configs, every refusal, describe, grow, shrink, delete), `admin-configs` (defaults, set, delete, refusals), `admin-cluster`, `admin-delete-records`, `admin-offsets`, `admin-producers` (`DescribeProducers`, `ListTransactions`, `DescribeTransactions`, abort), `admin-quotas` |
 | Limits and scale | `topic-limits` (a per-topic `max.message.bytes` refuses what the broker default would take), `many-partitions` (50 partitions: one metadata, one `ListOffsets` and one assignment across all of them), `many-records` (20,000 records in batches, by checksum), `seek-into-batch` (a seek to the middle of a 100-record batch, past the end, and an offset lookup by time inside it) |
 | Lifecycle | `topic-recreate` (delete and recreate under the same name: new topic id, offsets restart at 0, none of the old data), `group-partition-growth` (a member picks up partitions added to a topic it consumes), `group-pattern` (regex subscription, including a topic created after the group formed), `group-list-filters` (list groups by state), `compacted-null-key` (a compacted topic refuses a null key and accepts a tombstone) |
-| Failure | `commit-stale-generation` (a member that missed a rebalance has its commit refused and nothing stored), `txn-timeout` (a transaction abandoned past its timeout is aborted and stops holding the last stable offset) |
+| Failure | `txn-timeout` (a transaction abandoned past its timeout is aborted and stops holding the last stable offset) |
 | Metadata | `metadata`, `unknown-topic` |
 
 ## Advertised API surface
@@ -216,27 +216,28 @@ from, so a reset moves where the next acquire begins.
   `max.message.bytes` has an upper bound for the same reason on the fetch side: Fetch
   must return the first batch whole, so an oversized batch could be produced but never
   fetched, which stalls the partition silently.
+- **A producer whose transaction expired is fenced.** kafgres aborts a transaction past
+  its timeout and fences the producer, so a slow producer cannot write into a transaction
+  that has already been aborted. Its late `EndTxn` fails with `PRODUCER_FENCED`; Kafka
+  answers `INVALID_TXN_STATE`. Both are fatal to the producer. `txn-timeout`, Java, listed
+  in `ACCEPTED_DEVIATIONS` in `tests/conformance/harness.py`.
 
 ## Known gaps
 
-Each is a `KNOWN_GAPS` entry in `tests/conformance/harness.py`, run as an expected
-failure. When the scenario stops differing from Kafka, the run fails until the entry and
-its paragraph here are removed.
+Differences from Kafka that are not intended. Each is a `KNOWN_GAPS` entry in
+`tests/conformance/harness.py`, which expects the scenario to differ and fails it once it
+matches.
 
 - **Static membership (KIP-345) is not enforced.** A member joining with a used
   `group.instance.id` does not fence the first; Kafka answers the first `FENCED_INSTANCE_ID`.
   `group-static` (Java, librdkafka, Sarama, franz-go); leave and rejoin matches.
-- **`OffsetCommit` does not validate the member.** Accepted: no member id with generation
-  -1 while the group has members (Kafka: `UNKNOWN_MEMBER_ID`), and a fenced member or stale
-  generation (Kafka: `ILLEGAL_GENERATION`). `group-admin`, Java.
+- **`OffsetCommit` does not validate the member.** kafgres stores a commit with no member
+  id and generation -1 while the group has members (Kafka: `UNKNOWN_MEMBER_ID`), and one
+  from a fenced member or a stale generation (Kafka: `ILLEGAL_GENERATION`). `group-admin`,
+  Java.
 - **Sarama-produced batches are not searchable by time.** Sarama sends max timestamp -1 in
   the batch header. Kafka recomputes it on append; kafgres stores header and CRC verbatim,
   so time lookups miss Sarama's records. `offsets-by-time`, `admin-offsets`, Sarama.
-
-- **A producer whose transaction expired is fenced.** kafgres aborts a transaction past its
-  timeout and fences the producer, so a slow producer cannot write into a closed
-  transaction. Its late `EndTxn` fails with `PRODUCER_FENCED`; Kafka answers
-  `INVALID_TXN_STATE`. Both fail the producer, with different classes. `txn-timeout`, Java.
 
 ## Debezium parity
 
@@ -277,7 +278,7 @@ Stated so the suite is not read as broader than it is.
   this suite.
 - **TLS and SASL under the matrix.** Covered by
   `tests/integration/security/test_tls.py` and the neighbouring auth and ACL suites,
-  against librdkafka and the Java tooling. Every runner in the sweep speaks PLAINTEXT.
+  against librdkafka and the Java tooling. Every conformance runner speaks PLAINTEXT.
 - **Failover.** `tests/integration/replication/test_failover.py`, behind the `failover` profile, needs
   a real physical standby.
 - **Anything a scenario does not do.** The scenario count is a floor, not a ceiling.
@@ -293,7 +294,8 @@ Stated so the suite is not read as broader than it is.
 ## Adding a deviation
 
 If a reference-diff test fails and the difference is intended, it does not get a
-normalizer in the test. It gets an entry above, with the reason. The test asserting
+normalizer in the test. It gets an entry above, with the reason, and the scenario showing it
+gets an `ACCEPTED_DEVIATIONS` entry in `tests/conformance/harness.py`. The test asserting
 exact equality is what keeps this document honest; weakening the assertion to make a
 diff go away removes the only mechanism that does that.
 

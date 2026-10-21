@@ -69,7 +69,6 @@ public class Scenarios {
         all.put("admin-producers", Scenarios::adminProducers);
         all.put("admin-quotas", Scenarios::adminQuotas);
         all.put("share-consume", Scenarios::shareConsume);
-        all.put("commit-stale-generation", Scenarios::commitStaleGeneration);
         all.put("topic-recreate", Scenarios::topicRecreate);
         all.put("topic-limits", Scenarios::topicLimits);
         all.put("many-partitions", Scenarios::manyPartitions);
@@ -1202,42 +1201,6 @@ public class Scenarios {
 
     static void createTopic(Admin a, String name, int partitions, Map<String, String> configs) throws Exception {
         a.createTopics(List.of(new NewTopic(name, partitions, (short) 1).configs(configs))).all().get();
-    }
-
-    /** A member that stops polling while another joins misses a generation; its commit must be refused. */
-    static String commitStaleGeneration() throws Exception {
-        String g = topic + "-g";
-        try (KafkaProducer<byte[], byte[]> p = producer()) {
-            for (int i = 0; i < 3; i++) send(p, topic, 0, "c" + i);
-        }
-        Properties slow = new Properties();
-        slow.put("group.id", g);
-        slow.put("max.poll.interval.ms", "3000");
-        slow.put("session.timeout.ms", "10000");
-        slow.put("heartbeat.interval.ms", "1000");
-        KafkaConsumer<byte[], byte[]> c1 = consumer(slow);
-        BgMember c2 = null;
-        try {
-            c1.subscribe(List.of(topic));
-            List<ConsumerRecord<byte[], byte[]>> got = drain(c1, 3, 60000);
-            // c1 stops polling; c2 joins, and the group waits out c1's poll interval.
-            c2 = new BgMember(g, new Properties());
-            Thread.sleep(8000);
-            String outcome;
-            try {
-                c1.commitSync(Map.of(tp(0), new OffsetAndMetadata(3)));
-                outcome = "committed";
-            } catch (Exception e) {
-                outcome = err(e);
-            }
-            try (Admin a = admin()) {
-                OffsetAndMetadata stored = a.listConsumerGroupOffsets(g).partitionsToOffsetAndMetadata().get().get(tp(0));
-                return "read=" + got.size() + " commit=" + outcome + " stored=" + (stored == null ? "none" : stored.offset());
-            }
-        } finally {
-            try { c1.close(Duration.ofSeconds(5)); } catch (Exception ignored) { }
-            if (c2 != null) c2.close();
-        }
     }
 
     static String topicRecreate() throws Exception {

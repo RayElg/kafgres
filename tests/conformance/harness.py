@@ -75,12 +75,16 @@ KNOWN_GAPS = {
         "Sarama's producer sends a batch header with max timestamp -1 and Kafka recomputes it "
         "on append; kafgres stores the header and CRC verbatim, so time lookups miss Sarama data"
     ),
-    ("java", "txn-timeout"): (
-        "an expired transaction fences its producer, deliberately, so a slow producer cannot "
-        "write on; the producer's late commit then fails with PRODUCER_FENCED where Kafka "
-        "answers INVALID_TXN_STATE"
-    ),
     ("sarama", "admin-offsets"): "the same batch-header max timestamp as sarama/offsets-by-time",
+}
+
+# Intended differences a scenario shows, strict like `KNOWN_GAPS`. Written up in
+# docs/conformance.md under "Behavioural differences".
+ACCEPTED_DEVIATIONS = {
+    ("java", "txn-timeout"): (
+        "an expired transaction fences its producer, so its late commit fails with "
+        "PRODUCER_FENCED where Kafka answers INVALID_TXN_STATE"
+    ),
 }
 
 
@@ -177,22 +181,29 @@ def drop_prefixed(prefix, reference):
 
 
 class Mismatch(AssertionError):
-    """Both brokers answered OK with different lines: the only failure a known gap covers."""
+    """Both brokers answered OK with different lines: the only failure an expected difference
+    covers."""
 
 
 def check_scenario(client, scenario):
-    """A `KNOWN_GAPS` scenario xfails while it differs and fails once it matches."""
-    gap = KNOWN_GAPS.get((client, scenario.name))
-    if gap is None:
+    """A `KNOWN_GAPS` or `ACCEPTED_DEVIATIONS` scenario xfails while it differs and fails
+    once it matches."""
+    key = (client, scenario.name)
+    if key in KNOWN_GAPS:
+        expected, table, section = KNOWN_GAPS[key], "KNOWN_GAPS", "Known gaps"
+    elif key in ACCEPTED_DEVIATIONS:
+        expected, table = ACCEPTED_DEVIATIONS[key], "ACCEPTED_DEVIATIONS"
+        section = "Behavioural differences"
+    else:
         return _check_scenario(client, scenario)
     if not has_reference():
-        pytest.skip("a known gap is only meaningful against the reference broker")
+        pytest.skip("an expected difference is only meaningful against the reference broker")
     try:
         _check_scenario(client, scenario)
     except Mismatch:
-        pytest.xfail(gap)
-    pytest.fail(f"{client}/{scenario.name} now matches the reference; delete its KNOWN_GAPS "
-                "entry and its paragraph in docs/conformance.md")
+        pytest.xfail(expected)
+    pytest.fail(f"{client}/{scenario.name} now matches the reference; delete its {table} "
+                f"entry and its paragraph under \"{section}\" in docs/conformance.md")
 
 
 def _check_scenario(client, scenario):

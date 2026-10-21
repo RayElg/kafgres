@@ -157,10 +157,6 @@ From 0.2.0, the first start on the segment engine removes the log's old-format
 `.timeindex` files. Nothing is lost: timestamp lookups scan the segments written before
 the upgrade instead, and segments written after it are indexed.
 
-Transaction markers written by 0.3.0 and earlier have no value. They are served as stored,
-so a Sarama `read_committed` consumer fails over a range that holds one until retention
-removes it. Other clients do not read the value.
-
 ## CDC without Debezium
 
 A table's changes reach a topic without Kafka Connect, a second JVM, or a network hop.
@@ -267,9 +263,8 @@ and the ELR columns, which the tool renders as `N/A` against kafgres because it 
 back to `Metadata`. Anything else that differs is treated as a bug, and the script shows
 it rather than absorbing it.
 
-The demo is a summary; `tests/conformance/` is the gate. It runs the five clients through
-about 180 scenarios and replays KIP-890 transaction frames against both brokers in
-eighteen more tests, in CI on every pull request.
+The demo is a summary; `tests/conformance/` is the gate, with the five clients run through
+about 180 scenarios against both brokers in CI on every pull request.
 
 ## Documentation
 

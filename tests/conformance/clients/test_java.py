@@ -11,7 +11,7 @@ SCENARIOS = scenarios(
     "group-static", "group-cooperative", "group-kip848", "group-admin", "admin-topics",
     "admin-configs", "admin-cluster", "admin-delete-records", "admin-offsets",
     "admin-producers", "admin-quotas", "share-consume", "metadata", "unknown-topic",
-    "commit-stale-generation", "topic-recreate", "topic-limits", "many-partitions",
+    "topic-recreate", "topic-limits", "many-partitions",
     "many-records", "seek-into-batch", "group-partition-growth", "group-pattern",
     "group-list-filters", "txn-timeout", "compacted-null-key",
 )

@@ -483,12 +483,15 @@ def group_admin(broker, topic):
         deadline = time.time() + 60
         while len(m.received()) < 6 and time.time() < deadline:
             time.sleep(0.2)
-        time.sleep(3)  # let the auto-commit land
+        # Until the auto-commit covers all six records.
+        offs = a.list_consumer_group_offsets(g)
+        while not any(v.offset == 6 for v in offs.values()) and time.time() < deadline:
+            time.sleep(0.2)
+            offs = a.list_consumer_group_offsets(g)
         out = []
         listed = any(x[0] == g for x in a.list_consumer_groups())
         d = a.describe_consumer_groups([g])[0]
         out.append(f"listed={listed} state={d.state} members={len(d.members)}")
-        offs = a.list_consumer_group_offsets(g)
         out.append("offsets=" + ",".join(f"{k.partition}:{v.offset}" for k, v in offs.items()))
         out.append("delete_while_active=" + delete_result(a.delete_consumer_groups([g])))
         m.close()
