@@ -50,9 +50,16 @@ computed from committed markers. Three properties of that mechanism are worth kn
   client that re-requests the same offset forever looks like a hung consumer.
 - Each transaction produces under its own producer id, taken from the transaction's xid.
   Kafka clients drop everything from a producer id at or after an aborted first offset,
-  so a shared producer id would let one rollback discard later committed records.
-- The last stable offset gates records from transactions that are still in flight, so
-  `read_committed` consumers never see records that may yet commit or abort.
+  so a shared producer id would let one rollback discard later committed records. For
+  the same reason, when a savepoint that produced is rolled back, the rest of the
+  transaction produces under a new producer id derived from the same xid. A transaction
+  that rolls back more than about four million such savepoints gets an error from
+  further calls.
+- The last stable offset is the first offset of the oldest transaction still in flight on
+  the partition, so `read_committed` consumers never see records that may yet commit or
+  abort. A commit becomes visible once every transaction that produced to the partition
+  before it has ended. Past 32 transactions in flight on one partition, the extra ones
+  hold the offset at the first of them until all of them have ended.
 
 ### Who may produce
 

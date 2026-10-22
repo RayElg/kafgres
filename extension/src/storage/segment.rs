@@ -86,9 +86,12 @@ pub struct Slot {
     next_offset: i64,
     active_base: i64,
     active_bytes: u64,
-    pending_count: i32,
-    /// Lowest offset written by an uncommitted transaction, or `-1`; the LSO derives from it.
-    pending_from: i64,
+    /// First offset of each in-flight `kafgres_produce()` transaction, `-1` when free.
+    pending: [i64; PENDING_TXNS],
+    /// Reservations that found `pending` full; `pending_overflow_from` is at or below all
+    /// of them until the count drains to zero.
+    pending_overflow: i32,
+    pending_overflow_from: i64,
     active_since_ms: i64,
     /// Cached because the roll decision runs under the shard lock, where SPI is not allowed.
     segment_ms: i64,
@@ -115,8 +118,9 @@ impl Default for Slot {
             next_offset: 0,
             active_base: 0,
             active_bytes: 0,
-            pending_count: 0,
-            pending_from: -1,
+            pending: [-1; PENDING_TXNS],
+            pending_overflow: 0,
+            pending_overflow_from: -1,
             active_since_ms: 0,
             segment_bytes: 0,
             segment_ms: 604_800_000,
@@ -130,7 +134,50 @@ impl Default for Slot {
     }
 }
 
+/// In-flight SQL produce transactions tracked exactly per partition; more fall back to a
+/// conservative mark.
+pub const PENDING_TXNS: usize = 32;
+
 impl Slot {
+    /// Hold the LSO at or below `base` until `release_pending(base)`.
+    fn reserve_pending(&mut self, base: i64) {
+        if let Some(free) = self.pending.iter_mut().find(|b| **b < 0) {
+            *free = base;
+            return;
+        }
+        if self.pending_overflow == 0 {
+            self.pending_overflow_from = base;
+        }
+        self.pending_overflow += 1;
+    }
+
+    /// A base not in `pending` at or above `pending_overflow_from` was an overflow reservation:
+    /// bases are distinct, increasing offsets. Any other base is stray and ignored.
+    fn release_pending(&mut self, base: i64) {
+        if let Some(entry) = self.pending.iter_mut().find(|b| **b == base) {
+            *entry = -1;
+            return;
+        }
+        if self.pending_overflow > 0 && base >= self.pending_overflow_from {
+            self.pending_overflow -= 1;
+            if self.pending_overflow == 0 {
+                self.pending_overflow_from = -1;
+            }
+        }
+    }
+
+    /// Lowest offset an in-flight SQL transaction may still commit or abort, else `next_offset`.
+    fn pending_floor(&self) -> i64 {
+        let mut floor = self.next_offset;
+        for b in self.pending.iter().copied().filter(|b| *b >= 0) {
+            floor = floor.min(b);
+        }
+        if self.pending_overflow > 0 {
+            floor = floor.min(self.pending_overflow_from);
+        }
+        floor
+    }
+
     /// The slot is shared memory and never rolls back; a `slot > seed` bump whose transaction has
     fn epoch_for_append(&mut self, seed: i32) -> StoreResult<i32> {
         if self.leader_epoch < 0 || seed > self.leader_epoch {
@@ -420,8 +467,9 @@ fn slot_for(slots: &mut [Slot; SLOTS_PER_SHARD], topic: TopicId, partition: i32)
         next_offset: recovered.next_offset,
         active_base: recovered.active_base,
         active_bytes: recovered.active_bytes,
-        pending_count: 0,
-        pending_from: -1,
+        pending: [-1; PENDING_TXNS],
+        pending_overflow: 0,
+        pending_overflow_from: -1,
         active_since_ms: 0,
         segment_ms: 604_800_000,
         segment_bytes: 0,
@@ -2334,13 +2382,7 @@ impl LogStore for SegmentStore {
         for probe in 0..SLOTS_PER_SHARD {
             let i = (start + probe) % SLOTS_PER_SHARD;
             if slots[i].topic == topic && slots[i].partition == partition {
-                // `pending_from` is the first offset an uncommitted transaction wrote, or
-                let st = &slots[i];
-                return Ok(Some(if st.pending_from >= 0 {
-                    st.pending_from
-                } else {
-                    st.next_offset
-                }));
+                return Ok(Some(slots[i].pending_floor()));
             }
             if slots[i].topic == 0 {
                 break;
@@ -2527,8 +2569,9 @@ impl LogStore for SegmentStore {
         topic: TopicId,
         partition: i32,
         batch: RawBatch,
+        reserve: bool,
     ) -> StoreResult<(i64, i64)> {
-        self.append_pending_impl(topic, partition, batch)
+        self.append_pending_impl(topic, partition, batch, reserve)
     }
 
     /// The only place committed records are deliberately destroyed: a leader's
@@ -2710,12 +2753,14 @@ impl LogStore for SegmentStore {
 }
 
 impl SegmentStore {
-    /// Append `batch` and reserve its offsets for an uncommitted transaction: until the caller's
+    /// Append `batch` for an uncommitted transaction. `reserve` holds the LSO at its base until
+    /// `release_pending`; without it, the transaction's earlier reservation here must cover it.
     fn append_pending_impl(
         &mut self,
         topic: TopicId,
         partition: i32,
         batch: RawBatch,
+        reserve: bool,
     ) -> StoreResult<(i64, i64)> {
         let seed = self.leader_epoch(topic, partition)?;
         let (seg_ms, seg_bytes) = roll_bounds_cached(topic);
@@ -2727,17 +2772,16 @@ impl SegmentStore {
             let last_offset = base_offset + batch.last_offset_delta as i64;
             Self::write_batch(topic, partition, st, hints, batch, epoch, base_offset)?;
 
-            // Conservative on purpose: the low-water mark does not rise as earlier transactions commit
-            if st.pending_count == 0 {
-                st.pending_from = base_offset;
+            // In the append's critical section, so no reader sees these offsets unreserved.
+            if reserve {
+                st.reserve_pending(base_offset);
             }
-            st.pending_count += 1;
             Ok((base_offset, last_offset))
         })
     }
 
-    /// Release one uncommitted reservation, on both commit and abort: missing it on the abort
-    pub fn release_pending(topic: TopicId, partition: i32) {
+    /// Release the reservation made at `base`, on both commit and abort: missing it on the abort
+    pub fn release_pending(topic: TopicId, partition: i32, base: i64) {
         // Runs in a commit or abort callback, where a panic is a PANIC: no indexing.
         let Some(shard) = SHARDS.get(shard_of(topic, partition)) else {
             pgrx::warning!("kafgres: no lock shard for topic {topic} partition {partition}; reservation not released");
@@ -2746,10 +2790,7 @@ impl SegmentStore {
         let mut slots = shard.exclusive();
         for slot in slots.iter_mut() {
             if slot.topic == topic && slot.partition == partition {
-                slot.pending_count = (slot.pending_count - 1).max(0);
-                if slot.pending_count == 0 {
-                    slot.pending_from = -1;
-                }
+                slot.release_pending(base);
                 return;
             }
         }
@@ -2758,13 +2799,7 @@ impl SegmentStore {
     /// The Last Stable Offset: the first offset a `read_committed` consumer must not pass.
     fn last_stable_offset_impl(&self, topic: TopicId, partition: i32) -> StoreResult<i64> {
         // Two mechanisms hold this back and both must be consulted: `pending_*` covers
-        let pending = Self::with_slot(topic, partition, |st, _| {
-            Ok(if st.pending_count > 0 {
-                st.pending_from
-            } else {
-                st.next_offset
-            })
-        })?;
+        let pending = Self::with_slot(topic, partition, |st, _| Ok(st.pending_floor()))?;
         match pmeta::kafka_txn_lso(topic, partition)? {
             Some(kafka) if kafka >= 0 => Ok(pending.min(kafka)),
             _ => Ok(pending),
@@ -2948,6 +2983,107 @@ mod slot_tests {
         assert_eq!(slot.leader_epoch, 5, "the refusal must not disturb the slot");
 
         assert_eq!(slot.epoch_for_append(5).unwrap(), 5);
+    }
+
+    fn with_next(next_offset: i64) -> Slot {
+        Slot { next_offset, ..Slot::default() }
+    }
+
+    /// RAY-5: T1 commits while T2 and later T3 are open; each commit raises the LSO.
+    #[test]
+    fn a_committed_transaction_stops_holding_the_lso_while_later_ones_are_open() {
+        let mut slot = with_next(0);
+        assert_eq!(slot.pending_floor(), 0);
+        for base in 0..2 {
+            slot.reserve_pending(base);
+            slot.next_offset = base + 1;
+        }
+        assert_eq!(slot.pending_floor(), 0);
+        slot.release_pending(0);
+        assert_eq!(slot.pending_floor(), 1, "T1 committed; only T2 is open");
+        slot.reserve_pending(2);
+        slot.next_offset = 3;
+        slot.release_pending(1);
+        assert_eq!(slot.pending_floor(), 2, "T3 is open");
+        slot.release_pending(2);
+        assert_eq!(slot.pending_floor(), 3);
+    }
+
+    #[test]
+    fn a_later_commit_does_not_raise_the_lso_past_an_earlier_open_transaction() {
+        let mut slot = with_next(10);
+        slot.reserve_pending(10);
+        slot.reserve_pending(11);
+        slot.next_offset = 12;
+        slot.release_pending(11);
+        assert_eq!(slot.pending_floor(), 10);
+        slot.release_pending(10);
+        assert_eq!(slot.pending_floor(), 12);
+    }
+
+    /// A full table holds the LSO at the first overflowed base until every overflow drains.
+    #[test]
+    fn overflow_falls_back_to_a_conservative_mark() {
+        let mut slot = with_next(0);
+        let n = PENDING_TXNS as i64;
+        for base in 0..n + 3 {
+            slot.reserve_pending(base);
+        }
+        slot.next_offset = n + 3;
+        for base in 0..n {
+            slot.release_pending(base);
+        }
+        assert_eq!(slot.pending_floor(), n, "overflowed reservations are still open");
+        slot.release_pending(n + 2);
+        slot.release_pending(n + 1);
+        assert_eq!(slot.pending_floor(), n, "one overflowed reservation is still open");
+        slot.release_pending(n);
+        assert_eq!(slot.pending_floor(), n + 3);
+
+        // An exact entry freed during overflow is reused, and the mark still covers the rest.
+        for base in n + 3..2 * n + 4 {
+            slot.reserve_pending(base);
+        }
+        slot.next_offset = 2 * n + 4;
+        slot.release_pending(n + 3);
+        slot.reserve_pending(2 * n + 4);
+        slot.next_offset = 2 * n + 5;
+        for base in n + 4..2 * n + 3 {
+            slot.release_pending(base);
+        }
+        assert_eq!(slot.pending_floor(), 2 * n + 3, "the overflowed one is open");
+        slot.release_pending(2 * n + 3);
+        assert_eq!(slot.pending_floor(), 2 * n + 4);
+    }
+
+    /// A release with nothing held, e.g. after the partition was dropped and recreated.
+    #[test]
+    fn a_stray_release_changes_nothing() {
+        let mut slot = with_next(5);
+        slot.release_pending(3);
+        assert_eq!(slot.pending_floor(), 5);
+        slot.reserve_pending(5);
+        slot.next_offset = 6;
+        slot.release_pending(3);
+        assert_eq!(slot.pending_floor(), 5);
+    }
+
+    #[test]
+    fn a_stray_release_during_overflow_keeps_the_overflow_mark() {
+        let n = PENDING_TXNS as i64;
+        let mut slot = with_next(100);
+        for base in 100..100 + n + 1 {
+            slot.reserve_pending(base);
+        }
+        slot.next_offset = 100 + n + 1;
+        slot.release_pending(3);
+        assert_eq!(slot.pending_floor(), 100);
+        for base in 100..100 + n {
+            slot.release_pending(base);
+        }
+        assert_eq!(slot.pending_floor(), 100 + n, "the overflowed reservation is still open");
+        slot.release_pending(100 + n);
+        assert_eq!(slot.pending_floor(), 100 + n + 1);
     }
 
     /// A postmaster crash-restart wipes shared memory. The slot relearns from Postgres, and
