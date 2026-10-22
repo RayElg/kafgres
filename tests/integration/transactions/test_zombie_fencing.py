@@ -6,6 +6,10 @@ transaction, is refused before it is written, or its successor's commit publishe
 RAY-8: OffsetCommit and TxnOffsetCommit check the member, generation and group state, or
 an evicted consumer's late commit rewinds its successor's offset.
 
+RAY-11: the producer-id sweep spares a producer with an open transaction, or its EndTxn
+fails with INVALID_PRODUCER_ID_MAPPING and the LSO stays pinned; and a transaction whose
+producer row is already gone is still aborted.
+
 Raw frames, since no client sends a stale epoch on purpose. Expected codes are
 apache/kafka 4.3.1's answers to the same requests.
 """
@@ -523,3 +527,104 @@ def test_txn_offset_commit_fences_a_zombie_consumer(topic, group):
     finally:
         c.close()
         t.close()
+
+
+# ---------------------------------------------------------------- RAY-11
+
+
+@pytest.fixture
+def retention():
+    """`kafgres.producer_id_expiration_ms` / `max_producer_ids`, reset afterwards."""
+    def apply(expiration_ms=None, max_ids=None):
+        if expiration_ms is not None:
+            sql(f"ALTER SYSTEM SET kafgres.producer_id_expiration_ms = {expiration_ms}")
+        if max_ids is not None:
+            sql(f"ALTER SYSTEM SET kafgres.max_producer_ids = {max_ids}")
+        sql("SELECT pg_reload_conf()")
+
+    yield apply
+    sql("ALTER SYSTEM RESET kafgres.producer_id_expiration_ms")
+    sql("ALTER SYSTEM RESET kafgres.max_producer_ids")
+    sql("SELECT pg_reload_conf()")
+
+
+def backdate(pid, secs):
+    sql(f"UPDATE kafgres_producers SET last_ts = now() - make_interval(secs => {secs}) "
+        f"WHERE producer_id = {pid}")
+
+
+def producer_exists(pid):
+    return int(sql(f"SELECT count(*) FROM kafgres_producers WHERE producer_id = {pid}")) == 1
+
+
+def open_txn(b, txn, topic, value):
+    pid, epoch = b.init_pid(txn)
+    assert b.add_partitions(txn, pid, epoch, topic) == NONE
+    assert b.produce(3, txn, topic, 0, txn_batch(value, pid, epoch, 0))[0] == NONE
+    return pid, epoch
+
+
+def test_an_open_transaction_survives_the_expiry_sweep(topic, retention):
+    """Nothing in a transaction refreshes `last_ts`, so the sweep must exempt it."""
+    b = Broker()
+    txn = txn_id(topic)
+    try:
+        pid, epoch = open_txn(b, txn, topic, b"held")
+        idle, _ = b.init_pid(txn_id(topic))
+        backdate(pid, 3600)
+        backdate(idle, 3600)
+        retention(expiration_ms=3000)
+        sql("SELECT kafgres_expire_producers()")
+        assert not producer_exists(idle), "the sweep did not run"
+        assert producer_exists(pid), "the producer of an open transaction was swept"
+
+        assert b.end_txn(txn, pid, epoch, True) == NONE
+        assert read_committed(topic) == [b"held"]
+    finally:
+        b.close()
+
+
+def test_an_open_transaction_survives_the_producer_id_ceiling(topic, retention):
+    """The ceiling evicts past its 300 s floor, inside the 15 min a transaction may stay open."""
+    b = Broker()
+    txn = txn_id(topic)
+    try:
+        pid, epoch = open_txn(b, txn, topic, b"held")
+        idle, _ = b.init_pid(txn_id(topic))
+        b.init_pid(txn_id(topic))  # a fresh producer, so the cut falls at or above `pid`
+        # Past the floor, well inside the default 24 h expiry: only the ceiling applies.
+        backdate(pid, 3600)
+        backdate(idle, 7200)
+        retention(max_ids=1)
+        sql("SELECT kafgres_expire_producers()")
+        assert not producer_exists(idle), "the ceiling did not run"
+        assert producer_exists(pid), "the ceiling evicted the producer of an open transaction"
+
+        assert b.end_txn(txn, pid, epoch, True) == NONE
+        assert read_committed(topic) == [b"held"]
+    finally:
+        b.close()
+
+
+@pytest.mark.parametrize("by", ["timeout", "reinit"])
+def test_a_transaction_whose_producer_is_gone_is_still_aborted(topic, by):
+    """Both the timeout sweep and a new InitProducerId for its transactional id abort it."""
+    b = Broker()
+    txn = txn_id(topic)
+    try:
+        pid, _ = open_txn(b, txn, topic, b"orphan")
+        sql(f"DELETE FROM kafgres_producers WHERE producer_id = {pid}")
+        if by == "timeout":
+            sql(f"UPDATE kafgres_txns SET timeout_ms = 1000, started_at = started_at - 60000 "
+                f"WHERE producer_id = {pid}")
+            sql("SELECT kafgres_expire_transactions()")
+        else:
+            new_pid, _ = b.init_pid(txn)
+            assert new_pid != pid
+        assert sql(f"SELECT state FROM kafgres_txns WHERE producer_id = {pid}") == "aborted"
+
+        after = record_batch([b"after"], producer_id=-1, producer_epoch=-1, base_sequence=-1)
+        assert b.produce(3, None, topic, 0, after)[0] == NONE
+        assert read_committed(topic) == [b"after"], "the orphan is visible or the LSO is pinned"
+    finally:
+        b.close()

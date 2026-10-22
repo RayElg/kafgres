@@ -378,13 +378,18 @@ pub struct Retention {
 
 /// Drop producer state that is idle or surplus; returns how many producers went. Two
 pub fn sweep(policy: Retention) -> Result<u64, spi::Error> {
+    // Producers with an open transaction are exempt, as in Kafka's `ProducerStateManager`:
+    // nothing in a transaction refreshes `last_ts`, and without the row EndTxn fails.
     let mut dropped = 0;
 
     if policy.expiration_ms > 0 {
         dropped += Spi::get_one_with_args::<i64>(
             "WITH victims AS (
-                 SELECT producer_id FROM kafgres_producers
+                 SELECT producer_id FROM kafgres_producers p
                   WHERE last_ts < now() - make_interval(secs => $1 / 1000.0)
+                    AND NOT EXISTS (SELECT 1 FROM kafgres_txns t
+                                     WHERE t.producer_id = p.producer_id
+                                       AND t.state = 'ongoing')
                   ORDER BY last_ts LIMIT $2),
                   gone AS (
                 DELETE FROM kafgres_producers p
@@ -411,6 +416,9 @@ pub fn sweep(policy: Retention) -> Result<u64, spi::Error> {
                  SELECT p.producer_id FROM kafgres_producers p, cut
                   WHERE p.last_ts <= cut.t
                     AND p.last_ts < now() - make_interval(secs => $3)
+                    AND NOT EXISTS (SELECT 1 FROM kafgres_txns t
+                                     WHERE t.producer_id = p.producer_id
+                                       AND t.state = 'ongoing')
                   ORDER BY p.last_ts LIMIT $2),
                   gone AS (
                 DELETE FROM kafgres_producers p

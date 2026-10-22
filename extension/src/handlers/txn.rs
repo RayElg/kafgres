@@ -465,13 +465,16 @@ fn finish_transaction(
 ) -> Result<Finish, HandlerError> {
     let requested = committed;
     // Lock the transaction row and re-check under it: without the lock, the expiry sweep
+    //
+    // An outer join, so an open transaction whose producer row is gone can still be aborted.
+    // `EndTxn` never gets here for one: `verdict` refuses it first.
     let state: Option<String> = Spi::get_one_with_args(
         "SELECT (SELECT CASE
                     WHEN p.producer_epoch > $2 THEN 'fenced'
                     WHEN t.state = 'ongoing' THEN 'ours'
                     ELSE t.state END
               FROM kafgres_txns t
-              JOIN kafgres_producers p ON p.producer_id = t.producer_id
+              LEFT JOIN kafgres_producers p ON p.producer_id = t.producer_id
              WHERE t.producer_id = $1
                FOR UPDATE OF t)",
         &[producer_id.into(), (producer_epoch as i32).into()],
@@ -589,27 +592,39 @@ fn finish_transaction(
 /// are written and NONE on the retry. Without the abort, the new instance's first commit
 /// would carry the abandoned records, and a `read_committed` consumer would see them.
 pub(super) fn abort_abandoned(transactional_id: &str) -> Result<(), HandlerError> {
-    let open: Option<String> = Spi::get_one_with_args(
-        "SELECT (SELECT p.producer_id || '|' || p.producer_epoch
-                   FROM kafgres_producers p
-                   JOIN kafgres_txns t ON t.producer_id = p.producer_id
-                  WHERE p.transactional_id = $1 AND t.state = 'ongoing')",
-        &[transactional_id.into()],
-    )
+    // By the transaction row's id, so one whose producer row is gone is found too; there
+    // may then be two.
+    let open: Vec<(i64, i16)> = Spi::connect(|client| {
+        let rows = client.select(
+            "SELECT t.producer_id, COALESCE(p.producer_epoch, t.producer_epoch)::int
+               FROM kafgres_txns t
+               LEFT JOIN kafgres_producers p ON p.producer_id = t.producer_id
+              WHERE t.transactional_id = $1 AND t.state = 'ongoing'
+                AND (p.producer_id IS NULL OR p.transactional_id = $1)
+              ORDER BY t.producer_id",
+            None,
+            &[transactional_id.into()],
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let (Some(p), Some(e)) = (row.get::<i64>(1)?, row.get::<i32>(2)?) {
+                out.push((p, e as i16));
+            }
+        }
+        Ok::<_, pgrx::spi::Error>(out)
+    })
     .map_err(|e| HandlerError::Internal(e.to_string()))?;
-    let Some(s) = open else { return Ok(()) };
-    let mut it = s.split('|');
-    let producer_id: i64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(-1);
-    let epoch: i16 = it.next().and_then(|x| x.parse().ok()).unwrap_or(-1);
 
-    // At the producer's current epoch, which the caller bumps next. Every outcome is
-    // acceptable: ended concurrently, already forced by an operator (which fenced the
-    // producer), or aborted here.
-    finish_transaction(producer_id, epoch, false)?;
-    log!(
-        "kafgres: aborted the open transaction of producer {producer_id} — \
-         InitProducerId for '{transactional_id}' supersedes it"
-    );
+    for (producer_id, epoch) in open {
+        // At the producer's current epoch, which the caller bumps next. Every outcome is
+        // acceptable: ended concurrently, already forced by an operator (which fenced the
+        // producer), or aborted here.
+        finish_transaction(producer_id, epoch, false)?;
+        log!(
+            "kafgres: aborted the open transaction of producer {producer_id} — \
+             InitProducerId for '{transactional_id}' supersedes it"
+        );
+    }
     Ok(())
 }
 
@@ -840,10 +855,17 @@ pub fn expire_stale_transactions() -> Result<usize, HandlerError> {
         // The fence makes expiry safe: the producer may just be slow, and unfenced it keeps
         let fenced_epoch = fence(producer_id)?;
 
-        log!(
-            "kafgres: aborted transaction for producer {producer_id} — no EndTxn within \
-             its transaction timeout; fenced at epoch {fenced_epoch}"
-        );
+        if fenced_epoch < 0 {
+            log!(
+                "kafgres: aborted transaction for producer {producer_id} — no EndTxn within \
+                 its transaction timeout; its producer state was already gone"
+            );
+        } else {
+            log!(
+                "kafgres: aborted transaction for producer {producer_id} — no EndTxn within \
+                 its transaction timeout; fenced at epoch {fenced_epoch}"
+            );
+        }
         done += 1;
     }
     Ok(done)
