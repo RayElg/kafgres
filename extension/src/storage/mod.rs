@@ -108,6 +108,52 @@ fn forget_cleaned(topic: TopicId, partition: i32) {
     }
 }
 
+/// Add `view`'s keys to `map`; false when they would not fit. A batch whose records do not
+/// decode supersedes nothing, but the map moves past it so the partition is not stuck.
+fn map_batch(
+    map: &mut kafgres_codec::compaction::OffsetMap,
+    view: &kafgres_codec::records::RecordBatch,
+    max_keys: usize,
+    topic: TopicId,
+    partition: i32,
+) -> bool {
+    match map.add_batch(view, max_keys) {
+        Ok(fits) => fits,
+        Err(e) => {
+            undecodable(topic, partition, view, e);
+            map.end = map.end.max(view.last_offset());
+            true
+        }
+    }
+}
+
+/// `clean_batch`, except that a stored batch whose records do not decode is kept verbatim.
+fn clean_or_keep(
+    view: &kafgres_codec::records::RecordBatch,
+    map: &kafgres_codec::compaction::OffsetMap,
+    tombstone_goes: &dyn Fn(i64) -> bool,
+    topic: TopicId,
+    partition: i32,
+) -> Option<Vec<kafgres_codec::compaction::KeptRecord>> {
+    kafgres_codec::compaction::clean_batch(view, map, tombstone_goes)
+        .unwrap_or_else(|e| {
+            undecodable(topic, partition, view, e);
+            None
+        })
+}
+
+fn undecodable(
+    topic: TopicId,
+    partition: i32,
+    view: &kafgres_codec::records::RecordBatch,
+    e: kafgres_codec::records::BatchError,
+) {
+    pgrx::log!(
+        "kafgres: compaction keeps batch {} of topic {topic} partition {partition} verbatim: its records do not decode ({e})",
+        view.base_offset()
+    );
+}
+
 /// What a compaction pass may do with a batch, beyond what the offset map says (I10).
 struct Judge {
     topic: TopicId,

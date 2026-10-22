@@ -8,7 +8,7 @@ use kafgres_codec::generated::produce_response::{
     PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
 };
 
-use kafgres_codec::records::{BatchIter, RecordBatch};
+use kafgres_codec::records::{BatchError, BatchIter, RecordBatch};
 
 use super::HandlerError;
 use crate::meta;
@@ -737,17 +737,30 @@ fn null_keyed(records: Option<&kafgres_codec::bytes::Bytes>) -> Option<AppendErr
         if view.is_control() {
             continue;
         }
-        let Ok(iter) = view.records_decompressed() else {
-            return None;
+        let iter = match view.records_decompressed() {
+            Ok(iter) => iter,
+            Err(e) => return undecodable(&view, e),
         };
         for record in iter {
-            let Ok(record) = record else { return None };
+            let record = match record {
+                Ok(record) => record,
+                Err(e) => return undecodable(&view, e),
+            };
             if record.key.is_none() {
                 return Some(AppendError::NullKeyOnCompacted);
             }
         }
     }
     None
+}
+
+/// Records Kafka's `DefaultRecord.readFrom` refuses. A bad CRC is left to the store (Kafka
+/// checks it first, as `CORRUPT_MESSAGE`), and so is an unknown codec.
+fn undecodable(view: &RecordBatch, e: BatchError) -> Option<AppendError> {
+    if matches!(e, BatchError::Compressed(_)) || view.verify_crc().is_err() {
+        return None;
+    }
+    Some(AppendError::Batch(e))
 }
 
 fn raw_batch(view: &RecordBatch) -> RawBatch {

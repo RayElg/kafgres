@@ -106,12 +106,12 @@ pub fn resolve_topic(name: &str, uuid: &[u8; 16]) -> Result<Option<ResolvedTopic
     let sql = if name.is_empty() {
         "SELECT topic_id::int, name, topic_uuid,
                 (config->>'max.message.bytes')::bigint,
-                (config->>'cleanup.policy' = 'compact')
+                (btrim(config->>'cleanup.policy') IN ('compact', 'compact,delete'))
            FROM kafgres_topics WHERE topic_uuid = $1"
     } else {
         "SELECT topic_id::int, name, topic_uuid,
                 (config->>'max.message.bytes')::bigint,
-                (config->>'cleanup.policy' = 'compact')
+                (btrim(config->>'cleanup.policy') IN ('compact', 'compact,delete'))
            FROM kafgres_topics WHERE name = $2"
     };
     Spi::connect(|client| {

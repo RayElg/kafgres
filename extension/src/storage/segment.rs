@@ -937,7 +937,7 @@ impl SegmentStore {
         generation: u64,
         budget: &mut i64,
     ) -> StoreResult<Option<Cleaned>> {
-        use kafgres_codec::compaction::{clean_batch, rebuild_batch, KeptRecord};
+        use kafgres_codec::compaction::{rebuild_batch, KeptRecord};
 
         // What survives of a batch, `None` for all of it; an aborted batch goes whole.
         let judge_batch = |view: &RecordBatch| -> StoreResult<Option<Vec<KeptRecord>>> {
@@ -947,8 +947,8 @@ impl SegmentStore {
             if !judge.committed(view)? {
                 return Ok(Some(Vec::new()));
             }
-            clean_batch(view, map, &|o| judge.tombstone_goes(o))
-                .map_err(|e| StoreError::Io(format!("compaction records: {e:?}")))
+            let goes = |o: i64| judge.tombstone_goes(o);
+            Ok(super::clean_or_keep(view, map, &goes, topic, partition))
         };
 
         let tmp_path = compacting_path(topic, partition, rw.info.base);
@@ -1204,14 +1204,8 @@ impl SegmentStore {
                         plan.map.end = plan.map.end.max(view.last_offset());
                         continue;
                     }
-                    match plan.map.add_batch(&view, MAX_COMPACT_KEYS) {
-                        Ok(true) => {}
-                        Ok(false) => break 'segments,
-                        Err(e) => {
-                            pgrx::log!("kafgres: compaction stopped mapping: {}", reader.corrupt(&format!("{e:?}")));
-                            plan.abandoned = true;
-                            break 'segments;
-                        }
+                    if !super::map_batch(&mut plan.map, &view, MAX_COMPACT_KEYS, topic, partition) {
+                        break 'segments;
                     }
                 }
             }

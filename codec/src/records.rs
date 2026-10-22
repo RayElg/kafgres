@@ -47,8 +47,16 @@ pub enum BatchError {
     TruncatedRecord {
         at: usize,
     },
-    /// A key or value length that is negative and not the `-1` that means null.
-    NegativeLength(i64),
+    /// A negative record length, header count or header key length.
+    NegativeLength {
+        field: &'static str,
+        value: i32,
+    },
+    /// Fields that end before the record's declared length (Kafka: "Invalid record size").
+    RecordSizeMismatch {
+        declared: i32,
+        read: usize,
+    },
     RecordCountMismatch {
         declared: i32,
         found: usize,
@@ -74,7 +82,8 @@ impl BatchError {
             }
             // All inside CRC coverage, so a retry reproduces the rejection exactly.
             BatchError::TruncatedRecord { .. }
-            | BatchError::NegativeLength(_)
+            | BatchError::NegativeLength { .. }
+            | BatchError::RecordSizeMismatch { .. }
             | BatchError::RecordCountMismatch { .. } => ErrorCode::InvalidRecord,
             // A payload that will not decompress is a batch the producer built wrong; it
             BatchError::Decompression(_) => ErrorCode::InvalidRecord,
@@ -121,8 +130,11 @@ impl std::fmt::Display for BatchError {
             BatchError::TruncatedRecord { at } => {
                 write!(f, "record at byte {at} runs past the end of the batch")
             }
-            BatchError::NegativeLength(n) => {
-                write!(f, "field length {n}; only -1 (null) may be negative")
+            BatchError::NegativeLength { field, value } => {
+                write!(f, "{field} is {value}, which cannot be negative")
+            }
+            BatchError::RecordSizeMismatch { declared, read } => {
+                write!(f, "record declares {declared} bytes, its fields take {read}")
             }
             BatchError::RecordCountMismatch { declared, found } => {
                 write!(f, "batch declares {declared} records, {found} remain")
@@ -768,9 +780,9 @@ fn read_varint_i64(buf: &[u8], pos: &mut usize) -> Option<i64> {
     None
 }
 
-/// Kafka's record offset delta is an int varint: truncate the unsigned payload to
-/// 32 bits *before* zigzag decoding. A terminating fifth byte may have spill bits.
-fn read_offset_varint(buf: &[u8], pos: &mut usize) -> Option<i32> {
+/// Kafka's `ByteUtils.readVarint`: at most five bytes, truncated to 32 bits before zigzag
+/// decoding, so spill bits in a terminating fifth byte are dropped.
+fn read_varint_i32(buf: &[u8], pos: &mut usize) -> Option<i32> {
     let mut result = 0u32;
     for shift in (0..35).step_by(7) {
         let byte = *buf.get(*pos)?;
@@ -846,46 +858,63 @@ impl RecordBatch {
 }
 
 impl RecordIter {
+    /// Reads stay inside the record's declared extent, and the fields must fill it exactly.
     fn next_record(&mut self) -> Result<RecordRef, BatchError> {
         let at = self.pos;
         let fail = || BatchError::TruncatedRecord { at };
 
-        let length = read_varint_i64(&self.buf, &mut self.pos).ok_or_else(fail)?;
+        let length = read_varint_i32(&self.buf, &mut self.pos).ok_or_else(fail)?;
         if length < 0 {
-            return Err(BatchError::NegativeLength(length));
+            return Err(BatchError::NegativeLength {
+                field: "record length",
+                value: length,
+            });
         }
-        // The record's declared extent, checked before any field inside it is read, so a
-        let end = self
-            .pos
+        let start = self.pos;
+        let end = start
             .checked_add(length as usize)
             .filter(|e| *e <= self.buf.len())
             .ok_or_else(fail)?;
 
-        let attributes = *self.buf.get(self.pos).ok_or_else(fail)?;
+        let attributes = *self.buf[..end].get(self.pos).ok_or_else(fail)?;
         self.pos += 1;
-        let timestamp_delta = read_varint_i64(&self.buf, &mut self.pos).ok_or_else(fail)?;
-        let offset_delta = read_offset_varint(&self.buf[..end], &mut self.pos).ok_or_else(fail)?;
+        // A varlong in Kafka too, so this one stays on the ten-byte reader.
+        let timestamp_delta = read_varint_i64(&self.buf[..end], &mut self.pos).ok_or_else(fail)?;
+        let offset_delta = read_varint_i32(&self.buf[..end], &mut self.pos).ok_or_else(fail)?;
 
         let key = self.read_field(end)?;
         let value = self.read_field(end)?;
 
-        // Headers are bounded by the record's own declared extent; the count is
-        let header_count = read_varint_i64(&self.buf, &mut self.pos).ok_or_else(fail)?;
+        let header_count = self.read_len(end)?;
         if header_count < 0 {
-            return Err(BatchError::NegativeLength(header_count));
+            return Err(BatchError::NegativeLength {
+                field: "header count",
+                value: header_count,
+            });
         }
         let mut headers = Vec::new();
         for _ in 0..header_count {
             if self.pos >= end {
                 return Err(fail());
             }
-            let name = self.read_field(end)?.ok_or_else(fail)?;
+            let name_len = self.read_len(end)?;
+            if name_len < 0 {
+                return Err(BatchError::NegativeLength {
+                    field: "header key length",
+                    value: name_len,
+                });
+            }
+            let name = self.read_bytes(end, name_len)?;
             let value = self.read_field(end)?;
             headers.push((name, value));
         }
 
-        // The record's own length advances the cursor, so a miscounted header list cannot
-        self.pos = end;
+        if self.pos != end {
+            return Err(BatchError::RecordSizeMismatch {
+                declared: length,
+                read: self.pos - start,
+            });
+        }
         Ok(RecordRef {
             offset_delta,
             timestamp_delta,
@@ -896,25 +925,29 @@ impl RecordIter {
         })
     }
 
-    /// A length-prefixed field: `-1` is null, anything else must fit inside the record.
-    fn read_field(&mut self, end: usize) -> Result<Option<Bytes>, BatchError> {
+    fn read_len(&mut self, end: usize) -> Result<i32, BatchError> {
         let at = self.pos;
-        let len =
-            read_varint_i64(&self.buf, &mut self.pos).ok_or(BatchError::TruncatedRecord { at })?;
-        if len == -1 {
-            return Ok(None);
-        }
-        if len < 0 {
-            return Err(BatchError::NegativeLength(len));
-        }
+        read_varint_i32(&self.buf[..end], &mut self.pos).ok_or(BatchError::TruncatedRecord { at })
+    }
+
+    fn read_bytes(&mut self, end: usize, len: i32) -> Result<Bytes, BatchError> {
         let stop = self
             .pos
             .checked_add(len as usize)
             .filter(|s| *s <= end)
-            .ok_or(BatchError::TruncatedRecord { at })?;
+            .ok_or(BatchError::TruncatedRecord { at: self.pos })?;
         let field = self.buf.slice(self.pos..stop);
         self.pos = stop;
-        Ok(Some(field))
+        Ok(field)
+    }
+
+    /// Key, value or header value: any negative length is null (Kafka's `Utils.readBytes`).
+    fn read_field(&mut self, end: usize) -> Result<Option<Bytes>, BatchError> {
+        let len = self.read_len(end)?;
+        if len < 0 {
+            return Ok(None);
+        }
+        self.read_bytes(end, len).map(Some)
     }
 }
 
@@ -1292,6 +1325,147 @@ mod record_decoder_tests {
                 "offset bytes {wire:02x?}"
             );
         }
+    }
+
+    /// `records` after a batch header, with count, length and CRC repaired.
+    fn sealed(count: i32, records: &[u8]) -> RecordBatch {
+        let mut wire = build_batch(&[NewRecord {
+            key: Some(b"k".to_vec()),
+            value: None,
+            timestamp: 1,
+        }])
+        .to_vec();
+        wire.truncate(RECORD_BATCH_OVERHEAD);
+        wire.extend_from_slice(records);
+        wire[RECORD_COUNT_OFFSET..RECORD_COUNT_OFFSET + 4].copy_from_slice(&count.to_be_bytes());
+        let length = (wire.len() - LENGTH_OFFSET - 4) as i32;
+        wire[LENGTH_OFFSET..LENGTH_OFFSET + 4].copy_from_slice(&length.to_be_bytes());
+        let crc = crc32c::crc32c(&wire[ATTRIBUTES_OFFSET..]);
+        wire[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+        let validated = RecordBatch::validated(Bytes::from(wire)).unwrap();
+        RecordBatch::new(validated.as_bytes().clone()).unwrap()
+    }
+
+    /// One record: zero attributes and deltas, then `parts`, under its canonical length.
+    fn record_of(parts: &[&[u8]]) -> Vec<u8> {
+        let mut body = vec![0u8, 0, 0];
+        for p in parts {
+            body.extend_from_slice(p);
+        }
+        let mut out = bytes::BytesMut::new();
+        put_varint_i32(&mut out, body.len() as i32);
+        out.extend_from_slice(&body);
+        out.to_vec()
+    }
+
+    fn first(batch: &RecordBatch) -> Result<RecordRef, BatchError> {
+        batch.records().unwrap().next().unwrap()
+    }
+
+    #[test]
+    fn key_and_value_lengths_follow_kafka_int_varints() {
+        let null: Option<&[u8]> = None;
+        let cases: &[(&[u8], &[u8], Option<&[u8]>)] = &[
+            (&[0x81, 0x80, 0x80, 0x80, 0x10], b"", null), // alias of -1
+            (&[0x82, 0x80, 0x80, 0x80, 0x10], b"k", Some(b"k")), // alias of 1
+            (&[0x03], b"", null),                         // -2
+            (&[0xff, 0xff, 0xff, 0xff, 0x0f], b"", null), // i32::MIN
+        ];
+        for &(len, bytes, want) in cases {
+            let key = sealed(1, &record_of(&[len, bytes, &[0x01], &[0x00]]));
+            assert_eq!(first(&key).unwrap().key.as_deref(), want, "key length {len:02x?}");
+            let value = sealed(1, &record_of(&[&[0x02], b"k", len, bytes, &[0x00]]));
+            let got = first(&value).unwrap();
+            assert_eq!(got.key.as_deref(), Some(&b"k"[..]));
+            assert_eq!(got.value.as_deref(), want, "value length {len:02x?}");
+        }
+    }
+
+    #[test]
+    fn a_six_byte_length_varint_is_refused() {
+        // Kafka refuses a varint longer than five bytes.
+        let six: &[u8] = &[0x81, 0x80, 0x80, 0x80, 0x80, 0x00];
+        for record in [
+            record_of(&[six, &[0x01], &[0x00]]),
+            record_of(&[&[0x02], b"k", six, &[0x00]]),
+            record_of(&[&[0x02], b"k", &[0x01], six]),
+        ] {
+            assert!(
+                matches!(first(&sealed(1, &record)), Err(BatchError::TruncatedRecord { .. })),
+                "{record:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_fields_follow_kafka_int_varints() {
+        let alias_one: &[u8] = &[0x82, 0x80, 0x80, 0x80, 0x10];
+        let b = sealed(1, &record_of(&[&[0x02], b"k", &[0x01], alias_one, &[0x02], b"h", &[0x03]]));
+        let got = first(&b).unwrap();
+        assert_eq!(got.headers.len(), 1);
+        assert_eq!(&got.headers[0].0[..], b"h");
+        assert!(got.headers[0].1.is_none(), "a header value length of -2 is null");
+
+        let b = sealed(1, &record_of(&[&[0x02], b"k", &[0x01], &[0x02], alias_one, b"h", &[0x01]]));
+        assert_eq!(&first(&b).unwrap().headers[0].0[..], b"h");
+
+        // Kafka: "Invalid negative header key size".
+        for key_len in [&[0x01][..], &[0x81, 0x80, 0x80, 0x80, 0x10]] {
+            let b = sealed(1, &record_of(&[&[0x02], b"k", &[0x01], &[0x02], key_len, &[0x01]]));
+            assert!(
+                matches!(
+                    first(&b),
+                    Err(BatchError::NegativeLength { field: "header key length", value: -1 })
+                ),
+                "{:?}",
+                first(&b)
+            );
+        }
+        let b = sealed(1, &record_of(&[&[0x02], b"k", &[0x01], &[0x01]]));
+        assert!(matches!(
+            first(&b),
+            Err(BatchError::NegativeLength { field: "header count", value: -1 })
+        ));
+    }
+
+    #[test]
+    fn the_record_length_is_an_int_varint() {
+        let canonical = record_of(&[&[0x02], b"k", &[0x01], &[0x00]]);
+        let body = &canonical[1..];
+        // zigzag(len) with spill bits in a terminating fifth byte.
+        let mut aliased = vec![(body.len() as u8 * 2) | 0x80, 0x80, 0x80, 0x80, 0x10];
+        aliased.extend_from_slice(body);
+        assert_eq!(first(&sealed(1, &aliased)).unwrap().key.as_deref(), Some(&b"k"[..]));
+
+        let mut six = vec![(body.len() as u8 * 2) | 0x80, 0x80, 0x80, 0x80, 0x80, 0x00];
+        six.extend_from_slice(body);
+        assert!(matches!(first(&sealed(1, &six)), Err(BatchError::TruncatedRecord { .. })));
+
+        let mut negative = vec![0x01];
+        negative.extend_from_slice(body);
+        assert!(matches!(
+            first(&sealed(1, &negative)),
+            Err(BatchError::NegativeLength { field: "record length", value: -1 })
+        ));
+    }
+
+    #[test]
+    fn trailing_bytes_inside_a_record_are_refused() {
+        let b = sealed(1, &record_of(&[&[0x02], b"k", &[0x01], &[0x00], &[0xaa]]));
+        assert!(
+            matches!(first(&b), Err(BatchError::RecordSizeMismatch { declared: 8, read: 7 })),
+            "{:?}",
+            first(&b)
+        );
+    }
+
+    #[test]
+    fn a_record_cannot_read_its_fields_out_of_the_next_one() {
+        // The first record's length stops before its header count.
+        let short = record_of(&[&[0x02], b"k", &[0x01]]);
+        let next = record_of(&[&[0x02], b"k", &[0x01], &[0x00]]);
+        let b = sealed(2, &[short, next].concat());
+        assert!(matches!(first(&b), Err(BatchError::TruncatedRecord { .. })));
     }
 
     #[test]

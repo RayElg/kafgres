@@ -773,6 +773,36 @@ mod tests {
     }
 
     #[test]
+    fn an_undecodable_batch_adds_nothing_to_the_map() {
+        // The stores pass over a failed batch themselves, so the call must leave the map as it was.
+        let mut wire = crate::records::build_batch(&[
+            NewRecord { key: Some(b"k".to_vec()), value: Some(b"1".to_vec()), timestamp: 1 },
+            NewRecord { key: Some(b"z".to_vec()), value: Some(b"1".to_vec()), timestamp: 1 },
+        ])
+        .to_vec();
+        let first_len = (wire[crate::records::RECORD_BATCH_OVERHEAD] >> 1) as usize;
+        let second = crate::records::RECORD_BATCH_OVERHEAD + 1 + first_len;
+        wire.push(0xaa);
+        wire[second] += 2;
+        let length = (wire.len() - LENGTH_OFFSET - 4) as i32;
+        wire[LENGTH_OFFSET..LENGTH_OFFSET + 4].copy_from_slice(&length.to_be_bytes());
+        let crc = crc32c::crc32c(&wire[ATTRIBUTES_OFFSET..]);
+        wire[crate::records::CRC_OFFSET..crate::records::CRC_OFFSET + 4]
+            .copy_from_slice(&crc.to_be_bytes());
+        let validated = RecordBatch::validated(Bytes::from(wire)).unwrap();
+        let batch = RecordBatch::new(validated.as_bytes().clone()).unwrap();
+
+        let mut map = OffsetMap::default();
+        assert!(matches!(
+            map.add_batch(&batch, 1 << 20),
+            Err(BatchError::RecordSizeMismatch { .. })
+        ));
+        assert_eq!((map.len(), map.end), (0, -1));
+        map.end = batch.last_offset();
+        assert!(clean_batch(&batch, &map, &|_| false).is_err());
+    }
+
+    #[test]
     fn a_tombstone_goes_only_when_the_caller_says() {
         let batches = log(vec![(0, vec![("a", Some("1")), ("a", None)])]);
         let mut map = OffsetMap::default();
