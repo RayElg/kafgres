@@ -162,6 +162,7 @@ injection-prone, and because SQL can do things a template over one row cannot:
 | `commit_ts` | when that transaction committed, `timestamptz` |
 | `event_count` | changes in this commit; only on a `kafgres.transaction` mapping |
 | `data_collections` | `{"schema.table": n}` counts for this commit; same restriction |
+| `toast_unchanged` | `text[]` of columns whose value the change did not carry; see below |
 
 `xid` and `commit_ts` are the same for every change from one commit, which is what lets
 a consumer group those changes together. On a snapshot row they are NULL rather than
@@ -174,7 +175,15 @@ that setting backs the `pg_xact_commit_timestamp()` SLRU, which kafgres does not
 Only a snapshot row, above, has none.
 
 The values in `new` and `old` are exact as of the change; the WAL carries the new tuple
-and `REPLICA IDENTITY FULL` carries the before-image.
+and `REPLICA IDENTITY FULL` carries the before-image. One exception: an `UPDATE` that
+leaves a TOASTed column (a large value stored out of line) untouched logs only a pointer
+to it, not the value. Under `REPLICA IDENTITY FULL` the value is taken from the
+before-image, so the record is exact and matches a snapshot of the row. Otherwise the
+value is unavailable: `new.col` reads NULL and `toast_unchanged` lists the column, so
+`'body' = ANY(toast_unchanged)` tells it from a real NULL. A mapping that reads a large
+column from updates should use `REPLICA IDENTITY FULL` on its table, or skip the field
+when it is listed; treating the NULL as the value puts a wrong latest value on a
+compacted topic.
 
 ### The one caveat: joins read current state
 
@@ -188,24 +197,42 @@ labels, tenant metadata. It is wrong when the event must reflect the transaction
 snapshot. That case is what `kafgres_produce()` is for, and the two paths are
 complementary for exactly this reason.
 
-Delivery is at-least-once. The drain peeks changes from the slot, produces them, then
-advances the slot, so a crash between steps replays the changes instead of losing them.
-Unmapped write traffic never accumulates: the slot advances past every change it peeked,
-mapped or not.
+Delivery is at-least-once. The drain peeks changes from the slot, produces them, makes
+the partitions it appended to durable (an fsync on the segment engine, whatever
+`kafgres.fsync_before_ack` says), records how far each mapping got, then advances the
+slot. A crash between steps replays the changes instead of losing them; a failed fsync
+leaves the slot where it was. Unmapped write traffic never accumulates: the slot advances
+past every change it peeked, mapped or not.
+
+A large transaction is rendered in chunks of at most `kafgres.cdc_chunk_bytes` of decoded
+changes per mapping, in commit order, and the slot advances only once the last chunk is
+produced. The peeked changes wait in a temporary file on the server while they render,
+so a transaction of any size drains in bounded memory.
 
 ### Render failures: `on_error`
 
 Per mapping, `on_error` decides what happens when rendering fails:
 
 - `'skip'` (default) writes the change to `kafgres_cdc_errors` and continues.
-- `'stall'` holds the slot where it is, so nothing is lost and the changes replay once
-  the mapping is fixed. Stalling pins WAL, and pinned WAL fills the disk, so it is the
-  choice for pipelines where every event matters, not the safe default.
+- `'stall'` holds the slot just before the failed change's transaction, so nothing is
+  lost and the changes replay once the mapping is fixed. Stalling pins WAL, and pinned
+  WAL fills the disk, so it is the choice for pipelines where every event matters, not
+  the safe default.
 
 `on_error` governs permanent failures, such as a bad expression or a missing topic.
-Transient errors (deadlock, lock timeout) stop the drain and replay whatever `on_error`
-says. A partially appended batch on the segment engine is dead-lettered instead of
-replayed, since replaying would append the records a second time.
+Transient errors (deadlock, lock timeout) stop that mapping for the drain and replay
+whatever `on_error` says.
+
+A stopped mapping holds the slot only for itself. Each mapping records the last change it
+delivered, the other mappings carry on through the batch, and when the stopped one
+replays they skip what they already produced, so each change reaches each healthy
+mapping's topic once. They do not get ahead of the stopped mapping by more than one
+batch (`kafgres.cdc_batch_size`), since the slot is not advanced past it.
+`kafgres_cdc_drain()` reports a stopped mapping as a `WARNING` and returns the records it
+produced, rather than raising an `ERROR`: an error would roll back the other mappings'
+recorded progress while their records stayed in the log. A partially appended batch on
+the segment engine is dead-lettered instead of replayed, since replaying would append the
+records a second time.
 
 ## Transaction summaries
 

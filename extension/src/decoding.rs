@@ -38,7 +38,11 @@ unsafe extern "C-unwind" fn begin(
     ctx: *mut pg_sys::LogicalDecodingContext,
     txn: *mut pg_sys::ReorderBufferTXN,
 ) {
-    emit(ctx, &format!(r#"{{"v":2,"op":"B","xid":{}}}"#, (*txn).xid));
+    // `end`: the commit record's end LSN, which keys each mapping's delivered position.
+    emit(
+        ctx,
+        &format!(r#"{{"v":2,"op":"B","xid":{},"end":{}}}"#, (*txn).xid, (*txn).end_lsn),
+    );
 }
 
 #[pg_guard]
@@ -86,9 +90,14 @@ unsafe extern "C-unwind" fn change(
 
     let tp = (*change).data.tp;
     let cols_json = columns_json(desc);
-    let new_json = tuple_json(heap_tuple(tp.newtuple), desc);
     // `old` is present only when the table's REPLICA IDENTITY provides it; the default gives the key columns alone.
-    let old_json = tuple_json(heap_tuple(tp.oldtuple), desc);
+    let old_tuple = heap_tuple(tp.oldtuple);
+    // Only FULL logs every column of the old tuple; under DEFAULT or INDEX a key change logs
+    // the key columns and NULL for the rest.
+    let full = class.relreplident as u8 == pg_sys::REPLICA_IDENTITY_FULL;
+    let fallback = if full { old_tuple } else { std::ptr::null_mut() };
+    let new_json = tuple_json(heap_tuple(tp.newtuple), desc, fallback);
+    let old_json = tuple_json(old_tuple, desc, std::ptr::null_mut());
 
     // `ts` is the transaction's commit timestamp from the commit WAL record — always
     // present; `track_commit_timestamp` only backs pg_xact_commit_timestamp(). Microseconds.
@@ -134,8 +143,13 @@ unsafe fn columns_json(desc: pg_sys::TupleDesc) -> String {
     out
 }
 
-/// A tuple as `{"col":"text value"}`, or `null`.
-unsafe fn tuple_json(tuple: pg_sys::HeapTuple, desc: pg_sys::TupleDesc) -> String {
+/// A tuple as `{"col":"text value"}`, or `null`. A column whose value the WAL does not carry
+/// is taken from `fallback` when that has it, and otherwise left out of the object.
+unsafe fn tuple_json(
+    tuple: pg_sys::HeapTuple,
+    desc: pg_sys::TupleDesc,
+    fallback: pg_sys::HeapTuple,
+) -> String {
     if tuple.is_null() {
         return "null".to_string();
     }
@@ -150,7 +164,24 @@ unsafe fn tuple_json(tuple: pg_sys::HeapTuple, desc: pg_sys::TupleDesc) -> Strin
         let name = name_lossy(&att.attname);
 
         let mut is_null = false;
-        let datum = pg_sys::heap_getattr(tuple, att.attnum as _, desc, &mut is_null);
+        let mut datum = pg_sys::heap_getattr(tuple, att.attnum as _, desc, &mut is_null);
+
+        // The type's own output function; inferring from the JSON side would mangle types like `numeric`.
+        let mut typoutput = pg_sys::Oid::INVALID;
+        let mut typisvarlena = false;
+        pg_sys::getTypeOutputInfo(att.atttypid, &mut typoutput, &mut typisvarlena);
+
+        // An UPDATE that leaves a TOASTed column alone logs only its on-disk pointer. REPLICA
+        // IDENTITY FULL logs the old tuple flattened; otherwise the column is left out.
+        if !is_null && typisvarlena && is_external_ondisk(datum) {
+            if fallback.is_null() {
+                continue;
+            }
+            datum = pg_sys::heap_getattr(fallback, att.attnum as _, desc, &mut is_null);
+            if !is_null && is_external_ondisk(datum) {
+                continue;
+            }
+        }
 
         if !first {
             out.push(',');
@@ -160,17 +191,6 @@ unsafe fn tuple_json(tuple: pg_sys::HeapTuple, desc: pg_sys::TupleDesc) -> Strin
         out.push(':');
 
         if is_null {
-            out.push_str("null");
-            continue;
-        }
-
-        // The type's own output function; inferring from the JSON side would mangle types like `numeric`.
-        let mut typoutput = pg_sys::Oid::INVALID;
-        let mut typisvarlena = false;
-        pg_sys::getTypeOutputInfo(att.atttypid, &mut typoutput, &mut typisvarlena);
-
-        // An unchanged TOASTed value is not in the WAL — an UPDATE logs only an external pointer,
-        if typisvarlena && is_external_ondisk(datum) {
             out.push_str("null");
             continue;
         }

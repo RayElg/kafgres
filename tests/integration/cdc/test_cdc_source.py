@@ -20,7 +20,7 @@ import subprocess
 import time
 
 import pytest
-from support.docker import REPO, psql, query as sql
+from support.docker import REPO, client_network, psql, query as sql
 
 
 def set_guc(name, value):
@@ -34,7 +34,7 @@ def consume(topic, timeout=25):
     ordinary Kafka records, and only a client that never heard of Postgres can establish it.
     """
     out = subprocess.run(
-        ["docker", "run", "--rm", "--network", "host", "kafgres-clients",
+        ["docker", "run", "--rm", "--network", client_network(), "kafgres-clients",
          "kcat", "-b", "127.0.0.1:9092", "-C", "-t", topic, "-o", "beginning", "-e",
          "-f", "%p\t%k\t%s\n"],
         capture_output=True, text=True, timeout=timeout, cwd=REPO,
@@ -213,7 +213,7 @@ def test_the_brokers_own_tables_are_not_decoded():
     baseline = len(consume("src-events"))
 
     produced = subprocess.run(
-        ["docker", "run", "--rm", "-i", "--network", "host", "kafgres-clients",
+        ["docker", "run", "--rm", "-i", "--network", client_network(), "kafgres-clients",
          "kcat", "-b", "127.0.0.1:9092", "-P", "-t", "src-events", "-p", "0"],
         input="direct\n", capture_output=True, text=True, timeout=30, cwd=REPO,
     )
@@ -287,13 +287,20 @@ def test_on_error_stall_holds_the_slot_where_it_was():
                  "WHERE slot_name='kafgres_cdc'")
     sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','oops')")
 
+    # A WARNING, not an ERROR: an error would roll back what other mappings delivered in
+    # the same drain while their appends stayed in the log.
     out = psql("SELECT kafgres_cdc_drain()")
-    assert out.returncode != 0, "a stalling mapping reported success"
-    assert "stopped the CDC slot" in out.stderr, out.stderr[-400:]
+    assert out.returncode == 0, out.stderr[-400:]
+    assert "WARNING" in out.stderr and "stopped the CDC slot" in out.stderr, out.stderr[-400:]
 
+    # The slot may move up to the stalled transaction, past earlier ones that rendered
+    # nothing, but never past it: the change must still be there to replay.
     after = sql("SELECT confirmed_flush_lsn FROM pg_replication_slots "
                 "WHERE slot_name='kafgres_cdc'")
-    assert after == before, f"the slot advanced past an unrendered change: {before} -> {after}"
+    assert sql(f"SELECT '{after}'::pg_lsn >= '{before}'::pg_lsn") == "t", (before, after)
+    held = sql("SELECT count(*) FROM pg_logical_slot_peek_changes('kafgres_cdc', NULL, NULL) "
+               "WHERE data LIKE '%\"table\":\"src_orders\"%' AND data LIKE '%oops%'")
+    assert held == "1", f"the slot advanced past an unrendered change: {before} -> {after}"
 
     sql("UPDATE src_orders SET note = '7' WHERE id = 10")
     sql("UPDATE kafgres_cdc_mappings SET on_error = 'skip'")
@@ -350,9 +357,9 @@ def test_an_unchanged_toasted_column_does_not_crash_the_decoder():
     """The WAL carries a TOAST pointer, not the value, for a column an UPDATE did not touch.
 
     Passing that pointer to the type's output function is a toast fetch under a historic
-    snapshot. The plugin guards it and emits null instead, which is indistinguishable from a
-    real NULL — a limitation pgoutput shares. What must not happen is the decoder returning
-    the pointer's bytes or failing.
+    snapshot. Without REPLICA IDENTITY FULL the plugin leaves the column out, so `new` reads
+    NULL and `toast_unchanged` names the column. What must not happen is the decoder
+    returning the pointer's bytes or failing.
 
     This is the shape of bug no amount of INSERT/UPDATE/DELETE on short rows will produce.
     """
@@ -541,3 +548,145 @@ def test_a_jsonb_column_is_not_double_encoded(fixtures):
     assert drain() == 1
 
     assert values(consume("src-events")) == [{"p": {"a": 1}}], values(consume("src-events"))
+
+def drain_warning():
+    out = psql("SELECT kafgres_cdc_drain()")
+    assert out.returncode == 0, out.stderr[-500:]
+    return int(out.stdout.strip() or 0), out.stderr
+
+def test_a_stalled_mapping_does_not_replay_the_others():
+    """The slot is held for a stalled mapping, but each healthy one gets each change once.
+
+    The drain used to produce every mapping in turn and advance only if all succeeded, so
+    a mapping that sorted before the stalled one re-produced the whole batch on every tick
+    while the stall lasted.
+    """
+    sql("SELECT kafgres_drop_topic('src-stall')")
+    sql("SELECT kafgres_create_topic('src-stall', 1)")
+    try:
+        add_mapping("jsonb_build_object('id', new.id)", name="a_ok")
+        add_mapping("jsonb_build_object('n', 1 / (new.id - 2))", name="b_stall",
+                    topic="src-stall")
+        sql("UPDATE kafgres_cdc_mappings SET on_error = 'stall' WHERE mapping_name = 'b_stall'")
+        start_slot()
+
+        sql("INSERT INTO src_orders VALUES (1,1,1,'placed','x')")
+        assert drain() == 2
+        sql("INSERT INTO src_orders VALUES (2,1,1,'placed','x')")
+        sql("INSERT INTO src_orders VALUES (3,1,1,'placed','x')")
+        for _ in range(3):
+            _, err = drain_warning()
+            assert "b_stall" in err and "stopped the CDC slot" in err, err[-400:]
+
+        assert sorted(int(k) for _, k, _ in consume("src-events")) == [1, 2, 3], (
+            "the healthy mapping was re-produced while the other one stalled"
+        )
+        # A stalling render fails for its whole chunk, so b_stall delivered neither change.
+        assert [v["n"] for v in values(consume("src-stall"))] == [-1]
+        held = sql("SELECT count(*) FROM pg_logical_slot_peek_changes('kafgres_cdc', NULL, NULL) "
+                   "WHERE data::jsonb->>'op' IN ('I','U','D')")
+        assert held == "2", f"the slot is not held for the stalled mapping: {held} change(s) left"
+
+        add_mapping("jsonb_build_object('n', new.id)", name="b_stall", topic="src-stall")
+        n, err = drain_warning()
+        assert "stopped" not in err, err[-400:]
+        assert n == 2, "only the stalled mapping's changes should have been produced"
+        assert sorted(int(k) for _, k, _ in consume("src-events")) == [1, 2, 3]
+        assert [v["n"] for v in values(consume("src-stall"))] == [-1, 2, 3]
+    finally:
+        sql("SELECT kafgres_drop_topic('src-stall')")
+
+def test_an_unchanged_toasted_column_is_marked_without_full_identity():
+    add_mapping("jsonb_build_object('id', new.id, 'note_len', length(new.note), "
+                "'unavailable', 'note' = ANY(toast_unchanged), 'status', new.status)")
+    start_slot()
+
+    sql("INSERT INTO src_orders VALUES (10,1,1,'placed', "
+        "(SELECT string_agg(md5(random()::text), '') FROM generate_series(1,2000)))")
+    sql("UPDATE src_orders SET status = 'shipped' WHERE id = 10")
+    # A key change logs an old tuple too, but with NULL for every non-key column.
+    sql("UPDATE src_orders SET id = 11 WHERE id = 10")
+    assert drain() == 3
+
+    vs = sorted(values(consume("src-events")), key=lambda v: (v["id"], v["status"]))
+    assert vs[0] == {"id": 10, "note_len": 64000, "unavailable": False, "status": "placed"}, vs
+    assert vs[1] == {"id": 10, "note_len": None, "unavailable": True, "status": "shipped"}, vs
+    assert vs[2] == {"id": 11, "note_len": None, "unavailable": True, "status": "shipped"}, vs
+
+def test_replica_identity_full_streams_an_unchanged_toasted_column_exactly():
+    """Under REPLICA IDENTITY FULL the old tuple carries the value, so the streamed record
+    matches a snapshot of the same row."""
+    sql("ALTER TABLE src_orders REPLICA IDENTITY FULL")
+    add_mapping("jsonb_build_object('id', new.id, 'status', new.status, "
+                "'note_md5', md5(new.note), 'unavailable', toast_unchanged)")
+    start_slot()
+
+    sql("INSERT INTO src_orders VALUES (10,1,1,'placed', "
+        "(SELECT string_agg(md5(random()::text), '') FROM generate_series(1,2000)))")
+    sql("UPDATE src_orders SET status = 'shipped' WHERE id = 10")
+    assert drain() == 2
+    streamed = values(consume("src-events"))[1]
+
+    sql("SELECT kafgres_snapshot_mapping('m1')")
+    assert sql("SELECT kafgres_cdc_snapshot()") == "1"
+    snapshot = values(consume("src-events"))[2]
+
+    expected = sql("SELECT md5(note) FROM src_orders WHERE id = 10")
+    assert streamed["note_md5"] == expected, streamed
+    assert streamed == snapshot, (streamed, snapshot)
+
+def test_a_transaction_renders_in_bounded_chunks_in_order():
+    """One transaction's changes to a table no longer become one jsonb value.
+
+    That value has a 256 MB cap, so a large enough transaction failed every peek and
+    wedged the slot for every mapping. With the chunk bound lowered to its 1 kB minimum,
+    a transaction of a few hundred rows straddling a DROP COLUMN renders in many chunks,
+    each in its own worker transaction, and arrives once each, in commit order.
+    """
+    add_mapping("jsonb_build_object('id', new.id, 'tx', pg_current_xact_id()::text)",
+                key_expr=None)
+    start_slot()
+    set_guc("kafgres.cdc_chunk_bytes", "1024")
+    try:
+        sql("BEGIN; "
+            "INSERT INTO src_orders SELECT g, 1, 1, 'placed', repeat('n', 100) "
+            "  FROM generate_series(1, 200) g; "
+            "ALTER TABLE src_orders DROP COLUMN note; "
+            "INSERT INTO src_orders SELECT g, 1, 1, 'placed' FROM generate_series(201, 300) g; "
+            "COMMIT")
+        sql("INSERT INTO src_orders VALUES (301, 1, 1, 'canary')")
+        set_guc("kafgres.cdc_interval_ms", "200")
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            rows = consume("src-events")
+            if len(rows) >= 301:
+                break
+            time.sleep(1)
+        else:
+            pytest.fail(f"the worker produced {len(rows)} of 301 records")
+    finally:
+        set_guc("kafgres.cdc_interval_ms", "0")
+        set_guc("kafgres.cdc_chunk_bytes", "16777216")
+        time.sleep(1)
+
+    vs = values(rows)
+    assert [v["id"] for v in vs] == list(range(1, 302)), "records duplicated, lost or reordered"
+    assert len({v["tx"] for v in vs[:300]}) > 2, "the transaction was rendered in one piece"
+
+@pytest.mark.skipif(not os.environ.get("KAFGRES_SLOW_TESTS"),
+                    reason="writes ~300 MB of WAL; set KAFGRES_SLOW_TESTS=1")
+def test_a_transaction_over_the_jsonb_limit_drains():
+    """The ticket's case at full size: past 256 MB of decoded changes to one table."""
+    sql("CREATE TABLE IF NOT EXISTS big (id int primary key, body text)")
+    try:
+        add_mapping("jsonb_build_object('id', new.id, 'len', length(new.body))",
+                    source="public.big", name="big")
+        start_slot()
+        sql("INSERT INTO big SELECT g, (SELECT string_agg(md5(random()::text || g), '') "
+            "FROM generate_series(1, 32768)) FROM generate_series(1, 300) g", timeout=600)
+        sql("INSERT INTO big VALUES (0, 'canary')")
+        out = psql("SELECT kafgres_cdc_drain()", timeout=1200)
+        assert out.returncode == 0, out.stderr[-500:]
+        assert int(out.stdout.strip()) == 301
+    finally:
+        sql("DROP TABLE IF EXISTS big")
