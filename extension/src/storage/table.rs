@@ -754,6 +754,7 @@ impl LogStore for TableStore {
         _topic: TopicId,
         _partition: i32,
         _batch: RawBatch,
+        _reserve: bool,
     ) -> StoreResult<(i64, i64)> {
         Err(StoreError::NotImplemented(
             "transactional produce on the table engine (set kafgres.storage_engine = 'segment')",

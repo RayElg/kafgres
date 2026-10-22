@@ -17,8 +17,8 @@ pub fn open() -> Box<dyn LogStore> {
 }
 
 /// Release an uncommitted produce reservation, on commit or abort. Cannot fail: it
-pub fn release_pending(topic: TopicId, partition: i32) {
-    segment::SegmentStore::release_pending(topic, partition);
+pub fn release_pending(topic: TopicId, partition: i32, base: i64) {
+    segment::SegmentStore::release_pending(topic, partition, base);
 }
 
 /// Set in the broker worker only. A backend running `kafgres_enforce_retention()` stalls
@@ -145,13 +145,14 @@ impl Judge {
         if segment::is_marker_backed(batch.as_bytes()) {
             // No marker means aborted only once the snapshot sees the writer finished: the
             // live LSO can pass a commit a REPEATABLE READ snapshot does not see. The producer
-            // id is the top-level xid; the marker's subtransaction may have rolled back.
-            match pmeta::marker_state(self.topic, self.partition, base, batch.producer_id())? {
+            // id encodes the top-level xid; the marker's subtransaction may have rolled back.
+            let xid = crate::produce_sql::xid_of_sql_producer_id(batch.producer_id());
+            match pmeta::marker_state(self.topic, self.partition, base, xid)? {
                 (true, _) => Ok(true),
                 (false, true) => Ok(false),
                 (false, false) => Err(StoreError::Io(format!(
                     "transaction {} below the LSO is not yet visible to this snapshot",
-                    batch.producer_id()
+                    xid
                 ))),
             }
         } else {
@@ -464,6 +465,7 @@ pub trait LogStore: Send {
         _topic: TopicId,
         _partition: i32,
         _batch: RawBatch,
+        _reserve: bool,
     ) -> StoreResult<(i64, i64)> {
         Err(StoreError::NotImplemented("transactional produce"))
     }

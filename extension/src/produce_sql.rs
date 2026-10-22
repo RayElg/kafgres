@@ -87,10 +87,13 @@ fn kafgres_produce(
         None => 0,
     };
 
-    // One `producerId` per transaction, taken from the xid: the aborted list is keyed by it.
     // What `pg_current_xact_id()` calls, without the SPI round trip; both assign a
     // top-level xid if none. SAFETY: called inside a transaction, which `#[pg_extern]` is.
-    let producer_id: i64 = unsafe { pg_sys::GetTopFullTransactionId().value as i64 };
+    let xid: i64 = unsafe { pg_sys::GetTopFullTransactionId().value as i64 };
+    // SAFETY: as above.
+    let subid = unsafe { pg_sys::GetCurrentSubTransactionId() };
+    // Decided before the append: a batch must never carry a pre-rollback producer id.
+    let (producer_id, reserve) = enter_produce(xid, subid, topic_id, partition);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -128,21 +131,27 @@ fn kafgres_produce(
 
     // Through the factory: whether an engine supports this is the engine's call.
     let mut store = crate::storage::open();
-    let (base_offset, last_offset) = match store.append_pending(topic_id, partition, raw) {
-        Ok(v) => v,
-        Err(e) => error!("kafgres: produce failed: {e}"),
-    };
+    let (base_offset, last_offset) =
+        match store.append_pending(topic_id, partition, raw, reserve) {
+            Ok(v) => v,
+            Err(e) => error!("kafgres: produce failed: {e}"),
+        };
 
-    // Release on both commit and abort, so an aborted reservation does not pin the LSO.
+    // One reservation per transaction and partition, at its first offset, released on both
+    // commit and abort so an aborted reservation does not pin the LSO.
     // Registered before the marker INSERT: an ERROR there re-raises as a panic at the
     // FFI boundary, skipping the `Err` branch below, so the release must already be armed.
-    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Commit, move || {
-        crate::storage::release_pending(topic_id, partition);
-    });
-    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Abort, move || {
-        crate::storage::release_pending(topic_id, partition);
-    });
-    owe_sync(producer_id, topic_id, partition);
+    if reserve {
+        pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Commit, move || {
+            crate::storage::release_pending(topic_id, partition, base_offset);
+        });
+        pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Abort, move || {
+            crate::storage::release_pending(topic_id, partition, base_offset);
+        });
+        // Only once armed: a later append that skips reserving relies on this one.
+        PRODUCING.with(|s| s.borrow_mut().reserved.insert((topic_id, partition)));
+    }
+    owe_sync(xid, topic_id, partition);
 
     // Payload is already in the segment; on failure the abort callback above
     // releases the reservation.
@@ -166,6 +175,99 @@ fn kafgres_produce(
 thread_local! {
     /// Partitions the current transaction appended to, keyed by its top-level xid.
     static SYNC_OWED: RefCell<(i64, HashSet<(u32, i32)>)> = RefCell::new((0, HashSet::new()));
+
+    static PRODUCING: RefCell<Producing> = RefCell::new(Producing::default());
+}
+
+/// The current top-level transaction's produce state.
+#[derive(Default)]
+struct Producing {
+    xid: i64,
+    /// Partitions holding this transaction's LSO reservation.
+    reserved: HashSet<(u32, i32)>,
+    /// Bumped when a subtransaction that produced rolls back; part of the producer id.
+    generation: i64,
+    /// Highest subtransaction that produced under `generation`, 0 if none.
+    max_subid: pg_sys::SubTransactionId,
+    hooked: bool,
+}
+
+/// Bits of a generation-tagged producer id below the generation. Bit 62 flags the tag, so an
+/// untagged id is the xid itself.
+const XID_BITS: u32 = 40;
+const GENERATION_FLAG: i64 = 1 << 62;
+const MAX_GENERATION: i64 = (1 << (62 - XID_BITS)) - 1;
+
+/// The producer id of a batch appended under `generation` of transaction `xid`.
+///
+/// A Kafka client drops every batch of a producer id from an aborted first offset until an
+/// abort marker, which an orphan of a rolled-back savepoint never gets. Batches produced
+/// while that subtransaction was open all rolled back with it, so changing the producer id
+/// at its rollback keeps every later batch of the transaction out of the aborted range.
+fn sql_producer_id(xid: i64, generation: i64) -> Option<i64> {
+    if generation == 0 {
+        return Some(xid);
+    }
+    if xid >> XID_BITS != 0 || generation > MAX_GENERATION {
+        return None;
+    }
+    Some(GENERATION_FLAG | (generation << XID_BITS) | xid)
+}
+
+/// The top-level xid behind a `kafgres_produce()` batch's producer id.
+pub fn xid_of_sql_producer_id(producer_id: i64) -> i64 {
+    if producer_id & GENERATION_FLAG != 0 {
+        producer_id & ((1 << XID_BITS) - 1)
+    } else {
+        producer_id
+    }
+}
+
+/// The producer id for this call, and whether it must reserve the partition's LSO.
+fn enter_produce(
+    xid: i64,
+    subid: pg_sys::SubTransactionId,
+    topic: u32,
+    partition: i32,
+) -> (i64, bool) {
+    let (generation, reserve, hook) = PRODUCING.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.xid != xid {
+            *s = Producing { xid, ..Producing::default() };
+        }
+        s.max_subid = s.max_subid.max(subid);
+        let hook = !s.hooked;
+        s.hooked = true;
+        (s.generation, !s.reserved.contains(&(topic, partition)), hook)
+    });
+    if hook {
+        // pgrx drops subtransaction hooks at top-level commit or abort.
+        pgrx::register_subxact_callback(
+            pgrx::PgSubXactCallbackEvent::AbortSub,
+            move |subid, _parent| rolled_back(xid, subid),
+        );
+    }
+    match sql_producer_id(xid, generation) {
+        Some(id) => (id, reserve),
+        None => error!(
+            "kafgres_produce(): too many rolled-back savepoints that produced in transaction {xid}"
+        ),
+    }
+}
+
+/// Every subtransaction with an id at or above `subid` is `subid` or its descendant, and
+/// rolls back with it.
+fn rolled_back(xid: i64, subid: pg_sys::SubTransactionId) {
+    PRODUCING.with(|s| {
+        // Runs in abort processing, where a panic is a PANIC.
+        let Ok(mut s) = s.try_borrow_mut() else {
+            return;
+        };
+        if s.xid == xid && s.max_subid >= subid {
+            s.generation += 1;
+            s.max_subid = 0;
+        }
+    });
 }
 
 /// Fsync the partition at pre-commit, once per partition per transaction. The marker is
@@ -323,4 +425,38 @@ pub fn reconcile_markers(store: &mut dyn crate::storage::LogStore) -> i64 {
         dropped += orphaned;
     }
     dropped
+}
+
+#[cfg(test)]
+mod producer_id_tests {
+    use super::*;
+
+    #[test]
+    fn generation_zero_is_the_xid_itself() {
+        assert_eq!(sql_producer_id(1234, 0), Some(1234));
+        assert_eq!(xid_of_sql_producer_id(1234), 1234);
+        let big = (1 << 50) + 7;
+        assert_eq!(xid_of_sql_producer_id(sql_producer_id(big, 0).unwrap()), big);
+    }
+
+    #[test]
+    fn each_generation_is_a_distinct_producer_id_that_decodes_to_the_xid() {
+        let xid = (3i64 << 32) | 0xdead_beef;
+        let ids: Vec<i64> = (0..4).map(|g| sql_producer_id(xid, g).unwrap()).collect();
+        for (i, a) in ids.iter().enumerate() {
+            assert!(*a >= 0, "a Kafka producer id is non-negative");
+            assert_eq!(xid_of_sql_producer_id(*a), xid);
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_ne!(sql_producer_id(xid, 1), sql_producer_id(xid + 1, 1));
+    }
+
+    #[test]
+    fn an_unencodable_generation_is_refused() {
+        assert_eq!(sql_producer_id(1 << XID_BITS, 1), None);
+        assert_eq!(sql_producer_id(5, MAX_GENERATION + 1), None);
+        assert!(sql_producer_id(5, MAX_GENERATION).is_some());
+    }
 }
