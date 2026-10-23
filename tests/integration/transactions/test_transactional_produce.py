@@ -16,7 +16,7 @@ import subprocess
 import pytest
 from support.docker import REPO, psql, query as sql, CLIENTS
 
-BROKER = "127.0.0.1:9092"
+BROKER = f"{os.environ.get('KAFGRES_HOST', '127.0.0.1')}:9092"
 
 def compose(*args, timeout=180, check=False):
     out = subprocess.run(["docker", "compose", *args], capture_output=True,
@@ -244,6 +244,228 @@ def test_an_uncommitted_produce_does_not_block_the_partition(topic):
         holder.stdin.flush()
         holder.stdin.close()
         holder.wait(timeout=60)
+
+class Session:
+    """One psql backend held open, so transactions can interleave."""
+
+    DONE = b"__kafgres_done__"
+
+    def __init__(self):
+        # stderr has its own pipe: `docker compose exec` forwards the two streams
+        # separately, so an ERROR can arrive after the stdout marker if they are merged.
+        self.proc = subprocess.Popen(
+            ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres",
+             "-d", "postgres", "-X", "-q", "-tA"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=REPO,
+        )
+
+    def run(self, statement, timeout=60):
+        """Output of `statement`; raises on an ERROR, which leaves the session usable."""
+        import select
+        import time
+
+        done = self.DONE.decode()
+        # Without the `;` psql only buffers the statement, and the markers run at once.
+        statement = statement.rstrip()
+        if not statement.endswith(";"):
+            statement += ";"
+        self.proc.stdin.write(f"{statement}\n\\echo {done}\n\\warn {done}\n".encode())
+        self.proc.stdin.flush()
+        bufs = {self.proc.stdout.fileno(): b"", self.proc.stderr.fileno(): b""}
+        deadline = time.time() + timeout
+        while any(self.DONE not in b for b in bufs.values()):
+            pending = [fd for fd, b in bufs.items() if self.DONE not in b]
+            left = deadline - time.time()
+            ready = select.select(pending, [], [], max(left, 0))[0] if left > 0 else []
+            if not ready:
+                raise AssertionError(f"psql did not finish {statement!r}: {bufs!r}")
+            for fd in ready:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    raise AssertionError(f"psql exited during {statement!r}: {bufs!r}")
+                bufs[fd] += chunk
+        self.last = bufs
+        out = bufs[self.proc.stdout.fileno()].split(self.DONE)[0].decode()
+        err = bufs[self.proc.stderr.fileno()].split(self.DONE)[0].decode()
+        if any(level in err or level in out for level in ("ERROR", "FATAL", "PANIC")):
+            raise AssertionError(f"{statement!r}: {err}{out}")
+        return out.strip()
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=60)
+        except Exception:
+            self.proc.kill()
+
+@pytest.fixture
+def sessions():
+    opened = []
+
+    def open_one():
+        s = Session()
+        opened.append(s)
+        return s
+
+    yield open_one
+    for s in opened:
+        s.close()
+
+def produce_in(session, topic, value):
+    out = session.run(f"SELECT kafgres_produce('{topic}', 'k', '{value}')")
+    try:
+        return int(out)
+    except ValueError:
+        raise AssertionError(f"produce of {value!r} printed no offset: {session.last!r}") from None
+
+def committed(topic):
+    return list(consume(topic).values())
+
+def test_a_commit_is_visible_while_a_later_transaction_is_open(topic, sessions):
+    """RAY-5: only a still-open transaction holds the LSO back, as in Kafka."""
+    t = [sessions() for _ in range(4)]
+    for s in t:
+        s.run("BEGIN")
+    assert produce_in(t[0], topic, "T1") == 0
+    assert produce_in(t[1], topic, "T2") == 1
+    t[0].run("COMMIT")
+    assert committed(topic) == ["T1"]
+    produce_in(t[2], topic, "T3")
+    t[1].run("COMMIT")
+    assert committed(topic) == ["T1", "T2"]
+    produce_in(t[3], topic, "T4")
+    t[2].run("COMMIT")
+    assert committed(topic) == ["T1", "T2", "T3"]
+    t[3].run("COMMIT")
+    assert committed(topic) == ["T1", "T2", "T3", "T4"]
+
+def test_a_later_commit_waits_for_an_earlier_open_transaction(topic, sessions):
+    a, b = sessions(), sessions()
+    a.run("BEGIN")
+    b.run("BEGIN")
+    produce_in(a, topic, "early")
+    produce_in(b, topic, "late")
+    b.run("COMMIT")
+    assert committed(topic) == [], "the LSO passed a transaction that is still open"
+    a.run("COMMIT")
+    assert committed(topic) == ["early", "late"]
+
+def test_a_rollback_and_a_savepoint_rollback_release_their_hold(topic, sessions):
+    a, b, c = sessions(), sessions(), sessions()
+    for s in (a, b, c):
+        s.run("BEGIN")
+    produce_in(a, topic, "rolled-back")
+    b.run("SAVEPOINT s")
+    produce_in(b, topic, "savepoint-only")
+    b.run("ROLLBACK TO SAVEPOINT s")
+    produce_in(c, topic, "kept")
+    a.run("ROLLBACK")
+    b.run("COMMIT")
+    assert committed(topic) == [], "the third transaction is still open"
+    c.run("COMMIT")
+    assert committed(topic) == ["kept"]
+
+def test_several_produces_in_one_transaction_hold_the_lso_once(topic, sessions):
+    """Many produces of one transaction take one reservation, so the partition does not
+    fall back to the conservative mark."""
+    a, b = sessions(), sessions()
+    a.run("BEGIN")
+    for i in range(50):
+        produce_in(a, topic, f"a{i}")
+    b.run("BEGIN")
+    produce_in(b, topic, "b")
+    a.run("COMMIT")
+    assert committed(topic) == [f"a{i}" for i in range(50)]
+    b.run("COMMIT")
+
+def list_offsets_latest(conn, topic, isolation_level):
+    """ListOffsets v2 LATEST for partition 0: (error_code, offset)."""
+    import struct
+    from conftest import LIST_OFFSETS
+
+    t = topic.encode()
+    body = struct.pack(">ib", -1, isolation_level)
+    body += struct.pack(">i", 1) + struct.pack(">h", len(t)) + t
+    body += struct.pack(">i", 1) + struct.pack(">iq", 0, -1)
+    conn.send(LIST_OFFSETS, 2, 7, body=body)
+    resp = conn.recv()
+    pos = 4 + 4 + 4                   # correlation, throttle, topics count
+    pos += 2 + struct.unpack_from(">h", resp, pos)[0]
+    pos += 4                          # partitions count
+    _idx, err, _ts, offset = struct.unpack_from(">ihqq", resp, pos)
+    return err, offset
+
+def test_read_committed_list_offsets_latest_is_the_lso(topic, sessions, conn):
+    """RAY-10: ListOffsets and Fetch share one bound, with a SQL transaction open."""
+    done = sessions()
+    done.run(f"SELECT kafgres_produce('{topic}', 'k', 'done')")
+    held = sessions()
+    held.run("BEGIN")
+    produce_in(held, topic, "held")
+    assert list_offsets_latest(conn, topic, 1) == (0, 1)
+    assert list_offsets_latest(conn, topic, 0) == (0, 2)
+    assert committed(topic) == ["done"]
+    held.run("COMMIT")
+    assert list_offsets_latest(conn, topic, 1) == (0, 2)
+
+def test_a_rolled_back_savepoint_hides_no_later_record(topic, sessions):
+    """RAY-9: the orphan's aborted range must not cover the transaction's later records."""
+    s = sessions()
+    s.run("BEGIN")
+    produce_in(s, topic, "a1")
+    s.run("SAVEPOINT x")
+    produce_in(s, topic, "a2")
+    s.run("ROLLBACK TO SAVEPOINT x")
+    produce_in(s, topic, "a3")
+    s.run("COMMIT")
+    assert committed(topic) == ["a1", "a3"]
+    assert list(consume(topic, "read_uncommitted").values()) == ["a1", "a2", "a3"]
+
+def test_a_rolled_back_first_produce_hides_no_later_record(topic, sessions):
+    s = sessions()
+    s.run("BEGIN")
+    s.run("SAVEPOINT x")
+    produce_in(s, topic, "dropped")
+    s.run("ROLLBACK TO SAVEPOINT x")
+    produce_in(s, topic, "kept")
+    s.run("SAVEPOINT y")
+    produce_in(s, topic, "dropped-too")
+    s.run("SAVEPOINT z")
+    produce_in(s, topic, "nested")
+    s.run("RELEASE SAVEPOINT z")
+    s.run("ROLLBACK TO SAVEPOINT y")
+    produce_in(s, topic, "kept-too")
+    s.run("COMMIT")
+    assert committed(topic) == ["kept", "kept-too"]
+
+def test_a_released_savepoint_keeps_every_record(topic, sessions):
+    s = sessions()
+    s.run("BEGIN")
+    produce_in(s, topic, "a1")
+    s.run("SAVEPOINT x")
+    produce_in(s, topic, "a2")
+    s.run("RELEASE SAVEPOINT x")
+    produce_in(s, topic, "a3")
+    s.run("COMMIT")
+    assert committed(topic) == ["a1", "a2", "a3"]
+
+def test_an_exception_block_that_produced_hides_no_later_record(topic):
+    out = script(f"""
+        BEGIN;
+        DO $$
+        BEGIN
+          BEGIN
+            PERFORM kafgres_produce('{topic}', 'k', 'caught');
+            RAISE EXCEPTION 'undo';
+          EXCEPTION WHEN raise_exception THEN NULL;
+          END;
+          PERFORM kafgres_produce('{topic}', 'k', 'after');
+        END $$;
+        COMMIT;
+    """)
+    assert out.returncode == 0, out.stderr
+    assert committed(topic) == ["after"]
 
 def test_a_marker_whose_payload_did_not_survive_is_dropped_loudly(topic):
     """The two-durability-domain seam.
