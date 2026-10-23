@@ -1,0 +1,3 @@
+-- kafgres 0.3.0 -> 0.3.1.
+--
+-- No SQL change. Present so ALTER EXTENSION kafgres UPDATE has a path.

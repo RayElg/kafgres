@@ -157,6 +157,10 @@ From 0.2.0, the first start on the segment engine removes the log's old-format
 `.timeindex` files. Nothing is lost: timestamp lookups scan the segments written before
 the upgrade instead, and segments written after it are indexed.
 
+From 0.3.0, transaction markers written before 0.3.1 carry no `EndTransactionMarker`
+value, which Sarama fails to decode. They stay until retention removes their segments.
+A Sarama consumer can start past the last such marker, or the topic can be recreated.
+
 ## CDC without Debezium
 
 A table's changes reach a topic without Kafka Connect, a second JVM, or a network hop.
