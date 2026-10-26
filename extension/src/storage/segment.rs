@@ -2842,7 +2842,7 @@ mod tests {
     /// Only a produce v12+ append at the current epoch may begin a transaction.
     #[pg_test]
     fn pg_only_a_verified_append_joins_a_transaction() {
-        use crate::handlers::txn::{add_partition_from_produce, verify_produce, ProduceTxn};
+        use crate::handlers::txn::{begin_or_continue, verify_produce, ProduceTxn};
         use kafgres_codec::errors::ErrorCode;
 
         crate::ensure_tables_exist();
@@ -2890,10 +2890,15 @@ mod tests {
 
         assert_eq!(verify(1, 10), ProduceTxn::Refused(ErrorCode::InvalidTxnState));
         assert_eq!(verify(1, 11), ProduceTxn::Refused(ErrorCode::TransactionAbortable));
-        assert_eq!(verify(1, 12), ProduceTxn::AddsPartition);
+        let begin = || match verify(1, 12) {
+            ProduceTxn::AddsPartition(admitted) => {
+                begin_or_continue(admitted, "pg-register").expect("begin failed")
+            }
+            other => panic!("v12 at the current epoch: {other:?}"),
+        };
         assert_eq!(state(), "empty", "verification alone must not begin a transaction");
 
-        add_partition_from_produce(424242, 1, "pg-register", topic, 0).expect("add failed");
+        begin();
         crate::storage::pmeta::register_txn_partition(424242, topic, 0, 7)
             .expect("register failed");
         assert_eq!(state(), "ongoing", "the v12 append begins the transaction");
@@ -2915,8 +2920,7 @@ mod tests {
         Spi::run("UPDATE kafgres_txns SET state = 'committed' WHERE producer_id = 424242")
             .expect("state update failed");
         assert_eq!(verify(1, 10), ProduceTxn::Refused(ErrorCode::InvalidTxnState));
-        assert_eq!(verify(1, 12), ProduceTxn::AddsPartition);
-        add_partition_from_produce(424242, 1, "pg-register", topic, 0).expect("add failed");
+        begin();
         crate::storage::pmeta::register_txn_partition(424242, topic, 0, 11)
             .expect("third register failed");
         assert_eq!(state(), "ongoing");

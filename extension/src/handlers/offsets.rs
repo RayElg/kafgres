@@ -144,31 +144,32 @@ fn validate_consumer_group(
     transactional: bool,
     version: i16,
 ) -> Result<GroupVerdict, spi::Error> {
-    let members: i64 = Spi::get_one_with_args(
-        "SELECT count(*) FROM kafgres_consumer_group_members WHERE group_id = $1",
-        &[c.group_id.into()],
-    )?
-    .unwrap_or(0);
+    let (members, row) = Spi::connect(|client| {
+        let rows = client.select(
+            "SELECT (SELECT count(*) FROM kafgres_consumer_group_members WHERE group_id = $1),
+                    m.member_epoch, m.owned || m.granted
+               FROM (SELECT 1) one
+               LEFT JOIN kafgres_consumer_group_members m
+                 ON m.group_id = $1 AND m.member_id = $2",
+            Some(1),
+            &[c.group_id.into(), c.member_id.into()],
+        )?;
+        for row in rows {
+            let members = row.get::<i64>(1)?.unwrap_or(0);
+            let member = match row.get::<i32>(2)? {
+                Some(epoch) => Some((epoch, row.get::<Vec<String>>(3)?.unwrap_or_default())),
+                None => None,
+            };
+            return Ok::<_, spi::Error>((members, member));
+        }
+        Ok((0, None))
+    })?;
     if c.generation < 0 && members == 0 {
         return Ok(GroupVerdict::Accept);
     }
     if transactional && c.generation == -1 && c.member_id.is_empty() && c.instance_id.is_none() {
         return Ok(GroupVerdict::Accept);
     }
-    let row = Spi::connect(|client| {
-        let rows = client.select(
-            "SELECT member_epoch, owned || granted
-               FROM kafgres_consumer_group_members WHERE group_id = $1 AND member_id = $2",
-            Some(1),
-            &[c.group_id.into(), c.member_id.into()],
-        )?;
-        for row in rows {
-            let epoch = row.get::<i32>(1)?.unwrap_or(0);
-            let held = row.get::<Vec<String>>(2)?.unwrap_or_default();
-            return Ok::<_, spi::Error>(Some((epoch, held)));
-        }
-        Ok(None)
-    })?;
     let Some((epoch, held)) = row else {
         return Ok(GroupVerdict::Refuse(ErrorCode::UnknownMemberId));
     };
@@ -180,12 +181,7 @@ fn validate_consumer_group(
         std::cmp::Ordering::Greater => GroupVerdict::Refuse(ErrorCode::StaleMemberEpoch),
         // Kafka also checks the partition's assignment epoch, which is not stored here.
         std::cmp::Ordering::Less => GroupVerdict::HeldOnly(
-            held.iter()
-                .filter_map(|s| {
-                    let (t, p) = s.split_once(':')?;
-                    Some((t.parse().ok()?, p.parse().ok()?))
-                })
-                .collect(),
+            held.iter().filter_map(|s| super::consumer_group::parse_tp(s)).collect(),
         ),
     })
 }
@@ -232,9 +228,9 @@ pub fn offset_commit(
                 .err()
         });
         let resolved = meta::resolve_topic(&t.name, &t.topic_id.0)?;
-        let count = match &resolved {
-            Some(r) => meta::partition_count(r.topic_id)?,
-            None => 0,
+        let count = match (&resolved, denied) {
+            (Some(r), None) => meta::partition_count(r.topic_id)?,
+            _ => 0,
         };
         let mut partitions = Vec::with_capacity(t.partitions.len());
 

@@ -10,7 +10,7 @@ use kafgres_codec::generated::produce_response::{
 
 use kafgres_codec::records::{BatchIter, RecordBatch};
 
-use super::txn::ProduceTxn;
+use super::txn::{Admitted, ProduceTxn};
 use super::HandlerError;
 use crate::meta;
 use crate::producer::{self, SequenceCheck, NO_PRODUCER_ID, NO_SEQUENCE};
@@ -173,6 +173,15 @@ pub fn handle(
     let segment = crate::storage_engine_guc() == "segment";
     LANDED.with(|l| *l.borrow_mut() = segment.then(HashMap::new));
 
+    // Outside the savepoint below: rolling it back releases row locks taken inside it, and a
+    // sweep could then abort a transaction whose batch already landed in a segment file.
+    if req.transactional_id.is_some() {
+        for producer_id in transactional_producers(req) {
+            super::txn::hold_for_produce(producer_id)
+                .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        }
+    }
+
     let attempt = crate::dbtx::atomically(
         || build(req, version, store, authz, Isolation::Shared),
         |_| Abandon::PartitionFailed,
@@ -207,6 +216,23 @@ fn any_transactional_batch(req: &ProduceRequest) -> bool {
     })
 }
 
+/// The producer ids of the request's transactional batches, sorted so locks go in one order.
+fn transactional_producers(req: &ProduceRequest) -> Vec<i64> {
+    let mut ids: Vec<i64> = req
+        .topic_data
+        .iter()
+        .flat_map(|t| t.partition_data.iter())
+        .filter_map(|p| p.records.clone())
+        .flat_map(BatchIter::new)
+        .filter_map(Result::ok)
+        .filter(|b| b.is_transactional() && !b.is_control() && b.producer_id() != NO_PRODUCER_ID)
+        .map(|b| b.producer_id())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Isolation {
     Shared,
@@ -222,7 +248,7 @@ struct Idem {
     last_seq: i32,
     transactional: bool,
     /// Produce v12+: this append adds its partition to the transaction.
-    adds_partition: bool,
+    adds_partition: Option<Admitted>,
 }
 
 /// What to do with one batch, decided before anything is written.
@@ -503,6 +529,8 @@ fn plan_partition(
         });
     };
 
+    // Once per producer and epoch in this partition, not per batch.
+    let mut verified: Vec<((i64, i16), ProduceTxn)> = Vec::new();
     for item in BatchIter::new(records.clone()) {
         let view = item.map_err(AppendError::Batch)?;
         let producer_id = view.producer_id();
@@ -513,21 +541,27 @@ fn plan_partition(
         }
         let transactional = view.is_transactional() && !view.is_control();
         // Before the window check, which lets any epoch through an empty window.
-        let adds_partition = transactional
-            && match crate::handlers::txn::verify_produce(
-                txn.transactional_id,
-                producer_id,
-                view.producer_epoch(),
-                tid,
-                index,
-                txn.version,
-            )
-            .map_err(|e| AppendError::ProducerState(e.to_string()))?
-            {
-                ProduceTxn::Added => false,
-                ProduceTxn::AddsPartition => true,
-                ProduceTxn::Refused(code) => return Err(AppendError::Txn(code)),
+        let adds_partition = if transactional {
+            let key = (producer_id, view.producer_epoch());
+            let found = match verified.iter().find(|(k, _)| *k == key) {
+                Some((_, v)) => *v,
+                None => {
+                    let v = crate::handlers::txn::verify_produce(
+                        txn.transactional_id, producer_id, key.1, tid, index, txn.version,
+                    )
+                    .map_err(|e| AppendError::ProducerState(e.to_string()))?;
+                    verified.push((key, v));
+                    v
+                }
             };
+            match found {
+                ProduceTxn::Added => None,
+                ProduceTxn::AddsPartition(admitted) => Some(admitted),
+                ProduceTxn::Refused(code) => return Err(AppendError::Txn(code)),
+            }
+        } else {
+            None
+        };
         let idem = Idem {
             producer_id,
             epoch: view.producer_epoch(),
@@ -624,20 +658,23 @@ fn reserve_partition(
     plan: &PartitionPlan,
     transactional_id: Option<&str>,
 ) -> Result<(), AppendError> {
+    let mut registered: Vec<i64> = Vec::new();
     for (_, decision) in &plan.batches {
         let Decision::Append(idem) = decision else { continue };
         producer::record(
             idem.producer_id, idem.epoch, plan.tid, plan.index, idem.first_seq, idem.last_seq, -1,
         )
         .map_err(|e| AppendError::ProducerState(e.to_string()))?;
-        if idem.adds_partition {
-            let txn_id = transactional_id.unwrap_or_default();
-            crate::handlers::txn::add_partition_from_produce(
-                idem.producer_id, idem.epoch, txn_id, plan.tid, plan.index,
-            )
-            .map_err(|e| AppendError::ProducerState(e.to_string()))?;
-        }
-        if idem.transactional {
+        if idem.transactional && !registered.contains(&idem.producer_id) {
+            registered.push(idem.producer_id);
+            // The registration below is what adds the partition.
+            if let Some(admitted) = idem.adds_partition {
+                crate::handlers::txn::begin_or_continue(
+                    admitted,
+                    transactional_id.unwrap_or_default(),
+                )
+                .map_err(|e| AppendError::ProducerState(e.to_string()))?;
+            }
             crate::storage::pmeta::register_txn_partition(
                 idem.producer_id, plan.tid, plan.index, -1,
             )

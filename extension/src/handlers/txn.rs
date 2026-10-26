@@ -53,36 +53,81 @@ impl Verdict {
     }
 }
 
+/// Proof that [`verdict`] accepted the pair, under locks held until the transaction ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Admitted {
+    producer_id: i64,
+    epoch: i16,
+}
+
 /// Check a transactional request against the producer we handed out for its transactional
 /// id: the id must be the one mapped to that transactional id, and its epoch exactly the
-/// current one. `None` means it may act.
+/// current one. `Ok` means it may act.
 fn verdict(
     transactional_id: &str,
     producer_id: i64,
     epoch: i16,
-) -> Result<Option<Verdict>, HandlerError> {
+) -> Result<Result<Admitted, Verdict>, HandlerError> {
+    judge(transactional_id, producer_id, epoch, None)
+        .map(|(verdict, _)| verdict)
+        .map_err(|e| HandlerError::Internal(e.to_string()))
+}
+
+/// [`verdict`], plus whether `partition` is in the ongoing transaction at `epoch`. Locks the
+/// transaction row, then reads the producer row under a share lock (the sweep's order), so
+/// no abort or fence lands between this check and the caller's write.
+fn judge(
+    transactional_id: &str,
+    producer_id: i64,
+    epoch: i16,
+    partition: Option<(u32, i32)>,
+) -> Result<(Result<Admitted, Verdict>, bool), pgrx::spi::Error> {
     if transactional_id.is_empty() {
-        return Ok(Some(Verdict::NoTransactionalId));
+        return Ok((Err(Verdict::NoTransactionalId), false));
     }
+    let txn = lock_txn(producer_id)?;
+    let (topic_id, index) = partition.map_or((None, None), |(t, p)| (Some(t as i32), Some(p)));
     let row: Option<String> = Spi::get_one_with_args(
-        "SELECT (SELECT producer_epoch || '|' || (transactional_id = $2)::text
-                   FROM kafgres_producers
-                  WHERE producer_id = $1)",
-        &[producer_id.into(), transactional_id.into()],
-    )
-    .map_err(|e| HandlerError::Internal(e.to_string()))?;
-    let Some(row) = row else { return Ok(Some(Verdict::UnknownProducer)) };
+        "SELECT (SELECT p.producer_epoch || '|' || (p.transactional_id = $2)::text || '|'
+                        || EXISTS (SELECT 1 FROM kafgres_txn_partitions tp
+                                    WHERE tp.producer_id = p.producer_id
+                                      AND tp.topic_id = $3::oid AND tp.partition = $4)::text
+                   FROM kafgres_producers p
+                  WHERE p.producer_id = $1
+                    FOR SHARE)",
+        &[producer_id.into(), transactional_id.into(), topic_id.into(), index.into()],
+    )?;
+    // A NULL transactional id (a plain idempotent producer) concatenates to NULL.
+    let Some(row) = row else { return Ok((Err(Verdict::UnknownProducer), false)) };
     let mut it = row.split('|');
     let current: i32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(-1);
-    // A NULL transactional id (a plain idempotent producer) concatenates to nothing.
     let mapped = it.next() == Some("true");
-    Ok(if !mapped {
-        Some(Verdict::UnknownProducer)
-    } else if (epoch as i32) != current {
-        Some(Verdict::Stale)
-    } else {
-        None
-    })
+    let listed = it.next() == Some("true");
+    if !mapped {
+        return Ok((Err(Verdict::UnknownProducer), false));
+    }
+    if (epoch as i32) != current {
+        return Ok((Err(Verdict::Stale), false));
+    }
+    let added = listed && txn.as_deref() == Some(format!("ongoing|{epoch}").as_str());
+    Ok((Ok(Admitted { producer_id, epoch }), added))
+}
+
+fn lock_txn(producer_id: i64) -> Result<Option<String>, pgrx::spi::Error> {
+    Spi::get_one_with_args(
+        "SELECT (SELECT state || '|' || producer_epoch FROM kafgres_txns
+                  WHERE producer_id = $1 FOR UPDATE)",
+        &[producer_id.into()],
+    )
+}
+
+/// `judge`'s locks, taken by a produce before its savepoint so a rollback keeps them.
+pub fn hold_for_produce(producer_id: i64) -> Result<(), pgrx::spi::Error> {
+    lock_txn(producer_id)?;
+    Spi::run_with_args(
+        "SELECT FROM kafgres_producers WHERE producer_id = $1 FOR SHARE",
+        &[producer_id.into()],
+    )
 }
 
 pub fn handle_add_partitions(
@@ -110,12 +155,11 @@ pub fn handle_add_partitions(
         )
     };
 
-    let code = verdict(&txn_id, producer_id, epoch)?
-        .map_or(ErrorCode::None, |v| v.code(version));
+    let admitted = verdict(&txn_id, producer_id, epoch)?;
+    let code = admitted.err().map_or(ErrorCode::None, |v| v.code(version));
 
-    if code == ErrorCode::None {
-        begin_or_continue(producer_id, epoch, &txn_id)
-            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    if let Ok(admitted) = admitted {
+        begin_or_continue(admitted, &txn_id).map_err(|e| HandlerError::Internal(e.to_string()))?;
 
         for topic in &topics {
             let topic_id = crate::meta::topic_id_by_name(&topic.name)
@@ -160,8 +204,9 @@ pub fn handle_add_partitions(
     })
 }
 
-/// Mark the transaction ongoing at `epoch`; a new one clears the previous one's rows.
-fn begin_or_continue(producer_id: i64, epoch: i16, txn_id: &str) -> Result<(), pgrx::spi::Error> {
+/// Mark the transaction ongoing at the admitted epoch; a new one clears the previous one's rows.
+pub fn begin_or_continue(admitted: Admitted, txn_id: &str) -> Result<(), pgrx::spi::Error> {
+    let Admitted { producer_id, epoch } = admitted;
     let beginning: bool = Spi::get_one_with_args::<bool>(
         "SELECT (SELECT COALESCE(
                     (SELECT state <> 'ongoing' FROM kafgres_txns WHERE producer_id = $1),
@@ -216,7 +261,7 @@ fn add_partition(producer_id: i64, topic_id: u32, partition: i32) -> Result<(), 
 pub enum ProduceTxn {
     Added,
     /// Produce v12+: the append adds the partition and begins the transaction if needed.
-    AddsPartition,
+    AddsPartition(Admitted),
     Refused(ErrorCode),
 }
 
@@ -225,7 +270,7 @@ const PRODUCE_ABORTABLE_FROM: i16 = 11;
 
 /// Codes as apache/kafka 4.3.1 answers them: an unmapped producer is
 /// INVALID_PRODUCER_ID_MAPPING, any other epoch INVALID_PRODUCER_EPOCH, and a partition
-/// not added INVALID_TXN_STATE (TRANSACTION_ABORTABLE at v11).
+/// not added INVALID_TXN_STATE (TRANSACTION_ABORTABLE at v11). Its locks last through the append.
 pub fn verify_produce(
     transactional_id: Option<&str>,
     producer_id: i64,
@@ -237,57 +282,18 @@ pub fn verify_produce(
     let Some(txn_id) = transactional_id else {
         return Ok(ProduceTxn::Refused(ErrorCode::TransactionalIdAuthorizationFailed));
     };
-    let row: Option<String> = crate::plan::get_one(
-        "SELECT (SELECT p.producer_epoch || '|' || (p.transactional_id = $2)::text || '|'
-                        || COALESCE(t.state = 'ongoing' AND t.producer_epoch = $3
-                                    AND EXISTS (SELECT 1 FROM kafgres_txn_partitions tp
-                                                 WHERE tp.producer_id = p.producer_id
-                                                   AND tp.topic_id = $4::oid
-                                                   AND tp.partition = $5), false)::text
-                   FROM kafgres_producers p
-                   LEFT JOIN kafgres_txns t ON t.producer_id = p.producer_id
-                  WHERE p.producer_id = $1)",
-        &[
-            producer_id.into(),
-            txn_id.into(),
-            (epoch as i32).into(),
-            (topic_id as i32).into(),
-            partition.into(),
-        ],
-    )?;
-    // A NULL transactional id (a plain idempotent producer) concatenates to NULL.
-    let Some(row) = row else {
-        return Ok(ProduceTxn::Refused(ErrorCode::InvalidProducerIdMapping));
-    };
-    let mut it = row.split('|');
-    let current: Option<i32> = it.next().and_then(|x| x.parse().ok());
-    let mapped = it.next() == Some("true");
-    let added = it.next() == Some("true");
-    Ok(if !mapped {
-        ProduceTxn::Refused(ErrorCode::InvalidProducerIdMapping)
-    } else if current != Some(epoch as i32) {
-        ProduceTxn::Refused(ErrorCode::InvalidProducerEpoch)
-    } else if added {
-        ProduceTxn::Added
-    } else if version >= PRODUCE_ADDS_PARTITION_FROM {
-        ProduceTxn::AddsPartition
-    } else if version >= PRODUCE_ABORTABLE_FROM {
-        ProduceTxn::Refused(ErrorCode::TransactionAbortable)
-    } else {
-        ProduceTxn::Refused(ErrorCode::InvalidTxnState)
+    Ok(match judge(txn_id, producer_id, epoch, Some((topic_id, partition)))? {
+        (Err(Verdict::Stale), _) => ProduceTxn::Refused(ErrorCode::InvalidProducerEpoch),
+        (Err(_), _) => ProduceTxn::Refused(ErrorCode::InvalidProducerIdMapping),
+        (Ok(_), true) => ProduceTxn::Added,
+        (Ok(admitted), false) if version >= PRODUCE_ADDS_PARTITION_FROM => {
+            ProduceTxn::AddsPartition(admitted)
+        }
+        (Ok(_), false) if version >= PRODUCE_ABORTABLE_FROM => {
+            ProduceTxn::Refused(ErrorCode::TransactionAbortable)
+        }
+        (Ok(_), false) => ProduceTxn::Refused(ErrorCode::InvalidTxnState),
     })
-}
-
-/// A produce v12+ append's `AddPartitionsToTxn`, once `verify_produce` said `AddsPartition`.
-pub fn add_partition_from_produce(
-    producer_id: i64,
-    epoch: i16,
-    transactional_id: &str,
-    topic_id: u32,
-    partition: i32,
-) -> Result<(), pgrx::spi::Error> {
-    begin_or_continue(producer_id, epoch, transactional_id)?;
-    add_partition(producer_id, topic_id, partition)
 }
 
 /// Commit or abort: write a marker to every partition the transaction touched. Markers
@@ -333,7 +339,7 @@ pub fn handle_end_txn(req: &EndTxnRequest, version: i16) -> Result<EndTxnRespons
         }
     }
 
-    if let Some(v) = verdict(&req.transactional_id, req.producer_id, req.producer_epoch)? {
+    if let Err(v) = verdict(&req.transactional_id, req.producer_id, req.producer_epoch)? {
         return Ok(unchanged(v.code(version)));
     }
 
@@ -654,33 +660,13 @@ pub fn handle_add_offsets(
     req: &AddOffsetsToTxnRequest,
     version: i16,
 ) -> Result<AddOffsetsToTxnResponse, HandlerError> {
-    let code = if let Some(v) = verdict(&req.transactional_id, req.producer_id, req.producer_epoch)? {
-        v.code(version)
-    } else {
-        Spi::run_with_args(
-            "INSERT INTO kafgres_txns
-                    (producer_id, producer_epoch, transactional_id, state, started_at)
-             VALUES ($1, $2, $3, 'ongoing', $4)
-             ON CONFLICT (producer_id) DO UPDATE
-                SET state = 'ongoing',
-                    -- Carried, like AddPartitionsToTxn does. EndTxn v5 rotates the epoch
-                    -- every transaction, so a row left holding the first one makes
-                    -- `finish_transaction`'s `p.producer_epoch <= $2` guard false forever:
-                    -- the expiry sweep can then never abort or fence this producer, the
-                    -- staged offsets are never cleared, and the LSO stays pinned.
-                    producer_epoch = EXCLUDED.producer_epoch,
-                    started_at = CASE WHEN kafgres_txns.state = 'ongoing'
-                                      THEN kafgres_txns.started_at
-                                      ELSE EXCLUDED.started_at END",
-            &[
-                req.producer_id.into(),
-                (req.producer_epoch as i32).into(),
-                req.transactional_id.clone().into(),
-                now_millis().into(),
-            ],
-        )
-        .map_err(|e| HandlerError::Internal(e.to_string()))?;
-        ErrorCode::None
+    let code = match verdict(&req.transactional_id, req.producer_id, req.producer_epoch)? {
+        Err(v) => v.code(version),
+        Ok(admitted) => {
+            begin_or_continue(admitted, &req.transactional_id)
+                .map_err(|e| HandlerError::Internal(e.to_string()))?;
+            ErrorCode::None
+        }
     };
 
     Ok(AddOffsetsToTxnResponse {
@@ -700,37 +686,12 @@ pub fn handle_txn_offset_commit(
 ) -> Result<TxnOffsetCommitResponse, HandlerError> {
     // Reported per partition, and a stale epoch is INVALID_PRODUCER_EPOCH at every
     // version, as Kafka answers it; the other coordinator APIs answer PRODUCER_FENCED.
-    let code = match verdict(&req.transactional_id, req.producer_id, req.producer_epoch)? {
-        Some(Verdict::Stale) => ErrorCode::InvalidProducerEpoch,
-        Some(other) => other.code(version),
-        None => ErrorCode::None,
+    let admitted = verdict(&req.transactional_id, req.producer_id, req.producer_epoch)?;
+    let code = match admitted {
+        Err(Verdict::Stale) => ErrorCode::InvalidProducerEpoch,
+        Err(other) => other.code(version),
+        Ok(_) => ErrorCode::None,
     };
-
-    if code == ErrorCode::None && version >= 5 {
-        Spi::run_with_args(
-            "INSERT INTO kafgres_txns
-                    (producer_id, producer_epoch, transactional_id, state, started_at)
-             VALUES ($1, $2, $3, 'ongoing', $4)
-             ON CONFLICT (producer_id) DO UPDATE
-                SET state = 'ongoing',
-                    -- Carried, like AddPartitionsToTxn does. EndTxn v5 rotates the epoch
-                    -- every transaction, so a row left holding the first one makes
-                    -- `finish_transaction`'s `p.producer_epoch <= $2` guard false forever:
-                    -- the expiry sweep can then never abort or fence this producer, the
-                    -- staged offsets are never cleared, and the LSO stays pinned.
-                    producer_epoch = EXCLUDED.producer_epoch,
-                    started_at = CASE WHEN kafgres_txns.state = 'ongoing'
-                                      THEN kafgres_txns.started_at
-                                      ELSE EXCLUDED.started_at END",
-            &[
-                req.producer_id.into(),
-                (req.producer_epoch as i32).into(),
-                req.transactional_id.clone().into(),
-                now_millis().into(),
-            ],
-        )
-        .map_err(|e| HandlerError::Internal(e.to_string()))?;
-    }
 
     // KIP-447: the v3+ member fields fence a zombie consumer; before v3 they default to none.
     let group = if code == ErrorCode::None {
@@ -749,6 +710,7 @@ pub fn handle_txn_offset_commit(
     };
 
     let mut topics = Vec::with_capacity(req.topics.len());
+    let mut accepted = Vec::new();
     for topic in &req.topics {
         let topic_id = crate::meta::topic_id_by_name(&topic.name)
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
@@ -765,7 +727,7 @@ pub fn handle_txn_offset_commit(
                 _ if code == ErrorCode::InvalidRequest => code,
                 (None, _) => ErrorCode::UnknownTopicOrPartition,
                 _ if index < 0 || index >= count => ErrorCode::UnknownTopicOrPartition,
-                (Some(id), Some(g)) if code == ErrorCode::None => g.code_for(id, index),
+                (Some(id), Some(g)) => g.code_for(id, index),
                 _ => code,
             };
             partitions.push(TxnOffsetCommitResponsePartition {
@@ -773,36 +735,43 @@ pub fn handle_txn_offset_commit(
                 error_code: part_code.code(),
                 ..Default::default()
             });
-            if part_code != ErrorCode::None {
-                continue;
+            if let (ErrorCode::None, Some(topic_id)) = (part_code, topic_id) {
+                accepted.push((topic_id, part));
             }
-            let Some(topic_id) = topic_id else { continue };
-            Spi::run_with_args(
-                "INSERT INTO kafgres_txn_offsets
-                        (producer_id, group_id, topic_id, partition, committed_offset,
-                         committed_leader_epoch, metadata)
-                 VALUES ($1, $2, $3::oid, $4, $5, $6, $7)
-                 ON CONFLICT (producer_id, group_id, topic_id, partition) DO UPDATE SET
-                    committed_offset = EXCLUDED.committed_offset,
-                    committed_leader_epoch = EXCLUDED.committed_leader_epoch,
-                    metadata = EXCLUDED.metadata",
-                &[
-                    req.producer_id.into(),
-                    req.group_id.clone().into(),
-                    (topic_id as i32).into(),
-                    index.into(),
-                    part.committed_offset.into(),
-                    part.committed_leader_epoch.into(),
-                    part.committed_metadata.clone().into(),
-                ],
-            )
-            .map_err(|e| HandlerError::Internal(e.to_string()))?;
         }
         topics.push(TxnOffsetCommitResponseTopic {
             name: topic.name.clone(),
             partitions,
             ..Default::default()
         });
+    }
+
+    // Only once something is accepted: a refused commit must not leave a transaction open.
+    if let (Ok(admitted), true) = (admitted, version >= 5 && !accepted.is_empty()) {
+        begin_or_continue(admitted, &req.transactional_id)
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    }
+    for (topic_id, part) in accepted {
+        Spi::run_with_args(
+            "INSERT INTO kafgres_txn_offsets
+                    (producer_id, group_id, topic_id, partition, committed_offset,
+                     committed_leader_epoch, metadata)
+             VALUES ($1, $2, $3::oid, $4, $5, $6, $7)
+             ON CONFLICT (producer_id, group_id, topic_id, partition) DO UPDATE SET
+                committed_offset = EXCLUDED.committed_offset,
+                committed_leader_epoch = EXCLUDED.committed_leader_epoch,
+                metadata = EXCLUDED.metadata",
+            &[
+                req.producer_id.into(),
+                req.group_id.clone().into(),
+                (topic_id as i32).into(),
+                part.partition_index.into(),
+                part.committed_offset.into(),
+                part.committed_leader_epoch.into(),
+                part.committed_metadata.clone().into(),
+            ],
+        )
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
     }
 
     Ok(TxnOffsetCommitResponse {

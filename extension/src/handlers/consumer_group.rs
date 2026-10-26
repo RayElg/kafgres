@@ -42,7 +42,7 @@ fn tp(topic: u32, partition: i32) -> String {
     format!("{topic}:{partition}")
 }
 
-fn parse_tp(s: &str) -> Option<(u32, i32)> {
+pub(super) fn parse_tp(s: &str) -> Option<(u32, i32)> {
     let (t, p) = s.split_once(':')?;
     Some((t.parse().ok()?, p.parse().ok()?))
 }
