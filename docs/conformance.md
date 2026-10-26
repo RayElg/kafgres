@@ -194,7 +194,15 @@ from, so a reset moves where the next acquire begins.
   partition uncleanable when a batch throws. kafgres logs the batch, keeps it verbatim,
   and goes on cleaning the rest of the partition. The batch's own records supersede
   nothing, so older values of its keys stay. Such a batch can only be one stored before
-  produce checked these records, or one stored while the topic was not compacted.
+  produce checked these records, or one stored while the topic was not compacted. A
+  batch whose CRC fails is corruption instead: the pass stops there and logs the file
+  and position, or the offset on the table engine.
+- **A bare snappy batch past 64 MiB is refused on a compacted topic.** Produce reads a
+  compacted topic's keys while the batch decompresses, so any size Kafka accepts is
+  accepted. A bare snappy block, the framing librdkafka writes, cannot be read that way
+  and is decompressed whole, so one that expands past 64 MiB gets `MESSAGE_TOO_LARGE`
+  where Kafka accepts it, and compaction keeps it whole without mapping its keys. The
+  same goes for a single key, or a xerial snappy block, past 64 MiB.
 - **Leader epochs are not consecutive.** Kafka increments the epoch by one per
   election. kafgres takes the next epoch on every broker start, but a promotion jumps to
   the next Postgres timeline's range, so the epoch leaps from, say, 3 to 65536. The

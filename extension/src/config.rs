@@ -294,7 +294,7 @@ fn validate_cleanup_policy(value: &str) -> Result<(), ConfigError> {
         name: "cleanup.policy".to_string(),
         value: v.to_string(),
     };
-    match value.trim() {
+    match java_trim(value) {
         "delete" => Ok(()),
         // The table engine rewrites rows inside one transaction (MVCC-atomic); the segment
         "compact" | "compact,delete" => Ok(()),
@@ -503,16 +503,23 @@ pub struct CleanupPolicy {
 
 pub fn cleanup_policy(topic_id: u32) -> Option<CleanupPolicy> {
     let overrides = load_overrides(topic_id).ok()?;
-    let value = overrides
-        .iter()
-        .find(|(k, _)| k == "cleanup.policy")
-        .map(|(_, v)| v.trim().to_string())
-        .unwrap_or_else(|| "delete".to_string());
-    Some(match value.as_str() {
-        "compact" => CleanupPolicy { compacts: true, deletes: false },
-        "compact,delete" => CleanupPolicy { compacts: true, deletes: true },
+    let value = overrides.iter().find(|(k, _)| k == "cleanup.policy").map(|(_, v)| v.as_str());
+    Some(parse_cleanup_policy(value))
+}
+
+/// The one reading of a stored `cleanup.policy`, for produce and the cleaner alike.
+pub fn parse_cleanup_policy(value: Option<&str>) -> CleanupPolicy {
+    match value.map(java_trim) {
+        Some("compact") => CleanupPolicy { compacts: true, deletes: false },
+        Some("compact,delete") => CleanupPolicy { compacts: true, deletes: true },
         _ => CleanupPolicy { compacts: false, deletes: true },
-    })
+    }
+}
+
+/// Java's `String.trim()`, which Kafka's `ConfigDef` applies to a list value: it strips
+/// every char up to U+0020, control characters included, and no other whitespace.
+fn java_trim(value: &str) -> &str {
+    value.trim_matches(|c: char| c <= ' ')
 }
 
 pub const DEFAULT_MAX_MESSAGE_BYTES: i64 = 1_048_588;
@@ -586,6 +593,20 @@ mod tests {
         assert!(check_alterable(def, OP_SET, Some("archive")).is_err());
         // Upstream validates against an exact-cased list, so this is INVALID_CONFIG there.
         assert!(check_alterable(def, OP_SET, Some("DELETE")).is_err());
+    }
+
+    #[test]
+    fn cleanup_policy_is_trimmed_as_java_trims() {
+        let def = topic_def("cleanup.policy").unwrap();
+        for value in ["compact\n", "\tcompact", "compact\r\n", " compact,delete\x0b"] {
+            assert!(check_alterable(def, OP_SET, Some(value)).is_ok(), "{value:?}");
+            assert!(parse_cleanup_policy(Some(value)).compacts, "{value:?}");
+        }
+        // Whitespace beyond U+0020, which `String.trim()` keeps.
+        assert!(check_alterable(def, OP_SET, Some("compact\u{a0}")).is_err());
+        assert!(!parse_cleanup_policy(Some("compact\u{a0}")).compacts);
+        assert!(!parse_cleanup_policy(None).compacts);
+        assert!(parse_cleanup_policy(Some("compact,delete")).deletes);
     }
 
     #[test]

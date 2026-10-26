@@ -922,7 +922,11 @@ impl BatchReader {
     }
 
     fn corrupt(&self, what: &str) -> StoreError {
-        StoreError::Io(format!("{} at {}: {what}", self.vfd.path.display(), self.pos))
+        self.corrupt_at(self.pos, what)
+    }
+
+    fn corrupt_at(&self, at: u64, what: &str) -> StoreError {
+        StoreError::Io(format!("{} at {at}: {what}", self.vfd.path.display()))
     }
 }
 
@@ -940,7 +944,10 @@ impl SegmentStore {
         use kafgres_codec::compaction::{rebuild_batch, KeptRecord};
 
         // What survives of a batch, `None` for all of it; an aborted batch goes whole.
-        let judge_batch = |view: &RecordBatch| -> StoreResult<Option<Vec<KeptRecord>>> {
+        let judge_batch = |reader: &BatchReader,
+                           at: u64,
+                           view: &RecordBatch|
+         -> StoreResult<Option<Vec<KeptRecord>>> {
             if view.base_offset() > map.end {
                 return Ok(None);
             }
@@ -948,7 +955,8 @@ impl SegmentStore {
                 return Ok(Some(Vec::new()));
             }
             let goes = |o: i64| judge.tombstone_goes(o);
-            Ok(super::clean_or_keep(view, map, &goes, topic, partition))
+            super::clean_or_keep(view, map, &goes, topic, partition)
+                .map_err(|e| reader.corrupt_at(at, &e.to_string()))
         };
 
         let tmp_path = compacting_path(topic, partition, rw.info.base);
@@ -963,14 +971,14 @@ impl SegmentStore {
                     rw.pos = reader.pos;
                     return Ok(None);
                 }
-                let Some((_, view)) = reader.next()? else {
+                let Some((at, view)) = reader.next()? else {
                     return Ok(Some(Cleaned::Unchanged));
                 };
                 *budget -= view.len() as i64;
                 if view.base_offset() > map.end {
                     return Ok(Some(Cleaned::Unchanged));
                 }
-                if judge_batch(&view)?.is_some() {
+                if judge_batch(&reader, at, &view)?.is_some() {
                     break;
                 }
             }
@@ -993,11 +1001,11 @@ impl SegmentStore {
                 out.writeback(written_from, rw.written - written_from);
                 return Ok(None);
             }
-            let Some((_, view)) = reader.next()? else {
+            let Some((at, view)) = reader.next()? else {
                 break;
             };
             *budget -= view.len() as i64;
-            match judge_batch(&view)? {
+            match judge_batch(&reader, at, &view)? {
                 None => {
                     out.write_all_at(view.as_bytes(), rw.written)?;
                     rw.written += view.len() as u64;
@@ -1183,8 +1191,8 @@ impl SegmentStore {
                         resume = Some((seg.base, reader.pos));
                         break 'segments;
                     }
-                    let view = match reader.next() {
-                        Ok(Some((_, v))) => v,
+                    let (at, view) = match reader.next() {
+                        Ok(Some(found)) => found,
                         Ok(None) => break,
                         Err(e) => {
                             // Keep what was mapped; the cursor stays.
@@ -1204,8 +1212,17 @@ impl SegmentStore {
                         plan.map.end = plan.map.end.max(view.last_offset());
                         continue;
                     }
-                    if !super::map_batch(&mut plan.map, &view, MAX_COMPACT_KEYS, topic, partition) {
-                        break 'segments;
+                    match super::map_batch(&mut plan.map, &view, MAX_COMPACT_KEYS, topic, partition) {
+                        Ok(true) => {}
+                        Ok(false) => break 'segments,
+                        Err(e) => {
+                            pgrx::log!(
+                                "kafgres: compaction stopped mapping: {}",
+                                reader.corrupt_at(at, &e.to_string())
+                            );
+                            plan.abandoned = true;
+                            break 'segments;
+                        }
                     }
                 }
             }

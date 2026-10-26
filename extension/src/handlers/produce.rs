@@ -731,33 +731,36 @@ fn null_keyed(records: Option<&kafgres_codec::bytes::Bytes>) -> Option<AppendErr
     if records.is_empty() {
         return None;
     }
+    // Kafka checks every batch's CRC before it reads a record, so a bad one is left to the
+    // store's CORRUPT_MESSAGE (I6).
     for item in BatchIter::new(records.clone()) {
-        let Ok(view) = item else { return None };
+        if !item.is_ok_and(|view| view.verify_crc().is_ok()) {
+            return None;
+        }
+    }
+    for view in BatchIter::new(records.clone()).flatten() {
         // Control batches carry the transaction marker, not user data; Kafka exempts them.
         if view.is_control() {
             continue;
         }
-        let iter = match view.records_decompressed() {
-            Ok(iter) => iter,
-            Err(e) => return undecodable(&view, e),
+        let keys = match view.stream_keys() {
+            Ok(keys) => keys,
+            Err(e) => return undecodable(e),
         };
-        for record in iter {
-            let record = match record {
-                Ok(record) => record,
-                Err(e) => return undecodable(&view, e),
-            };
-            if record.key.is_none() {
-                return Some(AppendError::NullKeyOnCompacted);
+        for record in keys {
+            match record {
+                Ok(record) if record.key.is_none() => return Some(AppendError::NullKeyOnCompacted),
+                Ok(_) => {}
+                Err(e) => return undecodable(e),
             }
         }
     }
     None
 }
 
-/// Records Kafka's `DefaultRecord.readFrom` refuses. A bad CRC is left to the store (Kafka
-/// checks it first, as `CORRUPT_MESSAGE`), and so is an unknown codec.
-fn undecodable(view: &RecordBatch, e: BatchError) -> Option<AppendError> {
-    if matches!(e, BatchError::Compressed(_)) || view.verify_crc().is_err() {
+/// Records Kafka's `DefaultRecord.readFrom` refuses. An unknown codec is left to the store.
+fn undecodable(e: BatchError) -> Option<AppendError> {
+    if matches!(e, BatchError::Compressed(_)) {
         return None;
     }
     Some(AppendError::Batch(e))

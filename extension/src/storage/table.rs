@@ -1083,6 +1083,10 @@ fn decode_err(e: kafgres_codec::records::BatchError) -> StoreError {
     StoreError::Io(format!("compaction decode: {e:?}"))
 }
 
+fn corrupt_row(base: i64, e: kafgres_codec::records::BatchError) -> StoreError {
+    StoreError::Io(format!("compaction: batch at offset {base}: {e}"))
+}
+
 impl TableStore {
     fn compact_pass(
         region: &Cleanable,
@@ -1160,7 +1164,9 @@ impl TableStore {
                     MAX_COMPACT_KEYS,
                     region.topic,
                     region.partition,
-                ) {
+                )
+                .map_err(|e| corrupt_row(*base, e))?
+                {
                     plan.mapping_after = None;
                     break;
                 }
@@ -1189,6 +1195,7 @@ impl TableStore {
                     let kept = if judge.committed(&view)? {
                         let goes = |o: i64| judge.tombstone_goes(o);
                         super::clean_or_keep(&view, &plan.map, &goes, region.topic, region.partition)
+                            .map_err(|e| corrupt_row(*base, e))?
                     } else {
                         Some(Vec::new())
                     };

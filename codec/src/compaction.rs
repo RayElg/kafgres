@@ -148,16 +148,28 @@ impl OffsetMap {
             return Ok(true);
         }
         let base = batch.base_offset();
-        let mut found = Vec::new();
-        for record in batch.records_decompressed()? {
+        // Deduplicated as it goes: this grows with distinct keys, not with the records a
+        // compressed batch expands to.
+        let mut found: HashMap<u128, i64> = HashMap::new();
+        let mut new = 0;
+        for record in batch.stream_keys()? {
             let record = record?;
-            if let Some(key) = record.key {
-                found.push((self.fingerprint(&key), base + record.offset_delta as i64));
+            let Some(key) = record.key else { continue };
+            let fingerprint = self.fingerprint(&key);
+            let offset = base + record.offset_delta as i64;
+            match found.entry(fingerprint) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let latest = e.get_mut();
+                    *latest = (*latest).max(offset);
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(offset);
+                    new += !self.latest.contains_key(&fingerprint) as usize;
+                }
             }
-        }
-        let new = found.iter().filter(|(f, _)| !self.latest.contains_key(f)).count();
-        if !self.latest.is_empty() && self.latest.len() + new > max_keys {
-            return Ok(false);
+            if !self.latest.is_empty() && self.latest.len() + new > max_keys {
+                return Ok(false);
+            }
         }
         for (fingerprint, offset) in found {
             let latest = self.latest.entry(fingerprint).or_insert(offset);
@@ -177,7 +189,8 @@ impl OffsetMap {
 
 /// What a pass keeps of one batch, or `None` when every record survives. Records above
 /// `map.end` and null-keyed records always survive. A tombstone the map has not superseded
-/// goes when `tombstone_goes(offset)` says so.
+/// goes when `tombstone_goes(offset)` says so. A compressed batch whose survivors would not
+/// fit in `MAX_DECOMPRESSED_BYTES` survives whole.
 pub fn clean_batch(
     batch: &RecordBatch,
     map: &OffsetMap,
@@ -187,10 +200,19 @@ pub fn clean_batch(
         return Ok(None);
     }
     let base = batch.base_offset();
+    let compressed = batch.compression_type() != 0;
     let mut kept = Vec::new();
+    let mut kept_bytes = 0usize;
     let mut dropped = false;
-    for record in batch.records_decompressed()? {
-        let record = record?;
+    let records = match batch.stream_records() {
+        Err(BatchError::DecompressedTooLarge) => return Ok(None),
+        records => records?,
+    };
+    for record in records {
+        let record = match record {
+            Err(BatchError::DecompressedTooLarge) => return Ok(None),
+            record => record?,
+        };
         let offset = base + record.offset_delta as i64;
         let timestamp = batch.base_timestamp() + record.timestamp_delta;
         let goes = offset <= map.end
@@ -204,6 +226,18 @@ pub fn clean_batch(
         if goes {
             dropped = true;
             continue;
+        }
+        if compressed {
+            // What the survivors hold in memory, so an empty record still counts.
+            let field = |f: &Option<Bytes>| f.as_ref().map_or(0, |b| b.len());
+            let header = std::mem::size_of::<(Bytes, Option<Bytes>)>();
+            kept_bytes += std::mem::size_of::<KeptRecord>();
+            kept_bytes += field(&record.key) + field(&record.value);
+            kept_bytes +=
+                record.headers.iter().map(|(n, v)| header + n.len() + field(v)).sum::<usize>();
+            if kept_bytes > crate::records::MAX_DECOMPRESSED_BYTES {
+                return Ok(None);
+            }
         }
         kept.push(KeptRecord {
             offset,
@@ -392,18 +426,9 @@ mod tests {
         assert_eq!(wire[delta], 0x02);
         wire.splice(delta..delta + 1, [0x82, 0x80, 0x80, 0x80, 0x10]);
         wire[second] += 8; // four added body bytes, zigzag length
-        let length = (wire.len() - LENGTH_OFFSET - 4) as i32;
-        wire[LENGTH_OFFSET..LENGTH_OFFSET + 4].copy_from_slice(&length.to_be_bytes());
-        let crc = crc32c::crc32c(&wire[ATTRIBUTES_OFFSET..]);
-        wire[crate::records::CRC_OFFSET..crate::records::CRC_OFFSET + 4]
-            .copy_from_slice(&crc.to_be_bytes());
 
-        let validated = RecordBatch::validated(Bytes::from(wire)).unwrap();
-        assert_eq!(
-            (validated.record_count(), validated.last_offset_delta()),
-            (2, 1)
-        );
-        let batch = RecordBatch::new(validated.as_bytes().clone()).unwrap();
+        let batch = crate::records::resealed(wire);
+        assert_eq!((batch.record_count(), batch.last_offset_delta()), (2, 1));
         let s = survivors(std::slice::from_ref(&batch)).unwrap();
         assert!(!s.keeps(0));
         assert!(s.keeps(1));
@@ -784,13 +809,7 @@ mod tests {
         let second = crate::records::RECORD_BATCH_OVERHEAD + 1 + first_len;
         wire.push(0xaa);
         wire[second] += 2;
-        let length = (wire.len() - LENGTH_OFFSET - 4) as i32;
-        wire[LENGTH_OFFSET..LENGTH_OFFSET + 4].copy_from_slice(&length.to_be_bytes());
-        let crc = crc32c::crc32c(&wire[ATTRIBUTES_OFFSET..]);
-        wire[crate::records::CRC_OFFSET..crate::records::CRC_OFFSET + 4]
-            .copy_from_slice(&crc.to_be_bytes());
-        let validated = RecordBatch::validated(Bytes::from(wire)).unwrap();
-        let batch = RecordBatch::new(validated.as_bytes().clone()).unwrap();
+        let batch = crate::records::resealed(wire);
 
         let mut map = OffsetMap::default();
         assert!(matches!(
@@ -800,6 +819,63 @@ mod tests {
         assert_eq!((map.len(), map.end), (0, -1));
         map.end = batch.last_offset();
         assert!(clean_batch(&batch, &map, &|_| false).is_err());
+    }
+
+    /// Base 1: `k` at offset 1, then a 1 MiB value under each of `keys`, past the cap.
+    fn past_the_cap(keys: impl Fn(usize) -> String) -> RecordBatch {
+        use crate::records::{gzipped, raw_record, MAX_DECOMPRESSED_BYTES};
+        let value = vec![0u8; 1 << 20];
+        let n = MAX_DECOMPRESSED_BYTES / value.len() + 2;
+        let mut plain = raw_record(0, Some(b"k"), b"new");
+        for i in 1..=n {
+            plain.extend(raw_record(i as i32, Some(keys(i).as_bytes()), &value));
+        }
+        let mut wire = gzipped(n as i32 + 1, &plain, false).as_bytes().to_vec();
+        wire[..8].copy_from_slice(&1i64.to_be_bytes());
+        let batch = RecordBatch::new(Bytes::from(wire)).unwrap();
+        assert!(matches!(batch.records_decompressed(), Err(BatchError::DecompressedTooLarge)));
+        batch
+    }
+
+    #[test]
+    fn a_batch_past_the_decompressed_cap_supersedes_older_values() {
+        let old = log(vec![(0, vec![("k", Some("old"))])]).remove(0);
+        let big = past_the_cap(|i| format!("v{i}"));
+        let mut map = OffsetMap::default();
+        assert!(map.add_batch(&old, 1 << 20).unwrap());
+        assert!(map.add_batch(&big, 1 << 20).unwrap());
+        assert_eq!(map.end, big.last_offset());
+        assert!(map.superseded(b"k", 0));
+
+        let kept = clean_batch(&old, &map, &|_| false).unwrap();
+        assert!(kept.is_some_and(|k| k.is_empty()), "the older value of k survived");
+        // Every survivor of the big batch is kept, which is more than fits in memory.
+        assert!(clean_batch(&big, &map, &|_| false).unwrap().is_none());
+    }
+
+    #[test]
+    fn survivors_are_counted_by_what_they_hold_in_memory() {
+        use crate::records::{gzipped, raw_record, MAX_DECOMPRESSED_BYTES};
+        let n = MAX_DECOMPRESSED_BYTES / std::mem::size_of::<KeptRecord>() + 2;
+        let mut plain = raw_record(0, Some(b"k"), b"old");
+        plain.extend(raw_record(1, Some(b"k"), b"new"));
+        for i in 0..n {
+            plain.extend(raw_record(i as i32 + 2, None, b""));
+        }
+        let batch = gzipped(n as i32 + 2, &plain, false);
+        let mut map = OffsetMap::default();
+        assert!(map.add_batch(&batch, 1 << 20).unwrap());
+        assert!(clean_batch(&batch, &map, &|_| false).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_batch_past_the_decompressed_cap_is_cleaned_when_its_survivors_fit() {
+        let big = past_the_cap(|_| "v".to_string());
+        let mut map = OffsetMap::default();
+        assert!(map.add_batch(&big, 1 << 20).unwrap());
+        let kept = clean_batch(&big, &map, &|_| false).unwrap().expect("nothing was removed");
+        let offsets: Vec<i64> = kept.iter().map(|r| r.offset).collect();
+        assert_eq!(offsets, vec![1, big.last_offset()]);
     }
 
     #[test]
