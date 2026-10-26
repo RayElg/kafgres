@@ -17,8 +17,10 @@ apache/kafka 4.3.1's answers to the same requests.
 import re
 import socket
 import struct
+import subprocess
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -32,6 +34,7 @@ UNKNOWN_MEMBER_ID = 25
 REBALANCE_IN_PROGRESS = 27
 UNSUPPORTED_VERSION = 35
 INVALID_PRODUCER_EPOCH = 47
+PRODUCER_FENCED = 90
 INVALID_TXN_STATE = 48
 GROUP_ID_NOT_FOUND = 69
 MEMBER_ID_REQUIRED = 79
@@ -197,11 +200,12 @@ class Broker:
         d.i32()
         return d.i16(), d.i64()
 
-    def txn_offset_commit(self, txn, group, pid, epoch, gen, member, instance, topic, part, offset):
+    def txn_offset_commit(self, txn, group, pid, epoch, gen, member, instance, topic, part, offset,
+                          ver=3):
         e = Enc(True).str(txn).str(group).i64(pid).i16(epoch).i32(gen).str(member).str(instance)
         pp = lambda e, p: e.i32(p).i64(offset).i32(-1).str("").tags()
         e.arr([topic], lambda e, t: e.str(t).arr([part], pp).tags()).tags()
-        d = self.call(28, 3, e.b)
+        d = self.call(28, ver, e.b)
         d.i32(); d.arrlen(); d.str(); d.arrlen(); d.i32()
         return d.i16()
 
@@ -382,6 +386,93 @@ def test_a_producer_fenced_mid_transaction_is_refused_on_its_next_batch(topic):
         b.close()
 
 
+class Interleave:
+    """A second session holding the producer's transaction and producer rows. `abort()`
+    waits until the broker blocks behind them, then runs the expiry sweep and commits, so
+    the transaction is aborted and fenced between a request's check and its write."""
+
+    def __init__(self, pid):
+        self.p = subprocess.Popen(
+            ["docker", "compose", "exec", "-T", "postgres",
+             "psql", "-U", "postgres", "-qtA", "-v", "ON_ERROR_STOP=1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self._run(f"BEGIN;\n"
+                  f"SELECT 1 FROM kafgres_txns WHERE producer_id = {pid} FOR UPDATE;\n"
+                  f"SELECT 1 FROM kafgres_producers WHERE producer_id = {pid} FOR UPDATE;\n")
+
+    def _run(self, script):
+        self.p.stdin.write(script + "\\echo MARK\n")
+        self.p.stdin.flush()
+        while (line := self.p.stdout.readline()) != "MARK\n":
+            assert line, "the interleaving session failed"
+
+    def abort(self):
+        # Inside the broker's 2 s lock_timeout.
+        self._run("""DO $$ BEGIN
+            FOR i IN 1..300 LOOP
+                PERFORM pg_stat_clear_snapshot();
+                IF EXISTS (SELECT 1 FROM pg_stat_activity
+                            WHERE backend_type = 'kafgres_broker' AND wait_event_type = 'Lock')
+                THEN RETURN; END IF;
+                PERFORM pg_sleep(0.005);
+            END LOOP;
+            RAISE EXCEPTION 'the broker never waited on the held rows';
+        END $$;
+        SELECT kafgres_expire_transactions();
+        COMMIT;
+        """)
+
+    def close(self):
+        if self.p.poll() is None:
+            self.p.stdin.write("ROLLBACK;\n\\q\n")
+            self.p.stdin.flush()
+        self.p.wait(timeout=30)
+
+
+@pytest.mark.parametrize("request_kind", ["add_partitions", "produce_v12", "produce_v3"])
+def test_a_transaction_aborted_behind_a_waiting_request_stays_aborted(topic, request_kind):
+    """The sweep aborts and fences while the request waits: AddPartitionsToTxn or a v12
+    produce must not reopen the transaction, and a batch to an added partition must not
+    land after the abort marker, where no marker closes it."""
+    b = Broker()
+    txn = txn_id(topic)
+    with ThreadPoolExecutor(1) as pool:
+        try:
+            pid, e0 = open_txn(b, txn, topic, b"first")
+            sql(f"UPDATE kafgres_txns SET timeout_ms = 1000, started_at = started_at - 60000 "
+                f"WHERE producer_id = {pid}")
+            # A stale `last_ts` is refreshed in phase 2, so an unlocked check would wait there,
+            # between the check and the write.
+            backdate(pid, 3600)
+            before = (high_watermark(topic, 0), high_watermark(topic, 1))
+            held = Interleave(pid)
+            try:
+                if request_kind == "add_partitions":
+                    sent = pool.submit(b.add_partitions, txn, pid, e0, topic, (1,))
+                    expected = PRODUCER_FENCED
+                elif request_kind == "produce_v12":
+                    sent = pool.submit(b.produce, 12, txn, topic, 1, txn_batch(b"z", pid, e0, 0))
+                    expected = INVALID_PRODUCER_EPOCH
+                else:
+                    sent = pool.submit(b.produce, 3, txn, topic, 0, txn_batch(b"z", pid, e0, 1))
+                    expected = INVALID_PRODUCER_EPOCH
+                held.abort()
+                answer = sent.result(timeout=30)
+            finally:
+                held.close()
+            code = answer if request_kind == "add_partitions" else answer[0]
+            assert code == expected, f"{request_kind}: {code}"
+            assert sql(f"SELECT state FROM kafgres_txns WHERE producer_id = {pid}") == "aborted"
+            # Partition 0 gained only the abort marker; partition 1 nothing.
+            assert (high_watermark(topic, 0), high_watermark(topic, 1)) == (before[0] + 1, before[1])
+
+            plain = record_batch([b"after"], producer_id=-1, producer_epoch=-1, base_sequence=-1)
+            assert b.produce(3, None, topic, 0, plain)[0] == NONE
+            assert read_committed(topic) == [b"after"]
+        finally:
+            b.close()
+
+
 # ---------------------------------------------------------------- RAY-8
 
 
@@ -526,6 +617,26 @@ def test_txn_offset_commit_fences_a_zombie_consumer(topic, group):
         assert t.end_txn(txn2, pid2, epoch2, False) == NONE
     finally:
         c.close()
+        t.close()
+
+
+def test_a_refused_v5_txn_offset_commit_begins_no_transaction(topic, group):
+    """At v5 the commit begins the transaction, but only once a partition is accepted."""
+    t = Broker()
+    txn = txn_id(topic)
+    try:
+        pid, epoch = t.init_pid(txn)
+        state = lambda: sql(f"SELECT state FROM kafgres_txns WHERE producer_id = {pid}")
+        toc = lambda *a: t.txn_offset_commit(txn, f"{group}-ghost", pid, epoch, *a, ver=5)
+        assert toc(5, "m", None, topic, 0, 1) == ILLEGAL_GENERATION
+        assert toc(-1, "", None, topic, 9, 1) == UNKNOWN_TOPIC_OR_PARTITION
+        assert state() == "empty"
+        assert sql(f"SELECT count(*) FROM kafgres_txn_offsets WHERE producer_id = {pid}") == "0"
+
+        assert toc(-1, "", None, topic, 0, 1) == NONE
+        assert state() == "ongoing"
+        assert t.end_txn(txn, pid, epoch, False) == NONE
+    finally:
         t.close()
 
 
