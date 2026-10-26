@@ -620,22 +620,25 @@ def test_txn_offset_commit_fences_a_zombie_consumer(topic, group):
         t.close()
 
 
-def test_a_refused_v5_txn_offset_commit_begins_no_transaction(topic, group):
-    """At v5 the commit begins the transaction, but only once a partition is accepted."""
+def test_a_refused_v5_txn_offset_commit_still_begins_the_transaction(topic, group):
+    """As in apache/kafka 4.3.1, which adds the offsets partition before checking the group:
+    the refusal stages nothing, but the transaction is ongoing and a commit succeeds."""
     t = Broker()
     txn = txn_id(topic)
     try:
         pid, epoch = t.init_pid(txn)
-        state = lambda: sql(f"SELECT state FROM kafgres_txns WHERE producer_id = {pid}")
         toc = lambda *a: t.txn_offset_commit(txn, f"{group}-ghost", pid, epoch, *a, ver=5)
         assert toc(5, "m", None, topic, 0, 1) == ILLEGAL_GENERATION
-        assert toc(-1, "", None, topic, 9, 1) == UNKNOWN_TOPIC_OR_PARTITION
-        assert state() == "empty"
+        assert sql(f"SELECT state FROM kafgres_txns WHERE producer_id = {pid}") == "ongoing"
         assert sql(f"SELECT count(*) FROM kafgres_txn_offsets WHERE producer_id = {pid}") == "0"
+        assert t.end_txn(txn, pid, epoch, True) == NONE
 
-        assert toc(-1, "", None, topic, 0, 1) == NONE
-        assert state() == "ongoing"
-        assert t.end_txn(txn, pid, epoch, False) == NONE
+        # Kafka refuses an absent topic before it adds the offsets partition.
+        txn2 = txn_id(topic)
+        pid2, epoch2 = t.init_pid(txn2)
+        assert t.txn_offset_commit(txn2, f"{group}-ghost", pid2, epoch2, -1, "", None,
+                                   f"{topic}-absent", 0, 1, ver=5) == UNKNOWN_TOPIC_OR_PARTITION
+        assert sql(f"SELECT state FROM kafgres_txns WHERE producer_id = {pid2}") == "empty"
     finally:
         t.close()
 

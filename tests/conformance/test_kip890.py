@@ -5,6 +5,7 @@ broker just retired. Every assertion compares kafgres against apache/kafka:4.3.1
 answering identical bytes.
 """
 
+import os
 import socket
 import struct
 import subprocess
@@ -13,8 +14,8 @@ import time
 import pytest
 
 KAFKA_IMAGE = "apache/kafka:4.3.1"
-KAFGRES = ("127.0.0.1", 9092)
-REFERENCE = ("127.0.0.1", 9292)
+KAFGRES = (os.environ.get("KAFGRES_HOST", "127.0.0.1"), 9092)
+REFERENCE = (os.environ.get("KAFGRES_REFERENCE_HOST", "127.0.0.1"), 9292)
 # Unique per run: a topic left by an earlier run under the other storage engine exists in
 # the metadata with no log behind it, and `--create` reports it as already there.
 RUN = int(time.time())
@@ -110,6 +111,12 @@ class _Reader:
         if n >= 0:
             self.i += n
 
+    def cstr(self):
+        n = self.uvarint() - 1
+        v = self.b[self.i:self.i + n].decode()
+        self.i += n
+        return v
+
 
 class Broker:
     """One connection, raw frames. Correlation ids increment to catch desynchronised responses."""
@@ -179,6 +186,38 @@ class Broker:
         r = self.call(26, 5, body, True)
         r.i32()
         return r.i16(), r.i64(), r.i16()
+
+    def txn_offset_commit(self, version, txn_id, group, pid, epoch, generation, member,
+                          topic_name=TOPIC):
+        """v3+: flexible, with the KIP-447 member fields. One partition, offset 1."""
+        part = _s32(0) + _s64(1) + _s32(-1) + _uvarint(1) + _uvarint(0)
+        topic = _cstr(topic_name) + _uvarint(2) + part + _uvarint(0)
+        body = (_cstr(txn_id) + _cstr(group) + _s64(pid) + _s16(epoch) + _s32(generation)
+                + _cstr(member) + _uvarint(0) + _uvarint(2) + topic + _uvarint(0))
+        r = self.call(28, version, body, True)
+        r.i32()
+        r.uvarint()                  # topics
+        r.cstr()
+        r.uvarint()                  # partitions
+        r.i32()
+        return r.i16()
+
+    def describe_transaction(self, txn_id):
+        """DescribeTransactions v0: the state and the topics in the transaction."""
+        r = self.call(65, 0, _uvarint(2) + _cstr(txn_id) + _uvarint(0) + _uvarint(0), True)
+        r.i32()
+        r.uvarint()
+        err = r.i16()
+        r.cstr()
+        state = r.cstr()
+        r.i32(); r.i64(); r.i64(); r.i16()
+        topics = []
+        for _ in range(r.uvarint() - 1):
+            topics.append(r.cstr())
+            for _ in range(r.uvarint() - 1):
+                r.i32()
+            r.uvarint()
+        return err, state, sorted(topics)
 
     def init_producer_id_v5(self, txn_id):
         """v5, flexible: the version a transaction-V2 client negotiates."""
@@ -647,4 +686,58 @@ def test_init_producer_id_aborts_the_open_transaction():
 def test_the_takeover_transcript_matches_the_reference():
     ours = _takeover_transcript(*KAFGRES, "kafgres")
     theirs = _takeover_transcript(*REFERENCE, "reference")
+    assert ours == theirs, f"\nkafgres:   {ours}\nreference: {theirs}"
+
+
+def _refused_txn_offset_commit_transcript(host, port, label, versions=(5,)):
+    """TxnOffsetCommit from a transaction-V2 producer whose every partition is refused: by
+    the group (unknown group, unknown member), by an absent topic, or by an empty group id.
+    The answer, and whether the request still began the transaction."""
+    _ensure_topic(f"{host}:{port}")
+    out = {}
+    for version in versions:
+        for case in ("unknown-group", "unknown-member", "unknown-topic", "empty-group"):
+            txn = f"kip890-refused-toc-{label}-{RUN}-v{version}-{case}"
+            group = "" if case == "empty-group" else f"{txn}-group"
+            b = _coordinated(host, port, txn, group or None)
+            try:
+                err, pid, epoch = _settle(lambda: b.init_producer_id_v5(txn))
+                assert err == NONE, f"{label}: InitProducerId error {err}"
+                if case == "unknown-member":
+                    # A committed simple commit creates the group, with no members.
+                    assert _settle(lambda: b.txn_offset_commit(
+                        5, txn, group, pid, epoch, -1, "")) == NONE
+                    _, pid, epoch = _settle(lambda: b.end_txn(txn, pid, epoch, True))
+                if case in ("unknown-group", "unknown-member"):
+                    sent = (5, "nobody", TOPIC)
+                else:
+                    sent = (-1, "", TOPIC if case == "empty-group" else f"{TOPIC}-absent")
+                code = _settle(lambda: b.txn_offset_commit(
+                    version, txn, group, pid, epoch, sent[0], sent[1], sent[2]))
+                described = _settle(lambda: b.describe_transaction(txn))
+                end = _settle(lambda: b.end_txn(txn, pid, epoch, True))[0]
+                out[f"v{version}-{case}"] = {
+                    "code": code,
+                    "ongoing": described[1] == "Ongoing",
+                    "commit_after": end,
+                }
+            finally:
+                b.close()
+    return out
+
+
+def test_a_refused_v5_txn_offset_commit_still_begins_the_transaction():
+    ours = _refused_txn_offset_commit_transcript(*KAFGRES, "kafgres")
+    assert ours == {
+        "v5-unknown-group": {"code": 22, "ongoing": True, "commit_after": NONE},
+        "v5-unknown-member": {"code": 25, "ongoing": True, "commit_after": NONE},
+        "v5-unknown-topic": {"code": 3, "ongoing": False, "commit_after": INVALID_TXN_STATE},
+        "v5-empty-group": {"code": 24, "ongoing": False, "commit_after": INVALID_TXN_STATE},
+    }, ours
+
+
+@needs_reference
+def test_the_refused_v5_txn_offset_commit_transcript_matches_the_reference():
+    ours = _refused_txn_offset_commit_transcript(*KAFGRES, "kafgres-vs")
+    theirs = _refused_txn_offset_commit_transcript(*REFERENCE, "reference")
     assert ours == theirs, f"\nkafgres:   {ours}\nreference: {theirs}"

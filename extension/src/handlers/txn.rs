@@ -694,7 +694,7 @@ pub fn handle_txn_offset_commit(
     };
 
     // KIP-447: the v3+ member fields fence a zombie consumer; before v3 they default to none.
-    let group = if code == ErrorCode::None {
+    let group = if code == ErrorCode::None && !req.group_id.is_empty() {
         let committer = super::offsets::Committer {
             group_id: &req.group_id,
             generation: req.generation_id,
@@ -711,6 +711,7 @@ pub fn handle_txn_offset_commit(
 
     let mut topics = Vec::with_capacity(req.topics.len());
     let mut accepted = Vec::new();
+    let mut any_partition = false;
     for topic in &req.topics {
         let topic_id = crate::meta::topic_id_by_name(&topic.name)
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
@@ -727,9 +728,11 @@ pub fn handle_txn_offset_commit(
                 _ if code == ErrorCode::InvalidRequest => code,
                 (None, _) => ErrorCode::UnknownTopicOrPartition,
                 _ if index < 0 || index >= count => ErrorCode::UnknownTopicOrPartition,
+                _ if req.group_id.is_empty() => ErrorCode::InvalidGroupId,
                 (Some(id), Some(g)) => g.code_for(id, index),
                 _ => code,
             };
+            any_partition |= topic_id.is_some() && (0..count).contains(&index);
             partitions.push(TxnOffsetCommitResponsePartition {
                 partition_index: index,
                 error_code: part_code.code(),
@@ -746,8 +749,11 @@ pub fn handle_txn_offset_commit(
         });
     }
 
-    // Only once something is accepted: a refused commit must not leave a transaction open.
-    if let (Ok(admitted), true) = (admitted, version >= 5 && !accepted.is_empty()) {
+    // As apache/kafka 4.3.1: v5 begins the transaction before the group checks, so a commit
+    // refused by them still leaves it ongoing; an empty group id or no existing partition
+    // stops the request first.
+    let begins = version >= 5 && any_partition && !req.group_id.is_empty();
+    if let (Ok(admitted), true) = (admitted, begins) {
         begin_or_continue(admitted, &req.transactional_id)
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
     }
