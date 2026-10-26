@@ -1,6 +1,7 @@
 //! CDC mappings: table → topic, defined in SQL. Enrichment subqueries run at render time
 
 use pgrx::prelude::*;
+use std::collections::HashMap;
 
 /// One slot for every mapping: N slots would pin WAL for the slowest and decode changes N times.
 pub const SLOT: &str = "kafgres_cdc";
@@ -54,7 +55,10 @@ fn kafgres_add_mapping(
             topic = EXCLUDED.topic,
             key_expr = EXCLUDED.key_expr,
             value_expr = EXCLUDED.value_expr,
-            filter_expr = EXCLUDED.filter_expr",
+            filter_expr = EXCLUDED.filter_expr,
+            -- A new definition renders whatever the slot replays, not only what follows it.
+            delivered_lsn = NULL,
+            delivered_seq = NULL",
         &[
             mapping_name.into(),
             source_table.into(),
@@ -435,31 +439,110 @@ unsafe fn text_column(
     if is_null {
         return None;
     }
-    let raw = datum.cast_mut_ptr::<pg_sys::varlena>();
+    Some(varlena_text(datum.cast_mut_ptr()))
+}
+
+unsafe fn varlena_text(raw: *mut pg_sys::varlena) -> String {
     let flat = pg_sys::pg_detoast_datum_packed(raw);
-    let text = String::from_utf8_lossy(pgrx::varlena::varlena_to_byte_slice(flat)).into_owned();
+    let text = from_server(pgrx::varlena::varlena_to_byte_slice(flat));
     if flat != raw {
         pg_sys::pfree(flat.cast());
     }
-    Some(text)
+    text
+}
+
+/// UTF-8 and SQL_ASCII text is passed through as bytes; any other server encoding is converted.
+fn encoding_passthrough() -> bool {
+    let enc = unsafe { pg_sys::GetDatabaseEncoding() } as u32;
+    enc == pg_sys::pg_enc::PG_UTF8 as u32 || enc == pg_sys::pg_enc::PG_SQL_ASCII as u32
+}
+
+unsafe fn from_server(bytes: &[u8]) -> String {
+    if bytes.is_ascii() || encoding_passthrough() {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let src = bytes.as_ptr().cast::<std::ffi::c_char>();
+    let converted = pg_sys::pg_server_to_any(src, bytes.len() as _, pg_sys::pg_enc::PG_UTF8 as _);
+    if converted.cast_const() == src {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let text = String::from_utf8_lossy(std::ffi::CStr::from_ptr(converted).to_bytes()).into_owned();
+    pg_sys::pfree(converted.cast());
+    text
+}
+
+unsafe fn to_server(s: &str) -> pg_sys::Datum {
+    let src = s.as_ptr().cast::<std::ffi::c_char>();
+    let converted = if s.is_ascii() || encoding_passthrough() {
+        src.cast_mut()
+    } else {
+        pg_sys::pg_any_to_server(src, s.len() as _, pg_sys::pg_enc::PG_UTF8 as _)
+    };
+    let text = if converted.cast_const() == src {
+        pg_sys::cstring_to_text_with_len(src, s.len() as _)
+    } else {
+        let t = pg_sys::cstring_to_text(converted);
+        pg_sys::pfree(converted.cast());
+        t
+    };
+    pg_sys::Datum::from(text)
+}
+
+/// SQL `text` read into UTF-8: pgrx's `String` passes server-encoded bytes through unconverted.
+struct Utf8Text(String);
+
+impl pgrx::datum::FromDatum for Utf8Text {
+    unsafe fn from_polymorphic_datum(datum: pg_sys::Datum, is_null: bool, _: pg_sys::Oid) -> Option<Self> {
+        if is_null || datum.is_null() {
+            return None;
+        }
+        Some(Utf8Text(varlena_text(datum.cast_mut_ptr())))
+    }
+}
+
+impl pgrx::datum::IntoDatum for Utf8Text {
+    fn into_datum(self) -> Option<pg_sys::Datum> {
+        ServerText(&self.0).into_datum()
+    }
+    fn type_oid() -> pg_sys::Oid {
+        pg_sys::TEXTOID
+    }
+}
+
+/// UTF-8 passed to SQL as `text` in the server encoding.
+struct ServerText<'a>(&'a str);
+
+impl pgrx::datum::IntoDatum for ServerText<'_> {
+    fn into_datum(self) -> Option<pg_sys::Datum> {
+        Some(unsafe { to_server(self.0) })
+    }
+    fn type_oid() -> pg_sys::Oid {
+        pg_sys::TEXTOID
+    }
+}
+
+fn utf8(v: Option<Utf8Text>) -> Option<String> {
+    v.map(|t| t.0)
 }
 
 /// The fields of a plugin row the drain routes on; `new` and `old` are skipped unparsed.
 #[derive(serde::Deserialize)]
-struct Head {
-    op: String,
+struct Head<'a> {
+    #[serde(borrow)]
+    op: std::borrow::Cow<'a, str>,
     #[serde(default)]
     xid: Option<i64>,
     #[serde(default)]
     ts: Option<i64>,
     #[serde(default)]
     end: Option<u64>,
-    #[serde(default)]
-    schema: Option<String>,
-    #[serde(default)]
-    table: Option<String>,
-    #[serde(default)]
-    cols: Option<Vec<(String, String)>>,
+    #[serde(default, borrow)]
+    schema: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    table: Option<std::borrow::Cow<'a, str>>,
+    /// Kept as text: runs compare shapes by it, and only a rendered run parses it.
+    #[serde(default, borrow)]
+    cols: Option<&'a serde_json::value::RawValue>,
 }
 
 pub fn parse_lsn(text: &str) -> Option<u64> {
@@ -485,23 +568,24 @@ struct Txn {
     seq: i64,
     xid: Option<i64>,
     ts: Option<i64>,
-    lsn: Option<(u64, String)>,
+    lsn: Option<u64>,
     events: i64,
-    tables: std::collections::BTreeMap<String, i64>,
+    /// Changes per schema, then table; counted only when a summary mapping exists.
+    tables: std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>>,
 }
 
 /// One mapping's changes being collected into a chunk: consecutive, one shape, bounded bytes.
 struct Run {
-    cols: Vec<(String, String)>,
+    cols: String,
     body: String,
     hold: Option<u64>,
     last: Pos,
 }
 
+type Appended = std::collections::BTreeSet<(u32, i32)>;
+
 struct Lane<'a> {
     m: &'a Mapping,
-    schema: String,
-    table: String,
     delivered: Option<Pos>,
     moved: bool,
     run: Option<Run>,
@@ -534,49 +618,65 @@ pub struct Drained {
 
 struct Drain<'a> {
     mode: Mode,
+    /// One budget for the runs of every mapping together.
     chunk_bytes: usize,
+    buffered: usize,
     lanes: Vec<Lane<'a>>,
-    appended: std::collections::BTreeSet<(u32, i32)>,
+    appended: Appended,
     produced: usize,
 }
 
 impl Drain<'_> {
-    fn offer(&mut self, lane: usize, pos: Pos, hold: Option<u64>, cols: &[(String, String)], element: &str) {
+    fn offer(&mut self, lane: usize, pos: Pos, hold: Option<u64>, cols: &str, element: &str) {
         let l = &self.lanes[lane];
         if l.stopped.is_some() || l.delivered.is_some_and(|d| pos <= d) {
             return;
         }
         // I1: rows arrive in commit order and runs flush in that order. A shape change closes
         // the run for good, since a recurring shape must not merge two runs apart in time.
-        let full = l.run.as_ref().is_some_and(|r| {
-            r.cols != cols || r.body.len() + element.len() + 2 > self.chunk_bytes
-        });
-        if full {
+        if l.run.as_ref().is_some_and(|r| r.cols != cols) {
             self.flush(lane);
-            if self.lanes[lane].stopped.is_some() {
-                return;
+        }
+        while self.buffered > 0 && self.buffered + element.len() + 2 > self.chunk_bytes {
+            let largest = (0..self.lanes.len())
+                .max_by_key(|&i| self.lanes[i].run.as_ref().map_or(0, |r| r.body.len()))
+                .unwrap_or(lane);
+            if self.lanes[largest].run.is_none() {
+                break;
             }
+            self.flush(largest);
+        }
+        if self.lanes[lane].stopped.is_some() {
+            return;
         }
         let run = self.lanes[lane].run.get_or_insert_with(|| Run {
-            cols: cols.to_vec(),
+            cols: cols.to_string(),
             body: String::from("["),
             hold,
             last: pos,
         });
-        if run.body.len() > 1 {
+        let before = run.body.len();
+        if before > 1 {
             run.body.push(',');
         }
         run.body.push_str(element);
         run.last = pos;
+        self.buffered += run.body.len() - before + usize::from(before == 1);
     }
 
     fn flush(&mut self, lane: usize) {
+        if self.lanes[lane].m.source == TRANSACTION_SOURCE && !self.flush_changes_first(lane) {
+            return;
+        }
         let Some(mut run) = self.lanes[lane].run.take() else {
             return;
         };
+        self.buffered -= run.body.len();
         run.body.push(']');
         let m = self.lanes[lane].m;
-        let done = step(self.mode, || render_and_produce(m, &run.cols, &run.body));
+        let done = serde_json::from_str::<Vec<(String, String)>>(&run.cols)
+            .map_err(|e| format!("unreadable change shape {:?}: {e}", run.cols))
+            .and_then(|cols| step(self.mode, || render_and_produce(m, &cols, &run.body)));
         let l = &mut self.lanes[lane];
         match done {
             Ok((n, partitions)) => {
@@ -589,6 +689,32 @@ impl Drain<'_> {
                 l.stopped = Some((run.hold, format!("mapping {:?} stopped the CDC slot: {e}", m.name)))
             }
         }
+    }
+
+    /// A summary follows its transaction's changes on every mapping. While a table mapping is
+    /// stopped its changes are still to come, so the summary mapping stops with it.
+    fn flush_changes_first(&mut self, lane: usize) -> bool {
+        for other in 0..self.lanes.len() {
+            if self.lanes[other].m.source != TRANSACTION_SOURCE {
+                self.flush(other);
+            }
+        }
+        let Some(blocker) = self
+            .lanes
+            .iter()
+            .find(|l| l.m.source != TRANSACTION_SOURCE && l.stopped.is_some())
+        else {
+            return true;
+        };
+        let reason = format!(
+            "mapping {:?} waits for stopped mapping {:?}, so no summary precedes its changes",
+            self.lanes[lane].m.name, blocker.m.name
+        );
+        if let Some(run) = self.lanes[lane].run.take() {
+            self.buffered -= run.body.len();
+            self.lanes[lane].stopped = Some((run.hold, reason));
+        }
+        false
     }
 }
 
@@ -603,7 +729,7 @@ fn advance_target(high: Option<u64>, holds: &[Option<u64>]) -> Option<u64> {
 /// Every partition appended to is made durable before anything records the changes as
 /// delivered; a failure leaves both alone, so the batch replays (at-least-once).
 fn sync_then<T>(
-    appended: &std::collections::BTreeSet<(u32, i32)>,
+    appended: &Appended,
     mut sync: impl FnMut(u32, i32) -> Result<(), String>,
     then: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
@@ -636,13 +762,18 @@ fn drain(max_changes: i32, mode: Mode) -> Result<Drained, String> {
         return Ok(Drained { produced: 0, stalled: Vec::new() });
     };
 
-    let moved: Vec<(String, Pos)> = d
-        .lanes
-        .iter()
-        .filter(|l| l.moved)
-        .filter_map(|l| l.delivered.map(|p| (l.m.name.clone(), p)))
-        .collect();
     let holds: Vec<Option<u64>> = d.lanes.iter().filter_map(|l| l.stopped.as_ref().map(|s| s.0)).collect();
+    // Positions only matter to a replay of a held slot; without a hold, a crash before the
+    // advance replays the whole batch (at-least-once).
+    let moved: Vec<(&Mapping, Pos)> = if holds.is_empty() {
+        Vec::new()
+    } else {
+        d.lanes
+            .iter()
+            .filter(|l| l.moved)
+            .filter_map(|l| l.delivered.map(|p| (l.m, p)))
+            .collect()
+    };
     let stalled: Vec<String> = d.lanes.iter_mut().filter_map(|l| l.stopped.take().map(|s| s.1)).collect();
 
     let appended = std::mem::take(&mut d.appended);
@@ -651,7 +782,9 @@ fn drain(max_changes: i32, mode: Mode) -> Result<Drained, String> {
         |topic, partition| step(mode, || crate::storage::open().sync_partition(topic, partition).map_err(|e| e.to_string())),
         || {
             // Recorded before the slot moves: a crash between the two replays nothing twice.
-            step(mode, || save_positions(&moved))?;
+            if !moved.is_empty() {
+                step(mode, || save_positions(&moved))?;
+            }
             if let Some(target) = advance_target(Some(high), &holds) {
                 step(mode, || advance(&format_lsn(target)))?;
             }
@@ -669,18 +802,21 @@ fn stream<'a>(
     let mut d = Drain {
         mode,
         chunk_bytes: chunk_bytes(),
+        buffered: 0,
         lanes: mappings
             .iter()
-            .map(|m| {
-                let (schema, table) = split_source(&m.source);
-                Lane { m, schema, table, delivered: m.delivered, moved: false, run: None, stopped: None }
-            })
+            .map(|m| Lane { m, delivered: m.delivered, moved: false, run: None, stopped: None })
             .collect(),
         appended: Default::default(),
         produced: 0,
     };
     let summary_lanes: Vec<usize> =
-        (0..d.lanes.len()).filter(|&i| d.lanes[i].m.source == TRANSACTION_SOURCE).collect();
+        (0..mappings.len()).filter(|&i| mappings[i].source == TRANSACTION_SOURCE).collect();
+    let mut by_table: HashMap<String, HashMap<String, Vec<usize>>> = HashMap::new();
+    for (i, m) in mappings.iter().enumerate().filter(|(_, m)| m.source != TRANSACTION_SOURCE) {
+        let (schema, table) = split_source(&m.source);
+        by_table.entry(schema).or_default().entry(table).or_default().push(i);
+    }
 
     let mut high: Option<u64> = None;
     let mut last_end: Option<u64> = None;
@@ -692,7 +828,7 @@ fn stream<'a>(
             high = Some(high.map_or(lsn, |h| h.max(lsn)));
             let head: Head = serde_json::from_str(&data)
                 .map_err(|e| format!("unreadable change at {lsn_text}: {e}"))?;
-            match head.op.as_str() {
+            match &*head.op {
                 "B" => {
                     let end = head.end.ok_or_else(|| format!("transaction at {lsn_text} has no end LSN"))?;
                     txn = Some(Txn {
@@ -710,7 +846,7 @@ fn stream<'a>(
                     if let Some(t) = txn.take().filter(|t| t.events > 0) {
                         let element = summary_element(&t);
                         for &lane in &summary_lanes {
-                            d.offer(lane, (t.end, SUMMARY_SEQ), t.prev, &[], &element);
+                            d.offer(lane, (t.end, SUMMARY_SEQ), t.prev, "[]", &element);
                         }
                     }
                     last_end = Some(lsn);
@@ -720,21 +856,24 @@ fn stream<'a>(
                         .as_mut()
                         .ok_or_else(|| format!("change at {lsn_text} outside a transaction"))?;
                     t.seq += 1;
-                    let (schema, table) = (head.schema.unwrap_or_default(), head.table.unwrap_or_default());
                     t.events += 1;
-                    *t.tables.entry(format!("{schema}.{table}")).or_default() += 1;
                     t.ts = t.ts.max(head.ts);
-                    if t.lsn.as_ref().is_none_or(|(l, _)| lsn > *l) {
-                        t.lsn = Some((lsn, lsn_text.clone()));
+                    t.lsn = t.lsn.max(Some(lsn));
+                    let (schema, table) = (head.schema.unwrap_or_default(), head.table.unwrap_or_default());
+                    if let Some(lanes) = by_table.get(&*schema).and_then(|s| s.get(&*table)) {
+                        let (pos, hold) = ((t.end, t.seq), t.prev);
+                        let cols = head.cols.map_or("[]", |c| c.get());
+                        let element = format!(r#"{{"lsn":"{lsn_text}","ch":{data}}}"#);
+                        for &lane in lanes {
+                            d.offer(lane, pos, hold, cols, &element);
+                        }
                     }
-                    let pos = (t.end, t.seq);
-                    let hold = t.prev;
-                    let cols = head.cols.unwrap_or_default();
-                    let element = format!(r#"{{"lsn":"{lsn_text}","ch":{data}}}"#);
-                    for lane in 0..d.lanes.len() {
-                        let l = &d.lanes[lane];
-                        if l.m.source != TRANSACTION_SOURCE && l.schema == schema && l.table == table {
-                            d.offer(lane, pos, hold, &cols, &element);
+                    if !summary_lanes.is_empty() {
+                        match t.tables.get_mut(&*schema).and_then(|s| s.get_mut(&*table)) {
+                            Some(n) => *n += 1,
+                            None => {
+                                t.tables.entry(schema.into_owned()).or_default().insert(table.into_owned(), 1);
+                            }
                         }
                     }
                 }
@@ -744,18 +883,29 @@ fn stream<'a>(
         let budget = d.chunk_bytes;
         rows = step(mode, || fetch_peeked(budget))?;
     }
-    for lane in 0..d.lanes.len() {
+    for lane in (0..d.lanes.len()).filter(|i| !summary_lanes.contains(i)) {
+        d.flush(lane);
+    }
+    for &lane in &summary_lanes {
         d.flush(lane);
     }
     Ok((d, high))
 }
 
 fn summary_element(t: &Txn) -> String {
-    let tables: Vec<String> = t.tables.iter().map(|(k, n)| format!("{}:{n}", json_text(k))).collect();
+    let tables: Vec<String> = t
+        .tables
+        .iter()
+        .flat_map(|(s, tables)| {
+            tables.iter().map(move |(table, n)| {
+                format!("{}:{n}", crate::decoding::json_string(&format!("{s}.{table}")))
+            })
+        })
+        .collect();
     let opt = |v: Option<i64>| v.map_or("null".to_string(), |v| v.to_string());
     format!(
         r#"{{"lsn":"{}","ch":{{"op":"T","xid":{},"ts":{},"events":{},"tables":{{{}}}}}}}"#,
-        t.lsn.as_ref().map_or("0/0", |(_, s)| s.as_str()),
+        format_lsn(t.lsn.unwrap_or(0)),
         opt(t.xid),
         opt(t.ts),
         t.events,
@@ -763,18 +913,27 @@ fn summary_element(t: &Txn) -> String {
     )
 }
 
-fn json_text(s: &str) -> String {
-    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
-}
-
-fn save_positions(moved: &[(String, Pos)]) -> Result<(), String> {
-    for (name, (end, seq)) in moved {
+/// Only while the row still has the definition the drain rendered with: a redefinition
+/// mid-drain has cleared the position, and keeping it cleared is what makes it replay.
+fn save_positions(moved: &[(&Mapping, Pos)]) -> Result<(), String> {
+    for (m, (end, seq)) in moved {
         Spi::run_with_args(
             "UPDATE kafgres_cdc_mappings SET delivered_lsn = $2::pg_lsn, delivered_seq = $3
-              WHERE mapping_name = $1",
-            &[name.as_str().into(), format_lsn(*end).into(), (*seq).into()],
+              WHERE mapping_name = $1 AND source_table = $4 AND topic = $5
+                AND value_expr = $6 AND key_expr IS NOT DISTINCT FROM $7
+                AND filter_expr IS NOT DISTINCT FROM $8",
+            &[
+                m.name.as_str().into(),
+                format_lsn(*end).into(),
+                (*seq).into(),
+                m.source.as_str().into(),
+                m.topic.as_str().into(),
+                m.value_expr.as_str().into(),
+                m.key_expr.as_deref().into(),
+                m.filter_expr.as_deref().into(),
+            ],
         )
-        .map_err(|e| format!("recording what mapping {name:?} delivered: {e}"))?;
+        .map_err(|e| format!("recording what mapping {:?} delivered: {e}", m.name))?;
     }
     Ok(())
 }
@@ -870,17 +1029,15 @@ fn render(
         m.key_expr.as_deref(),
         m.filter_expr.as_deref(),
     );
-    let owned = changes.to_string();
-
     // In a savepoint: uncontained, one bad row aborts the whole worker transaction.
     let rendered = crate::dbtx::atomically(
         || {
             Spi::run("SET LOCAL statement_timeout = '30s'").map_err(|e| e.to_string())?;
             Spi::connect(|client| {
-                let rows = client.select(&sql, None, &[owned.clone().into()])?;
+                let rows = client.select(&sql, None, &[ServerText(changes).into()])?;
                 let mut out = Vec::new();
                 for r in rows {
-                    out.push((r.get::<String>(1)?, r.get::<String>(2)?));
+                    out.push((utf8(r.get::<Utf8Text>(1)?), utf8(r.get::<Utf8Text>(2)?)));
                 }
                 Ok::<_, pgrx::spi::Error>(out)
             })
@@ -913,9 +1070,9 @@ fn render_and_produce(
     m: &Mapping,
     columns: &[(String, String)],
     changes: &str,
-) -> Result<(usize, Vec<(u32, i32)>), String> {
+) -> Result<(usize, Appended), String> {
     let Some((target, rendered)) = render_phase(m, columns, changes)? else {
-        return Ok((0, Vec::new()));
+        return Ok((0, Appended::new()));
     };
 
     if let Err(e) = Spi::run("SET LOCAL lock_timeout = '2s'") {
@@ -923,28 +1080,25 @@ fn render_and_produce(
     }
 
     let mut n = 0;
-    let mut partitions = Vec::new();
+    let mut partitions = Appended::new();
     for (key, value) in rendered {
-        let appended = produce_rendered(&target, key.as_deref(), value.as_deref());
-        if let Err(e) = appended {
-            if n == 0 {
-                return Err(e);
+        match produce_rendered(&target, key.as_deref(), value.as_deref()) {
+            Ok(p) => {
+                partitions.insert((target.topic_id, p));
+                n += 1;
             }
-            log!(
-                "kafgres: WARNING: CDC mapping {:?} appended {n} of its rendered record(s)                  and then failed: {e}. The slot advances past this batch and every change                  in it goes to kafgres_cdc_errors — on the segment engine the {n} already                  appended cannot be withdrawn, so replaying the dead letters duplicates them.",
-                m.name
-            );
-            for one in split_changes(changes)? {
-                dead_letter(m, &one, &format!("partial append after {n} record(s): {e}"));
-            }
-            return Ok((n, partitions));
-        }
-        if let Ok(p) = appended {
-            if !partitions.contains(&(target.topic_id, p)) {
-                partitions.push((target.topic_id, p));
+            Err(e) if n == 0 => return Err(e),
+            Err(e) => {
+                log!(
+                    "kafgres: WARNING: CDC mapping {:?} appended {n} of its rendered record(s)                  and then failed: {e}. The slot advances past this batch and every change                  in it goes to kafgres_cdc_errors — on the segment engine the {n} already                  appended cannot be withdrawn, so replaying the dead letters duplicates them.",
+                    m.name
+                );
+                for one in split_changes(changes)? {
+                    dead_letter(m, &one, &format!("partial append after {n} record(s): {e}"));
+                }
+                return Ok((n, partitions));
             }
         }
-        n += 1;
     }
     Ok((n, partitions))
 }
@@ -1043,11 +1197,11 @@ fn split_changes(changes: &str) -> Result<Vec<String>, String> {
         let rows = client.select(
             "SELECT jsonb_build_array(e)::text FROM jsonb_array_elements($1::jsonb) AS e",
             None,
-            &[changes.into()],
+            &[ServerText(changes).into()],
         )?;
         let mut out = Vec::new();
         for r in rows {
-            if let Some(v) = r.get::<String>(1)? {
+            if let Some(v) = utf8(r.get::<Utf8Text>(1)?) {
                 out.push(v);
             }
         }
@@ -1061,7 +1215,7 @@ fn dead_letter(m: &Mapping, one: &str, err: &str) {
         "INSERT INTO kafgres_cdc_errors (mapping_name, lsn, change, error)
          SELECT $1, (e->>'lsn')::pg_lsn, e->'ch', $3
            FROM jsonb_array_elements($2::jsonb) AS e",
-        &[m.name.clone().into(), one.into(), err.into()],
+        &[m.name.clone().into(), ServerText(one).into(), err.into()],
     );
     if let Err(e) = stored {
         log!("kafgres: could not dead-letter a change for mapping {:?}: {e}", m.name);
@@ -1208,7 +1362,7 @@ fn pending_snapshots() -> Result<Vec<SnapshotState>, String> {
             out.push(SnapshotState {
                 name: r.get::<String>(1)?.unwrap_or_default(),
                 source: r.get::<String>(2)?.unwrap_or_default(),
-                cursor: r.get::<String>(3)?,
+                cursor: utf8(r.get::<Utf8Text>(3)?),
             });
         }
         Ok::<_, pgrx::spi::Error>(out)
@@ -1341,14 +1495,14 @@ fn snapshot_page(
 
     Spi::connect(|client| {
         let rows = if cursor.is_some() {
-            client.select(&sql, None, &[cursor.into()])?
+            client.select(&sql, None, &[cursor.map(ServerText).into()])?
         } else {
             client.select(&sql, None, &[])?
         };
         for r in rows {
             return Ok::<_, pgrx::spi::Error>((
-                r.get::<String>(1)?.unwrap_or_else(|| "[]".into()),
-                r.get::<String>(2)?,
+                utf8(r.get::<Utf8Text>(1)?).unwrap_or_else(|| "[]".into()),
+                utf8(r.get::<Utf8Text>(2)?),
                 r.get::<i64>(3)?.unwrap_or(0),
             ));
         }
@@ -1364,31 +1518,30 @@ fn snapshot_step(st: &SnapshotState, limit: i32) -> Result<bool, String> {
     let shape = shape_of(&st.source)?;
     let (changes, last, n) = snapshot_page(&st.source, &pk, &shape, st.cursor.as_deref(), limit)?;
 
-    if n > 0 {
-        let (_, appended) = render_and_produce(&m, &shape, &changes)?;
-        // Durable before the snapshot cursor moves past these rows.
-        let mut store = crate::storage::open();
-        for (topic, partition) in appended {
-            store
-                .sync_partition(topic, partition)
-                .map_err(|e| format!("could not make topic {topic} partition {partition} durable: {e}"))?;
-        }
-    }
+    let appended = if n > 0 { render_and_produce(&m, &shape, &changes)?.1 } else { Appended::new() };
 
     // Short page means end of table: a full page ending at the last row looks like one with more behind it.
     let done = n < limit as i64;
-    Spi::run_with_args(
-        "UPDATE kafgres_cdc_mappings
-            SET snapshot = CASE WHEN $3 THEN 'done' ELSE 'running' END,
-                snapshot_cursor = COALESCE($2::jsonb, snapshot_cursor),
-                snapshot_rows = snapshot_rows + $4,
-                snapshot_started_at = COALESCE(snapshot_started_at, now()),
-                snapshot_finished_at = CASE WHEN $3 THEN now() ELSE NULL END
-          WHERE mapping_name = $1",
-        &[st.name.as_str().into(), last.into(), done.into(), n.into()],
+    let mut store = crate::storage::open();
+    // Durable before the snapshot cursor moves past these rows.
+    sync_then(
+        &appended,
+        |topic, partition| store.sync_partition(topic, partition).map_err(|e| e.to_string()),
+        || {
+            Spi::run_with_args(
+                "UPDATE kafgres_cdc_mappings
+                    SET snapshot = CASE WHEN $3 THEN 'done' ELSE 'running' END,
+                        snapshot_cursor = COALESCE($2::jsonb, snapshot_cursor),
+                        snapshot_rows = snapshot_rows + $4,
+                        snapshot_started_at = COALESCE(snapshot_started_at, now()),
+                        snapshot_finished_at = CASE WHEN $3 THEN now() ELSE NULL END
+                  WHERE mapping_name = $1",
+                &[st.name.as_str().into(), last.as_deref().map(ServerText).into(), done.into(), n.into()],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(done)
+        },
     )
-    .map_err(|e| e.to_string())?;
-    Ok(done)
 }
 
 fn load_mapping(name: &str) -> Result<Option<Mapping>, String> {
@@ -1610,7 +1763,8 @@ mod tests {
         .unwrap();
         assert_eq!(h.op, "U");
         assert_eq!(h.table.as_deref(), Some("t\"x"));
-        assert_eq!(h.cols.unwrap()[1], ("b".to_string(), "text".to_string()));
+        let cols: Vec<(String, String)> = serde_json::from_str(h.cols.unwrap().get()).unwrap();
+        assert_eq!(cols[1], ("b".to_string(), "text".to_string()));
         let b: Head = serde_json::from_str(r#"{"v":2,"op":"B","xid":7,"end":4294967296}"#).unwrap();
         assert_eq!(b.end, Some(1 << 32));
     }

@@ -199,15 +199,22 @@ complementary for exactly this reason.
 
 Delivery is at-least-once. The drain peeks changes from the slot, produces them, makes
 the partitions it appended to durable (an fsync on the segment engine, whatever
-`kafgres.fsync_before_ack` says), records how far each mapping got, then advances the
-slot. A crash between steps replays the changes instead of losing them; a failed fsync
+`kafgres.fsync_before_ack` says), records how far each mapping got if a stopped mapping
+holds the slot, then advances the slot. A crash between steps replays the changes instead of losing them; a failed fsync
 leaves the slot where it was. Unmapped write traffic never accumulates: the slot advances
 past every change it peeked, mapped or not.
 
-A large transaction is rendered in chunks of at most `kafgres.cdc_chunk_bytes` of decoded
-changes per mapping, in commit order, and the slot advances only once the last chunk is
-produced. The peeked changes wait in a temporary file on the server while they render,
-so a transaction of any size drains in bounded memory.
+A large transaction is rendered in chunks, in commit order, and the slot advances only
+once the last chunk is produced. The peeked changes wait in a temporary file on the
+server while they render. `kafgres.cdc_chunk_bytes` is one budget for the decoded changes
+buffered by all mappings together; past it, the largest buffer renders. A drain holds at
+most that budget of buffered changes, plus up to as much again of changes just read from
+the slot (overshot by at most 64 changes), plus the chunk being rendered: Postgres's
+copies of it (its text and parsed `jsonb`) and its rendered records, which are capped at
+256 MB. A single change larger than the budget is rendered on its own.
+
+Redefining a mapping with `kafgres_add_mapping` clears how far it got, so changes the
+slot replays are rendered by the new definition rather than skipped.
 
 ### Render failures: `on_error`
 
@@ -249,6 +256,9 @@ SELECT kafgres_add_mapping('txns', 'kafgres.transaction', 'my-transactions',
 
 `xid` on each change lets a consumer group the changes of one commit; the summary tells
 it the group is complete. This is the information Debezium's transaction topic carries.
+A summary is produced after its transaction's changes on every mapping. While another
+mapping is stopped, a summary mapping stops with it, since that mapping's changes are
+still to come.
 
 There is no `BEGIN` event: the drain only sees committed transactions. A consumer that
 buffers until the summary arrives has the same guarantee without one. `new` and `old`

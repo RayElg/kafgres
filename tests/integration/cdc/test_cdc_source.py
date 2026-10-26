@@ -690,3 +690,92 @@ def test_a_transaction_over_the_jsonb_limit_drains():
         assert int(out.stdout.strip()) == 301
     finally:
         sql("DROP TABLE IF EXISTS big")
+
+def test_a_redefined_mapping_renders_what_the_slot_replays():
+    """Redefining a mapping clears how far it got. While another mapping holds the slot,
+    the replayed changes are the new definition's to render, not skipped as delivered."""
+    for topic in ("src-stall", "src-redef"):
+        sql(f"SELECT kafgres_drop_topic('{topic}')")
+        sql(f"SELECT kafgres_create_topic('{topic}', 1)")
+    try:
+        add_mapping("jsonb_build_object('id', new.id)", name="a_ok")
+        add_mapping("jsonb_build_object('n', 1 / (new.id - 2))", name="b_stall",
+                    topic="src-stall")
+        sql("UPDATE kafgres_cdc_mappings SET on_error = 'stall' WHERE mapping_name = 'b_stall'")
+        start_slot()
+
+        sql("INSERT INTO src_orders VALUES (2,1,1,'placed','x')")
+        sql("INSERT INTO src_orders VALUES (3,1,1,'placed','x')")
+        _, err = drain_warning()
+        assert "b_stall" in err and "stopped the CDC slot" in err, err[-400:]
+        assert sorted(int(k) for _, k, _ in consume("src-events")) == [2, 3]
+
+        add_mapping("jsonb_build_object('id', new.id)", name="a_ok", topic="src-redef")
+        _, err = drain_warning()
+        assert "b_stall" in err, err[-400:]
+        assert sorted(int(k) for _, k, _ in consume("src-redef")) == [2, 3], (
+            "the new definition skipped the replayed changes as already delivered"
+        )
+    finally:
+        for topic in ("src-stall", "src-redef"):
+            sql(f"SELECT kafgres_drop_topic('{topic}')")
+
+def test_a_summary_follows_its_changes_whatever_the_mapping_names():
+    """`a_txn` sorts before `orders`, and its summary must still come after the changes it
+    summarises. One sequence in both value expressions records the order of rendering, and
+    a chunk renders just before it is appended."""
+    sql("DROP SEQUENCE IF EXISTS cdc_render_order")
+    sql("CREATE SEQUENCE cdc_render_order")
+    sql("SELECT kafgres_drop_topic('src-txn')")
+    sql("SELECT kafgres_create_topic('src-txn', 1)")
+    try:
+        add_mapping("jsonb_build_object('id', new.id, 'seq', nextval('cdc_render_order'))",
+                    name="orders")
+        add_mapping("jsonb_build_object('xid', xid, 'seq', nextval('cdc_render_order'))",
+                    key_expr=None, name="a_txn", source="kafgres.transaction", topic="src-txn")
+        start_slot()
+
+        sql("BEGIN; INSERT INTO src_orders VALUES (1,1,1,'placed','x'),(2,1,1,'placed','x'); "
+            "COMMIT")
+        assert drain() == 3
+
+        changes = [v["seq"] for v in values(consume("src-events"))]
+        summaries = [v["seq"] for v in values(consume("src-txn"))]
+        assert len(changes) == 2 and len(summaries) == 1, (changes, summaries)
+        assert max(changes) < summaries[0], f"the summary went out first: {changes} {summaries}"
+    finally:
+        sql("SELECT kafgres_drop_topic('src-txn')")
+        sql("DROP SEQUENCE IF EXISTS cdc_render_order")
+
+def test_the_chunk_budget_is_shared_by_every_mapping():
+    """`kafgres.cdc_chunk_bytes` bounds what all mappings buffer together, not each one.
+
+    Two mappings on one table, and a transaction whose two changes (about 420 bytes each)
+    fit the 1 kB budget once but not twice. A budget per mapping renders each copy in one
+    chunk, two worker transactions in all; one shared budget needs at least three.
+    """
+    for name in ("m_a", "m_b"):
+        add_mapping("jsonb_build_object('id', new.id, 'tx', pg_current_xact_id()::text)",
+                    key_expr=None, name=name)
+    start_slot()
+    set_guc("kafgres.cdc_chunk_bytes", "1024")
+    try:
+        sql("INSERT INTO src_orders SELECT g, 1, 1, 'placed', repeat('n', 110) "
+            "FROM generate_series(1, 2) g")
+        set_guc("kafgres.cdc_interval_ms", "200")
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            rows = consume("src-events")
+            if len(rows) >= 4:
+                break
+            time.sleep(1)
+        else:
+            pytest.fail(f"the worker produced {len(rows)} of 4 records")
+    finally:
+        set_guc("kafgres.cdc_interval_ms", "0")
+        set_guc("kafgres.cdc_chunk_bytes", "16777216")
+        time.sleep(1)
+
+    vs = values(rows)
+    assert sorted(v["id"] for v in vs) == [1, 1, 2, 2], vs
+    assert len({v["tx"] for v in vs}) >= 3, f"each mapping had a budget of its own: {vs}"

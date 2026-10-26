@@ -73,20 +73,14 @@ unsafe extern "C-unwind" fn change(
     let rel = &*relation;
     let desc = rel.rd_att;
     let class = &*rel.rd_rel;
-    let table = name_lossy(&class.relname);
+    let table = name_bytes(&class.relname);
 
     // Not tidiness: under the table engine the log is a Postgres table, so every record we
-    if table.starts_with("kafgres_") {
+    if table.starts_with(b"kafgres_") {
         return;
     }
-    let schema = {
-        let ns = pg_sys::get_namespace_name(class.relnamespace);
-        if ns.is_null() {
-            String::new()
-        } else {
-            std::ffi::CStr::from_ptr(ns).to_string_lossy().into_owned()
-        }
-    };
+    let ns = pg_sys::get_namespace_name(class.relnamespace);
+    let schema: &[u8] = if ns.is_null() { b"" } else { std::ffi::CStr::from_ptr(ns).to_bytes() };
 
     let tp = (*change).data.tp;
     let cols_json = columns_json(desc);
@@ -101,45 +95,44 @@ unsafe extern "C-unwind" fn change(
 
     // `ts` is the transaction's commit timestamp from the commit WAL record — always
     // present; `track_commit_timestamp` only backs pg_xact_commit_timestamp(). Microseconds.
-    emit(
-        ctx,
-        &format!(
-            r#"{{"v":3,"op":"{op}","xid":{},"ts":{},"schema":{},"table":{},"cols":{cols_json},"new":{new_json},"old":{old_json}}}"#,
-            (*txn).xid,
-            commit_time(txn),
-            json_string(&schema),
-            json_string(&table)
-        ),
-    );
+    let mut line =
+        format!(r#"{{"v":3,"op":"{op}","xid":{},"ts":{},"schema":"#, (*txn).xid, commit_time(txn))
+            .into_bytes();
+    json_bytes(&mut line, schema);
+    line.extend_from_slice(br#","table":"#);
+    json_bytes(&mut line, table);
+    line.extend_from_slice(br#","cols":"#);
+    line.extend_from_slice(&cols_json);
+    line.extend_from_slice(br#","new":"#);
+    line.extend_from_slice(&new_json);
+    line.extend_from_slice(br#","old":"#);
+    line.extend_from_slice(&old_json);
+    line.push(b'}');
+    emit(ctx, &line);
 }
 
 /// The relation's shape as of this change; `format_type_with_typemod` because `numeric(10,2)` and bare `numeric` share an OID.
-unsafe fn columns_json(desc: pg_sys::TupleDesc) -> String {
+unsafe fn columns_json(desc: pg_sys::TupleDesc) -> Vec<u8> {
     let tupdesc = pgrx::PgTupleDesc::from_pg_unchecked(desc);
-    let mut out = String::from("[");
+    let mut out = vec![b'['];
     let mut first = true;
     for att in tupdesc.iter() {
         if att.attisdropped || att.attnum <= 0 {
             continue;
         }
         if !first {
-            out.push(',');
+            out.push(b',');
         }
         first = false;
-        let name = name_lossy(&att.attname);
         let ty = pg_sys::format_type_with_typemod(att.atttypid, att.atttypmod);
-        let ty = if ty.is_null() {
-            "text".to_string()
-        } else {
-            std::ffi::CStr::from_ptr(ty).to_string_lossy().into_owned()
-        };
-        out.push('[');
-        out.push_str(&json_string(&name));
-        out.push(',');
-        out.push_str(&json_string(&ty));
-        out.push(']');
+        let ty: &[u8] = if ty.is_null() { b"text" } else { std::ffi::CStr::from_ptr(ty).to_bytes() };
+        out.push(b'[');
+        json_bytes(&mut out, name_bytes(&att.attname));
+        out.push(b',');
+        json_bytes(&mut out, ty);
+        out.push(b']');
     }
-    out.push(']');
+    out.push(b']');
     out
 }
 
@@ -149,31 +142,24 @@ unsafe fn tuple_json(
     tuple: pg_sys::HeapTuple,
     desc: pg_sys::TupleDesc,
     fallback: pg_sys::HeapTuple,
-) -> String {
+) -> Vec<u8> {
     if tuple.is_null() {
-        return "null".to_string();
+        return b"null".to_vec();
     }
     let tupdesc = pgrx::PgTupleDesc::from_pg_unchecked(desc);
-    let mut out = String::from("{");
+    let mut out = vec![b'{'];
     let mut first = true;
 
     for att in tupdesc.iter() {
         if att.attisdropped || att.attnum <= 0 {
             continue;
         }
-        let name = name_lossy(&att.attname);
-
         let mut is_null = false;
         let mut datum = pg_sys::heap_getattr(tuple, att.attnum as _, desc, &mut is_null);
 
-        // The type's own output function; inferring from the JSON side would mangle types like `numeric`.
-        let mut typoutput = pg_sys::Oid::INVALID;
-        let mut typisvarlena = false;
-        pg_sys::getTypeOutputInfo(att.atttypid, &mut typoutput, &mut typisvarlena);
-
         // An UPDATE that leaves a TOASTed column alone logs only its on-disk pointer. REPLICA
         // IDENTITY FULL logs the old tuple flattened; otherwise the column is left out.
-        if !is_null && typisvarlena && is_external_ondisk(datum) {
+        if !is_null && att.attlen == -1 && is_external_ondisk(datum) {
             if fallback.is_null() {
                 continue;
             }
@@ -184,22 +170,25 @@ unsafe fn tuple_json(
         }
 
         if !first {
-            out.push(',');
+            out.push(b',');
         }
         first = false;
-        out.push_str(&json_string(&name));
-        out.push(':');
+        json_bytes(&mut out, name_bytes(&att.attname));
+        out.push(b':');
 
         if is_null {
-            out.push_str("null");
+            out.extend_from_slice(b"null");
             continue;
         }
 
+        // The type's own output function; inferring from the JSON side would mangle types like `numeric`.
+        let mut typoutput = pg_sys::Oid::INVALID;
+        let mut typisvarlena = false;
+        pg_sys::getTypeOutputInfo(att.atttypid, &mut typoutput, &mut typisvarlena);
         let cstr = pg_sys::OidOutputFunctionCall(typoutput, datum);
-        let text = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
-        out.push_str(&json_string(&text));
+        json_bytes(&mut out, std::ffi::CStr::from_ptr(cstr).to_bytes());
     }
-    out.push('}');
+    out.push(b'}');
     out
 }
 
@@ -232,8 +221,8 @@ unsafe fn heap_tuple(tuple: pg_sys::HeapTuple) -> pg_sys::HeapTuple {
 
 /// Identifiers are bytes in the database encoding, not UTF-8; `pgrx::name_data_to_str` unwraps
 /// the conversion, and a `LATIN1` table name would fail every decode of that transaction forever.
-unsafe fn name_lossy(name: &pg_sys::NameData) -> String {
-    std::ffi::CStr::from_ptr(name.data.as_ptr()).to_string_lossy().into_owned()
+unsafe fn name_bytes(name: &pg_sys::NameData) -> &[u8] {
+    std::ffi::CStr::from_ptr(name.data.as_ptr()).to_bytes()
 }
 
 /// `VARATT_IS_EXTERNAL_ONDISK` is a C macro, open-coded: `va_header == 0x01` (little-endian) and `va_tag == VARTAG_ONDISK`.
@@ -246,27 +235,44 @@ unsafe fn is_external_ondisk(datum: pg_sys::Datum) -> bool {
 }
 
 /// Hand-rolled: a panic inside a decoding callback takes down the walsender. Escapes exactly what RFC 8259 requires.
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+/// Byte-wise, so text stays in the server encoding: every server encoding is ASCII-safe.
+fn json_bytes(out: &mut Vec<u8>, s: &[u8]) {
+    out.push(b'"');
+    for &b in s {
+        match b {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b if b < 0x20 => out.extend_from_slice(format!("\\u{b:04x}").as_bytes()),
+            b => out.push(b),
         }
     }
-    out.push('"');
-    out
+    out.push(b'"');
 }
 
-unsafe fn emit(ctx: *mut pg_sys::LogicalDecodingContext, line: &str) {
+pub(crate) fn json_string(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len() + 2);
+    json_bytes(&mut out, s.as_bytes());
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// Text in the server encoding, as a textual output plugin must write.
+unsafe fn emit(ctx: *mut pg_sys::LogicalDecodingContext, line: impl AsRef<[u8]>) {
+    let line = line.as_ref();
     pg_sys::OutputPluginPrepareWrite(ctx, true);
-    let c = std::ffi::CString::new(line).unwrap_or_default();
-    pg_sys::appendStringInfoString((*ctx).out, c.as_ptr());
+    pg_sys::appendBinaryStringInfo((*ctx).out, line.as_ptr().cast(), line.len() as _);
     pg_sys::OutputPluginWrite(ctx, true);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn non_utf8_bytes_pass_through_and_only_json_specials_are_escaped() {
+        let mut out = Vec::new();
+        super::json_bytes(&mut out, b"caf\xe9 \"q\"\\\n\x01");
+        assert_eq!(out, b"\"caf\xe9 \\\"q\\\"\\\\\\n\\u0001\"");
+        assert_eq!(super::json_string("caf\u{e9}"), "\"caf\u{e9}\"");
+    }
 }

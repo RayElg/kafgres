@@ -556,7 +556,7 @@ pub extern "C-unwind" fn _PG_init() {
     );
     GucRegistry::define_int_guc(
         c"kafgres.cdc_chunk_bytes",
-        c"Decoded change bytes a CDC mapping renders at once; a larger transaction renders in several chunks",
+        c"Decoded change bytes the CDC drain buffers across all mappings; past it, the largest buffer renders",
         c"",
         &CDC_CHUNK_BYTES,
         1024,
