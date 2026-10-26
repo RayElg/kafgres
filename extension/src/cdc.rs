@@ -763,9 +763,9 @@ fn drain(max_changes: i32, mode: Mode) -> Result<Drained, String> {
     };
 
     let holds: Vec<Option<u64>> = d.lanes.iter().filter_map(|l| l.stopped.as_ref().map(|s| s.0)).collect();
-    // Positions only matter to a replay of a held slot; without a hold, a crash before the
-    // advance replays the whole batch (at-least-once).
-    let moved: Vec<(&Mapping, Pos)> = if holds.is_empty() {
+    let appended = std::mem::take(&mut d.appended);
+    // With nothing appended and nothing held, a replay would produce nothing to duplicate.
+    let moved: Vec<(&Mapping, Pos)> = if appended.is_empty() && holds.is_empty() {
         Vec::new()
     } else {
         d.lanes
@@ -776,7 +776,6 @@ fn drain(max_changes: i32, mode: Mode) -> Result<Drained, String> {
     };
     let stalled: Vec<String> = d.lanes.iter_mut().filter_map(|l| l.stopped.take().map(|s| s.1)).collect();
 
-    let appended = std::mem::take(&mut d.appended);
     sync_then(
         &appended,
         |topic, partition| step(mode, || crate::storage::open().sync_partition(topic, partition).map_err(|e| e.to_string())),

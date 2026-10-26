@@ -199,8 +199,11 @@ complementary for exactly this reason.
 
 Delivery is at-least-once. The drain peeks changes from the slot, produces them, makes
 the partitions it appended to durable (an fsync on the segment engine, whatever
-`kafgres.fsync_before_ack` says), records how far each mapping got if a stopped mapping
-holds the slot, then advances the slot. A crash between steps replays the changes instead of losing them; a failed fsync
+`kafgres.fsync_before_ack` says), records how far each mapping got, then advances the
+slot. A crash between steps replays the changes instead of losing them. In the CDC
+worker, a crash after the positions are recorded and before the slot advances replays
+nothing twice: each mapping skips what it recorded. `kafgres_cdc_drain()` records them in
+the caller's transaction, so a crash before that commits can replay. A failed fsync
 leaves the slot where it was. Unmapped write traffic never accumulates: the slot advances
 past every change it peeked, mapped or not.
 
