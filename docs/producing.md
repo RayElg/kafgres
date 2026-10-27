@@ -58,8 +58,11 @@ computed from committed markers. Three properties of that mechanism are worth kn
 - The last stable offset is the first offset of the oldest transaction still in flight on
   the partition, so `read_committed` consumers never see records that may yet commit or
   abort. A commit becomes visible once every transaction that produced to the partition
-  before it has ended. Past 32 transactions in flight on one partition, the extra ones
-  hold the offset at the first of them until all of them have ended.
+  before it has ended. This holds at any concurrency: the broker reserves room in shared
+  memory for one in-flight transaction per Postgres process (`MaxBackends`) on every
+  tracked partition, 8 bytes each, so about 4 MB at the default `max_connections` of
+  100 and about 33 MB at 1000. `kafgres_produce()` cannot be used in a prepared
+  transaction, so prepared transactions need no room.
 
 ### Who may produce
 

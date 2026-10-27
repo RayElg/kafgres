@@ -323,7 +323,7 @@ def committed(topic):
     return list(consume(topic).values())
 
 def test_a_commit_is_visible_while_a_later_transaction_is_open(topic, sessions):
-    """RAY-5: only a still-open transaction holds the LSO back, as in Kafka."""
+    """Only a still-open transaction holds the LSO back, as in Kafka."""
     t = [sessions() for _ in range(4)]
     for s in t:
         s.run("BEGIN")
@@ -367,8 +367,7 @@ def test_a_rollback_and_a_savepoint_rollback_release_their_hold(topic, sessions)
     assert committed(topic) == ["kept"]
 
 def test_several_produces_in_one_transaction_hold_the_lso_once(topic, sessions):
-    """Many produces of one transaction take one reservation, so the partition does not
-    fall back to the conservative mark."""
+    """Many produces of one transaction take one reservation."""
     a, b = sessions(), sessions()
     a.run("BEGIN")
     for i in range(50):
@@ -378,6 +377,39 @@ def test_several_produces_in_one_transaction_hold_the_lso_once(topic, sessions):
     a.run("COMMIT")
     assert committed(topic) == [f"a{i}" for i in range(50)]
     b.run("COMMIT")
+
+def test_a_commit_is_visible_with_forty_transactions_open(topic, sessions):
+    """With 40 open transactions on one partition: a commit is visible once every
+    earlier one has ended."""
+    n = 40
+    t = [sessions() for _ in range(n)]
+    for i, s in enumerate(t):
+        s.run("BEGIN")
+        assert produce_in(s, topic, f"T{i}") == i
+    t[0].run("COMMIT")
+    assert committed(topic) == ["T0"]
+    t[2].run("COMMIT")
+    assert committed(topic) == ["T0"], "T1 is still open"
+    t[1].run("COMMIT")
+    assert committed(topic) == ["T0", "T1", "T2"]
+    for s in t[3:n - 1]:
+        s.run("COMMIT")
+    assert committed(topic) == [f"T{i}" for i in range(n - 1)], f"only T{n - 1} is open"
+    t[n - 1].run("COMMIT")
+    assert committed(topic) == [f"T{i}" for i in range(n)]
+
+def test_a_refused_prepare_releases_its_hold(topic, sessions):
+    """PREPARE TRANSACTION after a produce is refused, so no prepared transaction holds
+    the LSO."""
+    a, b = sessions(), sessions()
+    a.run("BEGIN")
+    produce_in(a, topic, "prepared")
+    b.run("BEGIN")
+    produce_in(b, topic, "kept")
+    with pytest.raises(AssertionError, match="prepared transaction"):
+        a.run("PREPARE TRANSACTION 'kafgres_refused'")
+    b.run("COMMIT")
+    assert committed(topic) == ["kept"]
 
 def list_offsets_latest(conn, topic, isolation_level):
     """ListOffsets v2 LATEST for partition 0: (error_code, offset)."""
@@ -397,7 +429,7 @@ def list_offsets_latest(conn, topic, isolation_level):
     return err, offset
 
 def test_read_committed_list_offsets_latest_is_the_lso(topic, sessions, conn):
-    """RAY-10: ListOffsets and Fetch share one bound, with a SQL transaction open."""
+    """ListOffsets and Fetch share one bound, with a SQL transaction open."""
     done = sessions()
     done.run(f"SELECT kafgres_produce('{topic}', 'k', 'done')")
     held = sessions()
@@ -410,7 +442,7 @@ def test_read_committed_list_offsets_latest_is_the_lso(topic, sessions, conn):
     assert list_offsets_latest(conn, topic, 1) == (0, 2)
 
 def test_a_rolled_back_savepoint_hides_no_later_record(topic, sessions):
-    """RAY-9: the orphan's aborted range must not cover the transaction's later records."""
+    """The orphan's aborted range must not cover the transaction's later records."""
     s = sessions()
     s.run("BEGIN")
     produce_in(s, topic, "a1")

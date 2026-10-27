@@ -212,7 +212,7 @@ def test_a_sql_produce_rolled_back_to_a_savepoint_supersedes_nothing(topic):
 @pytest.mark.skipif(engine() != "segment", reason="kafgres_produce() is segment engine only")
 def test_compaction_reads_the_xid_behind_a_post_rollback_producer_id(topic):
     """After a savepoint that produced rolls back, later batches carry a generation-tagged
-    producer id (RAY-9). Compaction must judge them by the xid it encodes."""
+    producer id. Compaction must judge them by the xid it encodes."""
     make_compacted(topic)
     sql(f"SELECT kafgres_produce('{topic}', 'k', 'v1')")
     out = subprocess.run(

@@ -200,10 +200,8 @@ const MAX_GENERATION: i64 = (1 << (62 - XID_BITS)) - 1;
 
 /// The producer id of a batch appended under `generation` of transaction `xid`.
 ///
-/// A Kafka client drops every batch of a producer id from an aborted first offset until an
-/// abort marker, which an orphan of a rolled-back savepoint never gets. Batches produced
-/// while that subtransaction was open all rolled back with it, so changing the producer id
-/// at its rollback keeps every later batch of the transaction out of the aborted range.
+/// A rolled-back savepoint's orphan never gets an abort marker, so a client would drop every
+/// later batch of the same producer id; a new id after the rollback keeps them out of that range.
 fn sql_producer_id(xid: i64, generation: i64) -> Option<i64> {
     if generation == 0 {
         return Some(xid);
