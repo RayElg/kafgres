@@ -170,7 +170,8 @@ from, so a reset moves where the next acquire begins.
   expect. Tools that consume `__consumer_offsets` directly to compute lag read nothing;
   a synthetic topic that lists in Metadata but yields no records was considered and
   rejected, because a tool would conclude the groups have committed nothing rather than
-  that the topic is not consumable.
+  that the topic is not consumable. DescribeTransactions does name it, with the partition
+  Kafka would hash the group to, once a transaction has added a group's offsets.
 
 ### Behavioural differences
 

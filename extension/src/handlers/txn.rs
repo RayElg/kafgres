@@ -238,7 +238,10 @@ pub fn begin_or_continue(admitted: Admitted, txn_id: &str) -> Result<(), pgrx::s
                 -- the same transaction, which must not extend its deadline either.
                 started_at = CASE WHEN kafgres_txns.state = 'ongoing'
                                   THEN kafgres_txns.started_at
-                                  ELSE EXCLUDED.started_at END",
+                                  ELSE EXCLUDED.started_at END,
+                offsets_partitions = CASE WHEN kafgres_txns.state = 'ongoing'
+                                          THEN kafgres_txns.offsets_partitions
+                                          ELSE '{}' END",
         &[
             producer_id.into(),
             (epoch as i32).into(),
@@ -254,6 +257,37 @@ fn add_partition(producer_id: i64, topic_id: u32, partition: i32) -> Result<(), 
          VALUES ($1, $2::oid, $3) ON CONFLICT DO NOTHING",
         &[producer_id.into(), (topic_id as i32).into(), partition.into()],
     )
+}
+
+/// Kafka's default `offsets.topic.num.partitions`.
+const OFFSETS_TOPIC_PARTITIONS: i32 = 50;
+
+/// The `__consumer_offsets` partition Kafka keeps `group` in: `Utils.abs(groupId.hashCode())`
+/// (Java's string hash, over UTF-16) modulo the partition count.
+pub fn offsets_partition(group: &str) -> i32 {
+    let h = group.encode_utf16().fold(0i32, |h, u| h.wrapping_mul(31).wrapping_add(u as i32));
+    if h == i32::MIN { 0 } else { h.abs() % OFFSETS_TOPIC_PARTITIONS }
+}
+
+fn add_offsets_partition(admitted: Admitted, group: &str) -> Result<(), pgrx::spi::Error> {
+    Spi::run_with_args(
+        "UPDATE kafgres_txns SET offsets_partitions = array_append(offsets_partitions, $2)
+          WHERE producer_id = $1 AND NOT $2 = ANY(offsets_partitions)",
+        &[admitted.producer_id.into(), offsets_partition(group).into()],
+    )
+}
+
+fn offsets_partition_added(admitted: Admitted, group: &str) -> Result<bool, pgrx::spi::Error> {
+    Ok(Spi::get_one_with_args::<bool>(
+        "SELECT (SELECT state = 'ongoing' AND producer_epoch = $2 AND $3 = ANY(offsets_partitions)
+                   FROM kafgres_txns WHERE producer_id = $1)",
+        &[
+            admitted.producer_id.into(),
+            (admitted.epoch as i32).into(),
+            offsets_partition(group).into(),
+        ],
+    )?
+    .unwrap_or(false))
 }
 
 /// A transactional batch checked against its transaction before append (KIP-890).
@@ -371,7 +405,8 @@ pub fn handle_end_txn(req: &EndTxnRequest, version: i16) -> Result<EndTxnRespons
                 return Ok(unchanged(ErrorCode::InvalidTxnState));
             }
             Spi::run_with_args(
-                "UPDATE kafgres_txns SET state = 'aborted' WHERE producer_id = $1",
+                "UPDATE kafgres_txns SET state = 'aborted', offsets_partitions = '{}'
+                  WHERE producer_id = $1",
                 &[req.producer_id.into()],
             )
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
@@ -568,7 +603,7 @@ fn finish_transaction(
     )
     .map_err(|e| HandlerError::Internal(e.to_string()))?;
     Spi::run_with_args(
-        "UPDATE kafgres_txns SET state = $2 WHERE producer_id = $1",
+        "UPDATE kafgres_txns SET state = $2, offsets_partitions = '{}' WHERE producer_id = $1",
         &[
             producer_id.into(),
             if committed { "committed" } else { "aborted" }.into(),
@@ -664,6 +699,7 @@ pub fn handle_add_offsets(
         Err(v) => v.code(version),
         Ok(admitted) => {
             begin_or_continue(admitted, &req.transactional_id)
+                .and_then(|()| add_offsets_partition(admitted, &req.group_id))
                 .map_err(|e| HandlerError::Internal(e.to_string()))?;
             ErrorCode::None
         }
@@ -693,8 +729,27 @@ pub fn handle_txn_offset_commit(
         Ok(_) => ErrorCode::None,
     };
 
+    // Before v5 the group's offsets partition must already be in the transaction (KIP-890
+    // verification), checked before the group itself.
+    let unverified = match admitted {
+        Ok(admitted) if version < 5 && !req.group_id.is_empty() => {
+            if offsets_partition_added(admitted, &req.group_id)
+                .map_err(|e| HandlerError::Internal(e.to_string()))?
+            {
+                ErrorCode::None
+            } else if version >= 4 {
+                ErrorCode::TransactionAbortable
+            } else {
+                ErrorCode::InvalidTxnState
+            }
+        }
+        _ => ErrorCode::None,
+    };
+
     // KIP-447: the v3+ member fields fence a zombie consumer; before v3 they default to none.
-    let group = if code == ErrorCode::None && !req.group_id.is_empty() {
+    let group = if code == ErrorCode::None && unverified == ErrorCode::None
+        && !req.group_id.is_empty()
+    {
         let committer = super::offsets::Committer {
             group_id: &req.group_id,
             generation: req.generation_id,
@@ -724,11 +779,13 @@ pub fn handle_txn_offset_commit(
         for part in &topic.partitions {
             let index = part.partition_index;
             let part_code = match (topic_id, &group) {
-                // An empty transactional id is refused before any topic lookup.
-                _ if code == ErrorCode::InvalidRequest => code,
+                // An empty transactional id is refused before any topic lookup, unless the
+                // group id is empty too: Kafka answers that INVALID_GROUP_ID.
+                _ if code == ErrorCode::InvalidRequest && !req.group_id.is_empty() => code,
                 (None, _) => ErrorCode::UnknownTopicOrPartition,
                 _ if index < 0 || index >= count => ErrorCode::UnknownTopicOrPartition,
                 _ if req.group_id.is_empty() => ErrorCode::InvalidGroupId,
+                _ if unverified != ErrorCode::None => unverified,
                 (Some(id), Some(g)) => g.code_for(id, index),
                 _ => code,
             };
@@ -755,6 +812,7 @@ pub fn handle_txn_offset_commit(
     let begins = version >= 5 && any_partition && !req.group_id.is_empty();
     if let (Ok(admitted), true) = (admitted, begins) {
         begin_or_continue(admitted, &req.transactional_id)
+            .and_then(|()| add_offsets_partition(admitted, &req.group_id))
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
     }
     for (topic_id, part) in accepted {
@@ -977,7 +1035,7 @@ fn finish_partition(
     )
     .map_err(|e| HandlerError::Internal(e.to_string()))?;
     Spi::run_with_args(
-        "UPDATE kafgres_txns SET state = $2 WHERE producer_id = $1",
+        "UPDATE kafgres_txns SET state = $2, offsets_partitions = '{}' WHERE producer_id = $1",
         &[
             producer_id.into(),
             if committed { "committed" } else { "aborted" }.into(),

@@ -1,12 +1,12 @@
 """Zombies: a producer or consumer that was replaced but keeps sending.
 
-RAY-7: a transactional Produce from a fenced epoch, or to a partition not added to the
+A transactional Produce from a fenced epoch, or to a partition not added to the
 transaction, is refused before it is written, or its successor's commit publishes it.
 
-RAY-8: OffsetCommit and TxnOffsetCommit check the member, generation and group state, or
+OffsetCommit and TxnOffsetCommit check the member, generation and group state, or
 an evicted consumer's late commit rewinds its successor's offset.
 
-RAY-11: the producer-id sweep spares a producer with an open transaction, or its EndTxn
+The producer-id sweep spares a producer with an open transaction, or its EndTxn
 fails with INVALID_PRODUCER_ID_MAPPING and the LSO stays pinned; and a transaction whose
 producer row is already gone is still aborted.
 
@@ -315,7 +315,7 @@ def txn_id(name):
     return f"{name}-{uuid.uuid4().hex[:8]}"
 
 
-# ---------------------------------------------------------------- RAY-7
+# ---------------------------------------------------------------- Produce fencing
 
 
 @pytest.mark.parametrize("version,current_code", [
@@ -473,7 +473,7 @@ def test_a_transaction_aborted_behind_a_waiting_request_stays_aborted(topic, req
             b.close()
 
 
-# ---------------------------------------------------------------- RAY-8
+# ---------------------------------------------------------------- Offset commit checks
 
 
 def test_commits_naming_no_live_member(topic, group):
@@ -643,7 +643,7 @@ def test_a_refused_v5_txn_offset_commit_still_begins_the_transaction(topic, grou
         t.close()
 
 
-# ---------------------------------------------------------------- RAY-11
+# ---------------------------------------------------------------- Producer-id sweep
 
 
 @pytest.fixture

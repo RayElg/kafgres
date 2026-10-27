@@ -211,13 +211,18 @@ class Broker:
         r.cstr()
         state = r.cstr()
         r.i32(); r.i64(); r.i64(); r.i16()
-        topics = []
+        topics = {}
         for _ in range(r.uvarint() - 1):
-            topics.append(r.cstr())
-            for _ in range(r.uvarint() - 1):
-                r.i32()
+            name = r.cstr()
+            topics[name] = sorted(r.i32() for _ in range(r.uvarint() - 1))
             r.uvarint()
-        return err, state, sorted(topics)
+        return err, state, topics
+
+    def add_offsets(self, txn_id, pid, epoch, group):
+        """v2, non-flexible."""
+        r = self.call(25, 2, _nstr(txn_id) + _s64(pid) + _s16(epoch) + _nstr(group), False)
+        r.i32()
+        return r.i16()
 
     def init_producer_id_v5(self, txn_id):
         """v5, flexible: the version a transaction-V2 client negotiates."""
@@ -689,55 +694,84 @@ def test_the_takeover_transcript_matches_the_reference():
     assert ours == theirs, f"\nkafgres:   {ours}\nreference: {theirs}"
 
 
-def _refused_txn_offset_commit_transcript(host, port, label, versions=(5,)):
-    """TxnOffsetCommit from a transaction-V2 producer whose every partition is refused: by
-    the group (unknown group, unknown member), by an absent topic, or by an empty group id.
-    The answer, and whether the request still began the transaction."""
+def _txn_offset_commit_transcript(host, port, label, versions=(3, 4, 5)):
+    """TxnOffsetCommit from a transaction-V2 producer, per version: refused by the group
+    (unknown group, unknown member), by an absent topic or an empty group id, after
+    AddOffsetsToTxn, and the precedence of an empty group id against a fenced producer
+    and an empty transactional id. The answer, then the transaction as described, then
+    what a commit of it answers."""
     _ensure_topic(f"{host}:{port}")
     out = {}
     for version in versions:
-        for case in ("unknown-group", "unknown-member", "unknown-topic", "empty-group"):
-            txn = f"kip890-refused-toc-{label}-{RUN}-v{version}-{case}"
-            group = "" if case == "empty-group" else f"{txn}-group"
+        for case in ("unknown-group", "unknown-member", "unknown-topic", "empty-group",
+                     "after-add-offsets", "fenced-empty-group", "no-txn-id-empty-group"):
+            txn = f"kip890-toc-{label}-{RUN}-v{version}-{case}"
+            group = "" if "empty-group" in case else f"{txn}-group"
             b = _coordinated(host, port, txn, group or None)
             try:
                 err, pid, epoch = _settle(lambda: b.init_producer_id_v5(txn))
                 assert err == NONE, f"{label}: InitProducerId error {err}"
+                gen, member, topic = 5, "nobody", TOPIC
                 if case == "unknown-member":
                     # A committed simple commit creates the group, with no members.
                     assert _settle(lambda: b.txn_offset_commit(
                         5, txn, group, pid, epoch, -1, "")) == NONE
                     _, pid, epoch = _settle(lambda: b.end_txn(txn, pid, epoch, True))
-                if case in ("unknown-group", "unknown-member"):
-                    sent = (5, "nobody", TOPIC)
-                else:
-                    sent = (-1, "", TOPIC if case == "empty-group" else f"{TOPIC}-absent")
+                if case in ("unknown-topic", "empty-group", "after-add-offsets",
+                            "fenced-empty-group", "no-txn-id-empty-group"):
+                    gen, member = -1, ""
+                if case == "unknown-topic":
+                    topic = f"{TOPIC}-absent"
+                if case == "after-add-offsets":
+                    assert _settle(lambda: b.add_offsets(txn, pid, epoch, group)) == NONE
+                sent_txn, sent_epoch = txn, epoch
+                if case == "fenced-empty-group":
+                    _settle(lambda: b.init_producer_id_v5(txn))
+                if case == "no-txn-id-empty-group":
+                    sent_txn = ""
                 code = _settle(lambda: b.txn_offset_commit(
-                    version, txn, group, pid, epoch, sent[0], sent[1], sent[2]))
-                described = _settle(lambda: b.describe_transaction(txn))
-                end = _settle(lambda: b.end_txn(txn, pid, epoch, True))[0]
-                out[f"v{version}-{case}"] = {
-                    "code": code,
-                    "ongoing": described[1] == "Ongoing",
-                    "commit_after": end,
-                }
+                    version, sent_txn, group, pid, sent_epoch, gen, member, topic))
+                row = {"code": code}
+                if case not in ("fenced-empty-group", "no-txn-id-empty-group"):
+                    _, state, topics = _settle(lambda: b.describe_transaction(txn))
+                    row["state"] = state
+                    row["topics"] = {
+                        t: "by-group" if t == "__consumer_offsets"
+                        and parts == [_offsets_partition(group)] else parts
+                        for t, parts in topics.items()}
+                    row["commit_after"] = _settle(lambda: b.end_txn(txn, pid, epoch, True))[0]
+                out[f"v{version}-{case}"] = row
             finally:
                 b.close()
     return out
 
 
-def test_a_refused_v5_txn_offset_commit_still_begins_the_transaction():
-    ours = _refused_txn_offset_commit_transcript(*KAFGRES, "kafgres")
-    assert ours == {
-        "v5-unknown-group": {"code": 22, "ongoing": True, "commit_after": NONE},
-        "v5-unknown-member": {"code": 25, "ongoing": True, "commit_after": NONE},
-        "v5-unknown-topic": {"code": 3, "ongoing": False, "commit_after": INVALID_TXN_STATE},
-        "v5-empty-group": {"code": 24, "ongoing": False, "commit_after": INVALID_TXN_STATE},
-    }, ours
+def test_txn_offset_commit_begins_and_refuses_as_kafka_does():
+    ours = _txn_offset_commit_transcript(*KAFGRES, "kafgres", versions=(4, 5))
+    offsets = {"__consumer_offsets": "by-group"}
+    assert ours["v5-unknown-group"]["code"] == 22
+    assert ours["v5-unknown-group"]["state"] == "Ongoing"
+    assert ours["v5-unknown-member"]["commit_after"] == NONE
+    assert ours["v5-unknown-topic"] == {
+        "code": 3, "state": "Empty", "topics": {}, "commit_after": INVALID_TXN_STATE}
+    assert ours["v5-empty-group"]["code"] == 24
+    assert ours["v4-unknown-group"]["code"] == 120, "no AddOffsetsToTxn was sent"
+    assert ours["v5-after-add-offsets"] == {
+        "code": NONE, "state": "Ongoing", "topics": offsets, "commit_after": NONE}
 
 
 @needs_reference
-def test_the_refused_v5_txn_offset_commit_transcript_matches_the_reference():
-    ours = _refused_txn_offset_commit_transcript(*KAFGRES, "kafgres-vs")
-    theirs = _refused_txn_offset_commit_transcript(*REFERENCE, "reference")
+def test_the_txn_offset_commit_transcript_matches_the_reference():
+    ours = _txn_offset_commit_transcript(*KAFGRES, "kafgres-vs")
+    theirs = _txn_offset_commit_transcript(*REFERENCE, "reference")
     assert ours == theirs, f"\nkafgres:   {ours}\nreference: {theirs}"
+
+
+def _offsets_partition(group, partitions=50):
+    """Kafka's `Utils.abs(groupId.hashCode()) % offsets.topic.num.partitions`, default 50."""
+    data = group.encode("utf-16-be")
+    h = 0
+    for i in range(0, len(data), 2):
+        h = (31 * h + int.from_bytes(data[i:i + 2], "big")) & 0xFFFFFFFF
+    h = h - (1 << 32) if h >= 1 << 31 else h
+    return 0 if h == -(1 << 31) else abs(h) % partitions
