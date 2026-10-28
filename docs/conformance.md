@@ -235,10 +235,6 @@ matches.
 - **Static membership (KIP-345) is not enforced.** A member joining with a used
   `group.instance.id` does not fence the first; Kafka answers the first `FENCED_INSTANCE_ID`.
   `group-static` (Java, librdkafka, Sarama, franz-go); leave and rejoin matches.
-- **`OffsetCommit` does not validate the member.** kafgres stores a commit with no member
-  id and generation -1 while the group has members (Kafka: `UNKNOWN_MEMBER_ID`), and one
-  from a fenced member or a stale generation (Kafka: `ILLEGAL_GENERATION`). `group-admin`,
-  Java.
 - **Sarama-produced batches are not searchable by time.** Sarama sends max timestamp -1 in
   the batch header. Kafka recomputes it on append; kafgres stores header and CRC verbatim,
   so time lookups miss Sarama's records. `offsets-by-time`, `admin-offsets`, Sarama.
