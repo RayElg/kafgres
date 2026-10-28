@@ -10,7 +10,10 @@ use pgrx::prelude::*;
 
 use kafgres_codec::records::{self, RecordBatch};
 
+mod pending;
+
 use super::pmeta;
+use pending::PendingRing;
 use super::{
     FetchSlice, IsolationLevel, LogStore, RawBatch, RetentionPolicy, StoreError, StoreResult,
     TopicId, TxnContext,
@@ -86,9 +89,9 @@ pub struct Slot {
     next_offset: i64,
     active_base: i64,
     active_bytes: u64,
-    pending_count: i32,
-    /// Lowest offset written by an uncommitted transaction, or `-1`; the LSO derives from it.
-    pending_from: i64,
+    /// First offset of each in-flight `kafgres_produce()` transaction, in ring `ring_index`.
+    pending: PendingRing,
+    ring_index: u32,
     active_since_ms: i64,
     /// Cached because the roll decision runs under the shard lock, where SPI is not allowed.
     segment_ms: i64,
@@ -115,8 +118,8 @@ impl Default for Slot {
             next_offset: 0,
             active_base: 0,
             active_bytes: 0,
-            pending_count: 0,
-            pending_from: -1,
+            pending: PendingRing::default(),
+            ring_index: 0,
             active_since_ms: 0,
             segment_bytes: 0,
             segment_ms: 604_800_000,
@@ -131,6 +134,14 @@ impl Default for Slot {
 }
 
 impl Slot {
+    /// Lowest offset an in-flight SQL transaction may still commit or abort, else `next_offset`.
+    fn pending_floor(&self) -> i64 {
+        match self.pending.floor() {
+            Some(b) => b.min(self.next_offset),
+            None => self.next_offset,
+        }
+    }
+
     /// The slot is shared memory and never rolls back; a `slot > seed` bump whose transaction has
     fn epoch_for_append(&mut self, seed: i32) -> StoreResult<i32> {
         if self.leader_epoch < 0 || seed > self.leader_epoch {
@@ -160,6 +171,8 @@ macro_rules! shards {
             [$(&$name),*];
         pub fn init_shmem() {
             $(pgrx::pg_shmem_init!($name = [Slot::default(); SLOTS_PER_SHARD]);)*
+            use pending::PENDING_REGION;
+            pgrx::pg_shmem_init!(PENDING_REGION = ());
         }
     };
 }
@@ -420,8 +433,8 @@ fn slot_for(slots: &mut [Slot; SLOTS_PER_SHARD], topic: TopicId, partition: i32)
         next_offset: recovered.next_offset,
         active_base: recovered.active_base,
         active_bytes: recovered.active_bytes,
-        pending_count: 0,
-        pending_from: -1,
+        pending: PendingRing::default(),
+        ring_index: (shard_of(topic, partition) * SLOTS_PER_SHARD + i) as u32,
         active_since_ms: 0,
         segment_ms: 604_800_000,
         segment_bytes: 0,
@@ -2334,13 +2347,7 @@ impl LogStore for SegmentStore {
         for probe in 0..SLOTS_PER_SHARD {
             let i = (start + probe) % SLOTS_PER_SHARD;
             if slots[i].topic == topic && slots[i].partition == partition {
-                // `pending_from` is the first offset an uncommitted transaction wrote, or
-                let st = &slots[i];
-                return Ok(Some(if st.pending_from >= 0 {
-                    st.pending_from
-                } else {
-                    st.next_offset
-                }));
+                return Ok(Some(slots[i].pending_floor()));
             }
             if slots[i].topic == 0 {
                 break;
@@ -2527,8 +2534,9 @@ impl LogStore for SegmentStore {
         topic: TopicId,
         partition: i32,
         batch: RawBatch,
+        reserve: bool,
     ) -> StoreResult<(i64, i64)> {
-        self.append_pending_impl(topic, partition, batch)
+        self.append_pending_impl(topic, partition, batch, reserve)
     }
 
     /// The only place committed records are deliberately destroyed: a leader's
@@ -2710,12 +2718,14 @@ impl LogStore for SegmentStore {
 }
 
 impl SegmentStore {
-    /// Append `batch` and reserve its offsets for an uncommitted transaction: until the caller's
+    /// Append `batch` for an uncommitted transaction. `reserve` holds the LSO at its base until
+    /// `release_pending`; without it, the transaction's earlier reservation here must cover it.
     fn append_pending_impl(
         &mut self,
         topic: TopicId,
         partition: i32,
         batch: RawBatch,
+        reserve: bool,
     ) -> StoreResult<(i64, i64)> {
         let seed = self.leader_epoch(topic, partition)?;
         let (seg_ms, seg_bytes) = roll_bounds_cached(topic);
@@ -2725,19 +2735,29 @@ impl SegmentStore {
             let epoch = st.epoch_for_append(seed)?;
             let base_offset = st.next_offset;
             let last_offset = base_offset + batch.last_offset_delta as i64;
+            // SAFETY: `with_slot` holds this slot's shard exclusively.
+            let ring = unsafe { pending::ring_mut(st.ring_index as usize) };
+            // Refused before the append, so no record is left unreserved.
+            if reserve && st.pending.len() >= ring.len() {
+                return Err(StoreError::Io(format!(
+                    "the reservation ring of topic {topic} partition {partition} is full \
+                     ({} of {} entries; its size is MaxBackends at startup)",
+                    st.pending.len(),
+                    ring.len()
+                )));
+            }
             Self::write_batch(topic, partition, st, hints, batch, epoch, base_offset)?;
 
-            // Conservative on purpose: the low-water mark does not rise as earlier transactions commit
-            if st.pending_count == 0 {
-                st.pending_from = base_offset;
+            // In the append's critical section, so no reader sees these offsets unreserved.
+            if reserve {
+                st.pending.reserve(ring, base_offset);
             }
-            st.pending_count += 1;
             Ok((base_offset, last_offset))
         })
     }
 
-    /// Release one uncommitted reservation, on both commit and abort: missing it on the abort
-    pub fn release_pending(topic: TopicId, partition: i32) {
+    /// Release the reservation made at `base`, on both commit and abort: missing it on the abort
+    pub fn release_pending(topic: TopicId, partition: i32, base: i64) {
         // Runs in a commit or abort callback, where a panic is a PANIC: no indexing.
         let Some(shard) = SHARDS.get(shard_of(topic, partition)) else {
             pgrx::warning!("kafgres: no lock shard for topic {topic} partition {partition}; reservation not released");
@@ -2746,10 +2766,9 @@ impl SegmentStore {
         let mut slots = shard.exclusive();
         for slot in slots.iter_mut() {
             if slot.topic == topic && slot.partition == partition {
-                slot.pending_count = (slot.pending_count - 1).max(0);
-                if slot.pending_count == 0 {
-                    slot.pending_from = -1;
-                }
+                // SAFETY: the shard is held exclusively.
+                let ring = unsafe { pending::ring_mut(slot.ring_index as usize) };
+                slot.pending.release(ring, base);
                 return;
             }
         }
@@ -2758,13 +2777,7 @@ impl SegmentStore {
     /// The Last Stable Offset: the first offset a `read_committed` consumer must not pass.
     fn last_stable_offset_impl(&self, topic: TopicId, partition: i32) -> StoreResult<i64> {
         // Two mechanisms hold this back and both must be consulted: `pending_*` covers
-        let pending = Self::with_slot(topic, partition, |st, _| {
-            Ok(if st.pending_count > 0 {
-                st.pending_from
-            } else {
-                st.next_offset
-            })
-        })?;
+        let pending = Self::with_slot(topic, partition, |st, _| Ok(st.pending_floor()))?;
         match pmeta::kafka_txn_lso(topic, partition)? {
             Some(kafka) if kafka >= 0 => Ok(pending.min(kafka)),
             _ => Ok(pending),
@@ -2948,6 +2961,95 @@ mod slot_tests {
         assert_eq!(slot.leader_epoch, 5, "the refusal must not disturb the slot");
 
         assert_eq!(slot.epoch_for_append(5).unwrap(), 5);
+    }
+
+    /// A slot and a ring of `cap` entries standing in for its shared-memory one.
+    struct Held {
+        slot: Slot,
+        ring: Vec<i64>,
+    }
+
+    impl Held {
+        fn new(next_offset: i64, cap: usize) -> Held {
+            Held { slot: Slot { next_offset, ..Slot::default() }, ring: vec![0; cap] }
+        }
+        fn reserve(&mut self, base: i64) -> bool {
+            self.slot.pending.reserve(&mut self.ring, base)
+        }
+        fn release(&mut self, base: i64) {
+            self.slot.pending.release(&mut self.ring, base);
+        }
+        fn floor(&self) -> i64 {
+            self.slot.pending_floor()
+        }
+    }
+
+    #[test]
+    fn a_committed_transaction_stops_holding_the_lso_while_later_ones_are_open() {
+        let mut h = Held::new(0, 4);
+        assert_eq!(h.floor(), 0);
+        for base in 0..2 {
+            h.reserve(base);
+            h.slot.next_offset = base + 1;
+        }
+        assert_eq!(h.floor(), 0);
+        h.release(0);
+        assert_eq!(h.floor(), 1, "T1 committed; only T2 is open");
+        h.reserve(2);
+        h.slot.next_offset = 3;
+        h.release(1);
+        assert_eq!(h.floor(), 2, "T3 is open");
+        h.release(2);
+        assert_eq!(h.floor(), 3);
+    }
+
+    #[test]
+    fn a_later_commit_does_not_raise_the_lso_past_an_earlier_open_transaction() {
+        let mut h = Held::new(10, 4);
+        h.reserve(10);
+        h.reserve(11);
+        h.slot.next_offset = 12;
+        h.release(11);
+        assert_eq!(h.floor(), 10);
+        h.release(10);
+        assert_eq!(h.floor(), 12);
+    }
+
+    #[test]
+    fn many_open_transactions_hold_the_lso_only_at_the_oldest() {
+        let n = 64;
+        let mut h = Held::new(0, n);
+        for base in 0..n as i64 {
+            assert!(h.reserve(base));
+        }
+        h.slot.next_offset = n as i64;
+        h.release(0);
+        assert_eq!(h.floor(), 1);
+        for base in (2..n as i64).rev() {
+            h.release(base);
+            assert_eq!(h.floor(), 1, "transaction 1 is still open");
+        }
+        h.release(1);
+        assert_eq!(h.floor(), n as i64);
+    }
+
+    /// A release with nothing held, e.g. after the partition was dropped and recreated.
+    #[test]
+    fn a_stray_release_changes_nothing() {
+        let mut h = Held::new(5, 4);
+        h.release(3);
+        assert_eq!(h.floor(), 5);
+        h.reserve(5);
+        h.slot.next_offset = 6;
+        h.release(3);
+        assert_eq!(h.floor(), 5);
+    }
+
+    #[test]
+    fn a_default_slot_holds_nothing() {
+        let slot = Slot::default();
+        assert_eq!(slot.pending.floor(), None);
+        assert_eq!(slot.pending_floor(), 0);
     }
 
     /// A postmaster crash-restart wipes shared memory. The slot relearns from Postgres, and

@@ -1,6 +1,7 @@
 """Log compaction (`cleanup.policy=compact`): a surviving record keeps the offset it was
 written at — the log becomes sparse, never renumbered."""
 
+import os
 import subprocess
 import time
 
@@ -10,7 +11,7 @@ from conftest import sql
 
 CLIENTS = "kafgres-clients"
 KAFKA = "apache/kafka:4.1.0"
-BROKER = "127.0.0.1:9092"
+BROKER = f"{os.environ.get('KAFGRES_HOST', '127.0.0.1')}:9092"
 
 def kafka_tool(script, *args, timeout=300):
     return subprocess.run(
@@ -207,6 +208,36 @@ def test_a_sql_produce_rolled_back_to_a_savepoint_supersedes_nothing(topic):
     assert "k=v1" in values.stdout.split(), (
         f"the committed value was superseded by a rolled-back one: {values.stdout.split()[:6]}"
     )
+
+@pytest.mark.skipif(engine() != "segment", reason="kafgres_produce() is segment engine only")
+def test_compaction_reads_the_xid_behind_a_post_rollback_producer_id(topic):
+    """After a savepoint that produced rolls back, later batches carry a generation-tagged
+    producer id. Compaction must judge them by the xid it encodes."""
+    make_compacted(topic)
+    sql(f"SELECT kafgres_produce('{topic}', 'k', 'v1')")
+    out = subprocess.run(
+        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-X", "-q",
+         "-v", "ON_ERROR_STOP=1", "-c",
+         f"BEGIN; SAVEPOINT a; SELECT kafgres_produce('{topic}', 'k', 'v2'); "
+         "ROLLBACK TO SAVEPOINT a; "
+         f"SAVEPOINT b; SELECT kafgres_produce('{topic}', 'k', 'v3'); "
+         "ROLLBACK TO SAVEPOINT b; "
+         f"SELECT kafgres_produce('{topic}', 'j', 'w1'); COMMIT;"],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    # k:v4 supersedes v1, so v1 going proves the pass judged the tagged batches.
+    produce(topic, ["k:v4", "a:1", "b:1", "c:1", "d:1"])
+
+    for _ in range(3):
+        compact()
+    values = kcat("-C", "-t", topic, "-o", "beginning", "-e", "-q",
+                  "-X", "isolation.level=read_committed", "-f", "%k=%s\n")
+    got = [v[:4] for v in values.stdout.split()]
+    assert "j=w1" in got, f"the committed post-rollback record is gone: {got}"
+    assert "k=v4" in got, got
+    assert "k=v1" not in got, f"the pass did not get past the tagged batches: {got}"
+    assert "k=v2" not in got and "k=v3" not in got, got
 
 def test_a_null_key_is_refused_on_a_compacted_topic(topic):
     """Verified against Kafka 4.1.0: INVALID_RECORD at produce time."""
