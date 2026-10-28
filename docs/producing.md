@@ -203,8 +203,11 @@ the partitions it appended to durable (an fsync on the segment engine, whatever
 slot. A crash between steps replays the changes instead of losing them. In the CDC
 worker, a crash after the positions are recorded and before the slot advances replays
 nothing twice: each mapping skips what it recorded. `kafgres_cdc_drain()` records them in
-the caller's transaction, so a crash before that commits can replay. A failed fsync
-leaves the slot where it was. Unmapped write traffic never accumulates: the slot advances
+the caller's transaction, so a crash before that commits can replay. Advancing the slot is
+not transactional, though: call `kafgres_cdc_drain()` inside a transaction you then roll
+back and the slot has moved on. On the table engine the records and positions roll back
+with it, so those changes are lost. Call it where a rollback does not follow, or leave the
+draining to the CDC worker. A failed fsync leaves the slot where it was. Unmapped write traffic never accumulates: the slot advances
 past every change it peeked, mapped or not.
 
 A large transaction is rendered in chunks, in commit order, and the slot advances only

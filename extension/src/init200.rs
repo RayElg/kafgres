@@ -4,7 +4,7 @@
 
 use crate::ddl::run_ddl;
 
-pub fn init_190() {
+pub fn init_200() {
     run_ddl(
         "ALTER TABLE kafgres_cdc_mappings
             ADD COLUMN IF NOT EXISTS delivered_lsn pg_lsn,
