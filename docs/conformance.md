@@ -203,6 +203,11 @@ from, so a reset moves where the next acquire begins.
   and is decompressed whole, so one that expands past 64 MiB gets `MESSAGE_TOO_LARGE`
   where Kafka accepts it, and compaction keeps it whole without mapping its keys. The
   same goes for a single key, or a xerial snappy block, past 64 MiB.
+- **A compressed batch that expands past 1 GiB is refused on a compacted topic.** Produce
+  reads the keys of a gzip, lz4 or zstd batch while it decompresses, bounded per record
+  but not in total, so a few KiB of high-ratio data could cost the worker gigabytes of
+  work. A batch whose records add up past 1 GiB gets `MESSAGE_TOO_LARGE`. Kafka has no
+  such limit.
 - **Leader epochs are not consecutive.** Kafka increments the epoch by one per
   election. kafgres takes the next epoch on every broker start, but a promotion jumps to
   the next Postgres timeline's range, so the epoch leaps from, say, 3 to 65536. The

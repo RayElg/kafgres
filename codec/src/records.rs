@@ -681,8 +681,33 @@ pub const MAX_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 /// Snappy as Kafka's Java client writes it: `\x82SNAPPY\x00` then version and compat.
 const XERIAL_MAGIC: &[u8] = b"\x82SNAPPY\x00";
 
-pub fn decompress(codec: i16, payload: &[u8]) -> Result<Vec<u8>, BatchError> {
-    bounded_read(decoder(codec, Bytes::copy_from_slice(payload))?, codec)
+pub fn decompress(codec: i16, payload: Bytes) -> Result<Vec<u8>, BatchError> {
+    bounded_read(decoder(codec, payload)?, codec)
+}
+
+/// The most a streamed batch may expand to in total. Streaming keeps one record in memory
+/// at a time, so `MAX_DECOMPRESSED_BYTES` bounds memory but not the work: a few KiB of
+/// high-ratio gzip, lz4 or zstd inside `max.message.bytes` could otherwise have the broker
+/// worker decompress gigabytes. Kafka has no such cap; this one is far above any real batch.
+pub const MAX_STREAMED_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Fails with `DecompressedTooLarge` once more than `left` bytes have been read.
+struct TotalCap<R> {
+    inner: R,
+    left: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for TotalCap<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        match self.left.checked_sub(n as u64) {
+            Some(left) => self.left = left,
+            None => {
+                return Err(std::io::Error::other(BatchError::DecompressedTooLarge));
+            }
+        }
+        Ok(n)
+    }
 }
 
 /// A reader over the decompressed records. Only a bare snappy block is decoded whole, and
@@ -983,7 +1008,7 @@ impl RecordBatch {
         if codec == 0 {
             return self.records();
         }
-        let plain = decompress(codec, &self.bytes[RECORD_BATCH_OVERHEAD..])?;
+        let plain = decompress(codec, self.bytes.slice(RECORD_BATCH_OVERHEAD..))?;
         self.record_iter(Source::Mem { buf: Bytes::from(plain), pos: 0 }, true)
     }
 
@@ -1004,7 +1029,11 @@ impl RecordBatch {
         let src = if codec == 0 {
             Source::Mem { buf: self.bytes.clone(), pos: RECORD_BATCH_OVERHEAD }
         } else {
-            let reader = decoder(codec, self.bytes.slice(RECORD_BATCH_OVERHEAD..))?;
+            let reader = TotalCap {
+                inner: decoder(codec, self.bytes.slice(RECORD_BATCH_OVERHEAD..))?,
+                left: MAX_STREAMED_BYTES,
+            };
+            let reader: Box<dyn std::io::Read> = Box::new(reader);
             Source::Stream { reader: std::io::BufReader::new(reader), pos: 0, codec }
         };
         self.record_iter(src, full)
@@ -1983,9 +2012,17 @@ mod decompression_tests {
             "the bomb is not compressed enough to be a bomb"
         );
         assert!(matches!(
-            decompress(1, &bomb),
+            decompress(1, Bytes::from(bomb)),
             Err(BatchError::DecompressedTooLarge)
         ));
+    }
+
+    #[test]
+    fn the_total_cap_fails_a_stream_with_decompressed_too_large() {
+        use std::io::Read;
+        let mut capped = TotalCap { inner: std::io::repeat(0).take(100), left: 64 };
+        let err = capped.read_to_end(&mut Vec::new()).unwrap_err();
+        assert!(matches!(from_io(err, 1), BatchError::DecompressedTooLarge));
     }
 
     #[test]
@@ -1995,7 +2032,7 @@ mod decompression_tests {
         payload.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x7F]);
         payload.extend_from_slice(b"junk");
         assert!(matches!(
-            decompress(2, &payload),
+            decompress(2, Bytes::from(payload)),
             Err(BatchError::DecompressedTooLarge) | Err(BatchError::Decompression(2))
         ));
     }
@@ -2011,7 +2048,7 @@ mod decompression_tests {
                 &[0xFF; 64][..],
                 XERIAL_MAGIC,
             ] {
-                let _ = decompress(codec, payload);
+                let _ = decompress(codec, Bytes::copy_from_slice(payload));
             }
         }
     }
@@ -2019,7 +2056,7 @@ mod decompression_tests {
     #[test]
     fn an_unknown_codec_is_reported_rather_than_guessed() {
         assert!(matches!(
-            decompress(7, b"whatever"),
+            decompress(7, Bytes::from_static(b"whatever")),
             Err(BatchError::Compressed(7))
         ));
     }

@@ -158,11 +158,12 @@ fn clean_or_keep(
 
 /// Per partition, the (base offset, CRC) of each stored batch found not to decode, so each
 /// is logged and decoded once per process rather than every pass.
-static UNDECODABLE: std::sync::Mutex<Option<std::collections::HashMap<(TopicId, i32), Vec<(i64, u32)>>>> =
+static UNDECODABLE: std::sync::Mutex<Option<std::collections::HashMap<(TopicId, i32), std::collections::HashSet<(i64, u32)>>>> =
     std::sync::Mutex::new(None);
 
-/// Entries kept per partition; past it the oldest is decoded and logged again.
-const UNDECODABLE_HISTORY: usize = 64;
+/// Entries kept per partition. Past it a batch is decoded on each pass but no longer logged,
+/// so a partition full of them is neither logged every pass nor grown without bound.
+const UNDECODABLE_HISTORY: usize = 4096;
 
 fn is_known_undecodable(topic: TopicId, partition: i32, view: &RecordBatchView) -> bool {
     let id = (view.base_offset(), view.stored_crc());
@@ -180,16 +181,16 @@ fn undecodable(
     view: &RecordBatchView,
     e: kafgres_codec::records::BatchError,
 ) {
+    let mut all = UNDECODABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = all.get_or_insert_with(Default::default).entry((topic, partition)).or_default();
+    if seen.len() >= UNDECODABLE_HISTORY {
+        return;
+    }
+    seen.insert((view.base_offset(), view.stored_crc()));
     pgrx::log!(
         "kafgres: compaction keeps batch {} of topic {topic} partition {partition} verbatim: its records do not decode ({e})",
         view.base_offset()
     );
-    let mut all = UNDECODABLE.lock().unwrap_or_else(|e| e.into_inner());
-    let seen = all.get_or_insert_with(Default::default).entry((topic, partition)).or_default();
-    seen.push((view.base_offset(), view.stored_crc()));
-    if seen.len() > UNDECODABLE_HISTORY {
-        seen.remove(0);
-    }
 }
 
 /// What a compaction pass may do with a batch, beyond what the offset map says (I10).
