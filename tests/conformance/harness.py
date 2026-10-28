@@ -67,10 +67,6 @@ KNOWN_GAPS = {
     ("librdkafka", "group-static"): _STATIC_MEMBERSHIP,
     ("sarama", "group-static"): _STATIC_MEMBERSHIP,
     ("franz-go", "group-static"): _STATIC_MEMBERSHIP,
-    ("java", "group-admin"): (
-        "OffsetCommit does not validate the member: a commit with no member id and generation "
-        "-1 is accepted while the group has members, where Kafka answers UNKNOWN_MEMBER_ID"
-    ),
     ("sarama", "offsets-by-time"): (
         "Sarama's producer sends a batch header with max timestamp -1 and Kafka recomputes it "
         "on append; kafgres stores the header and CRC verbatim, so time lookups miss Sarama data"
