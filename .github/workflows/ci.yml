@@ -98,7 +98,7 @@ jobs:
             sleep 2
           done
           docker compose exec -T postgres psql -U postgres -tAc \
-            "SELECT extversion FROM pg_extension WHERE extname='kafgres'" | grep -q 0.3.0
+            "SELECT extversion FROM pg_extension WHERE extname='kafgres'" | grep -q 0.3.1
           docker compose exec -T postgres psql -U postgres -tAc \
             "SELECT count(*) FROM pg_stat_activity WHERE backend_type='kafgres_broker'" | grep -q '^1$'
 
@@ -174,3 +174,84 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose --profile failover --profile conformance down -v
+
+  # Each client against kafgres and the reference broker, one job per client and engine.
+  # Independent of the Postgres version (the extension job covers 13 to 18), so 16 only.
+  conformance:
+    name: ${{ matrix.client }} ${{ matrix.engine }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        client: [java, librdkafka, sarama, franz_go, kafka_python]
+        engine: [segment, table]
+    env:
+      PG_MAJOR: 16
+      KAFGRES_ENGINE: ${{ matrix.engine }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker compose build
+
+      - name: Build client tooling
+        run: docker build -t kafgres-clients tests/clients
+
+      - name: Extension loads and the worker starts
+        run: |
+          docker compose up -d
+          for i in $(seq 1 60); do
+            if docker compose exec -T postgres pg_isready -U postgres >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          docker compose exec -T postgres psql -U postgres -tAc \
+            "SELECT count(*) FROM pg_stat_activity WHERE backend_type='kafgres_broker'" | grep -q '^1$'
+
+      - name: Switch to the table engine
+        if: matrix.engine == 'table'
+        run: |
+          docker compose exec -T postgres psql -U postgres \
+            -c "ALTER SYSTEM SET kafgres.allow_engine_mismatch=on"
+          docker compose exec -T postgres bash -c 'rm -rf "$PGDATA"/kafgres/*'
+          docker compose exec -T postgres psql -U postgres \
+            -c "ALTER SYSTEM SET kafgres.storage_engine='table'" \
+            -c "ALTER SYSTEM SET kafgres.allow_engine_mismatch=off"
+          docker compose up -d --force-recreate postgres
+          for i in $(seq 1 60); do
+            if docker compose exec -T postgres psql -U postgres -tAc \
+                 "SELECT count(*) FROM pg_stat_activity \
+                   WHERE backend_type='kafgres_broker'" 2>/dev/null | grep -q '^1$'; then
+              break
+            fi
+            sleep 2
+          done
+          docker compose exec -T postgres psql -U postgres -tAc \
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE backend_type='kafgres_broker'" | grep -q '^1$'
+          test "$(docker compose exec -T postgres psql -U postgres -tAc \
+                    'SHOW kafgres.storage_engine' | tr -d '[:space:]')" = table
+
+      # Without the reference the diff tests skip, so assert it is reachable.
+      - name: Reference broker
+        run: |
+          docker compose --profile conformance up -d kafka
+          for i in $(seq 1 60); do
+            if docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+                 --bootstrap-server 127.0.0.1:9292 --list >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          docker run --rm --network host apache/kafka:4.3.1 \
+            /opt/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:9292 --list
+
+      - name: ${{ matrix.client }} against kafgres and Kafka
+        run: |
+          python3 -m pip install --quiet -r requirements.txt
+          python3 -m pytest tests/conformance/clients/test_${{ matrix.client }}.py -v -rxXs
+
+      - name: Worker logs
+        if: always()
+        run: docker compose logs postgres | grep -i kafgres || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile conformance down -v

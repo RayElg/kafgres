@@ -35,7 +35,8 @@ The following all work today:
   with ACLs in a SQL-managed table.
 - Consumers truncate rather than read divergent data when an async replica is promoted,
   verified against a real physical standby.
-- The conformance suite drives four real clients against kafgres and a reference Kafka
+- The conformance suite drives five real clients (Java, librdkafka, Sarama, franz-go,
+  kafka-python) through some 180 scenarios against kafgres and a reference Kafka
   and diffs the observable results; it runs in CI on every pull request, and every intended
   difference is catalogued in [docs/conformance.md](docs/conformance.md).
 - The segment engine (the default) passes the same conformance suite, survives `kill -9`
@@ -156,6 +157,10 @@ From 0.2.0, the first start on the segment engine removes the log's old-format
 `.timeindex` files. Nothing is lost: timestamp lookups scan the segments written before
 the upgrade instead, and segments written after it are indexed.
 
+From 0.3.0, transaction markers written before 0.3.1 carry no `EndTransactionMarker`
+value, which Sarama fails to decode. They stay until retention removes their segments.
+A Sarama consumer can start past the last such marker, or the topic can be recreated.
+
 ## CDC without Debezium
 
 A table's changes reach a topic without Kafka Connect, a second JVM, or a network hop.
@@ -262,9 +267,8 @@ and the ELR columns, which the tool renders as `N/A` against kafgres because it 
 back to `Metadata`. Anything else that differs is treated as a bug, and the script shows
 it rather than absorbing it.
 
-The demo is a summary; `tests/conformance/` is the gate. It runs Sarama, kafka-python
-and the Java tooling in seventeen tests, and replays KIP-890 transaction frames against
-both brokers in eighteen more, in CI on every pull request.
+The demo is a summary; `tests/conformance/` is the gate, with the five clients run through
+about 180 scenarios against both brokers in CI on every pull request.
 
 ## Documentation
 

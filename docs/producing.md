@@ -50,9 +50,19 @@ computed from committed markers. Three properties of that mechanism are worth kn
   client that re-requests the same offset forever looks like a hung consumer.
 - Each transaction produces under its own producer id, taken from the transaction's xid.
   Kafka clients drop everything from a producer id at or after an aborted first offset,
-  so a shared producer id would let one rollback discard later committed records.
-- The last stable offset gates records from transactions that are still in flight, so
-  `read_committed` consumers never see records that may yet commit or abort.
+  so a shared producer id would let one rollback discard later committed records. For
+  the same reason, when a savepoint that produced is rolled back, the rest of the
+  transaction produces under a new producer id derived from the same xid. A transaction
+  that rolls back more than about four million such savepoints gets an error from
+  further calls.
+- The last stable offset is the first offset of the oldest transaction still in flight on
+  the partition, so `read_committed` consumers never see records that may yet commit or
+  abort. A commit becomes visible once every transaction that produced to the partition
+  before it has ended. This holds at any concurrency: the broker reserves room in shared
+  memory for one in-flight transaction per Postgres process (`MaxBackends`) on every
+  tracked partition, 8 bytes each, so about 4 MB at the default `max_connections` of
+  100 and about 33 MB at 1000. `kafgres_produce()` cannot be used in a prepared
+  transaction, so prepared transactions need no room.
 
 ### Who may produce
 

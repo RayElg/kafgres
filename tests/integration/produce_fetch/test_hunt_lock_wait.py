@@ -434,22 +434,26 @@ def test_a_lock_held_past_the_retry_limit_fails_its_requests_and_nothing_else(to
         assert struct.unpack_from(">i", c.recv(), 0)[0] == 9
 
 
-def test_clients_that_leave_while_retrying_are_forgotten(topic):
-    """Connections close while their requests wait for a lock. On release none of those
-    requests runs, and the worker stays up."""
+def test_requests_from_clients_that_leave_while_retrying_still_run(topic):
+    """A request parked on a lock and one queued behind it both run after the client closes,
+    as in Kafka, which runs every request it has read."""
     pid = broker_pid()
     with Holder() as held:
         socks = [_connect() for _ in range(32)]
         for i, s in enumerate(socks):
-            Connection(s).send(PRODUCE, 3, i, body=produce_v3(TOPIC, 0, record_batch([b"gone"])))
+            c = Connection(s)
+            for value in (b"parked", b"queued"):
+                c.send(PRODUCE, 3, i, body=produce_v3(TOPIC, 0, record_batch([value]), acks=0))
         time.sleep(0.5)
         for s in socks:
             s.close()
         time.sleep(0.5)
         held.release()
-    time.sleep(0.5)
+    time.sleep(1.0)
     assert broker_pid() == pid, "the broker worker restarted"
-    assert "gone" not in _fetch_values(TOPIC), "a request ran after its client left"
+    values = _fetch_values(TOPIC)
+    assert values.count("parked") == 32, "a parked request was dropped when its client left"
+    assert values.count("queued") == 32, "a queued request was dropped when its client left"
     with _connect() as s:
         c = Connection(s)
         c.send(METADATA, 1, 9, body=struct.pack(">i", -1))
