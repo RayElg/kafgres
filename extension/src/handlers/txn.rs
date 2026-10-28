@@ -850,13 +850,12 @@ pub fn expire_stale_transactions() -> Result<usize, HandlerError> {
     let now = now_millis();
     // Bounded: ending thousands in one pass would hold the worker off Fetch, and the next
     const MAX_PER_SWEEP: i64 = 64;
-    let stale: Vec<(i64, i16)> = Spi::connect(|client| {
+    let mut stale: Vec<(i64, i16)> = Spi::connect(|client| {
         let rows = client.select(
             "SELECT producer_id, producer_epoch FROM kafgres_txns
               WHERE state = 'ongoing' AND $1 - started_at > timeout_ms
               ORDER BY started_at
-              LIMIT $2
-              FOR UPDATE",
+              LIMIT $2",
             None,
             &[now.into(), MAX_PER_SWEEP.into()],
         )?;
@@ -870,8 +869,21 @@ pub fn expire_stale_transactions() -> Result<usize, HandlerError> {
     })
     .map_err(|e| HandlerError::Internal(e.to_string()))?;
 
+    // Locked one at a time in ascending producer id, the order a Produce request takes them
+    // in (`hold_for_produce`): locking the whole batch oldest-first could deadlock with a
+    // request carrying several transactional producers. Staleness is re-checked under the lock.
+    stale.sort_unstable_by_key(|&(producer_id, _)| producer_id);
     let mut done = 0;
-    for (producer_id, epoch) in stale {
+    for (producer_id, _) in stale {
+        let locked: Option<i32> = Spi::get_one_with_args(
+            "SELECT (SELECT producer_epoch FROM kafgres_txns
+                      WHERE producer_id = $1 AND state = 'ongoing'
+                        AND $2 - started_at > timeout_ms
+                        FOR UPDATE)",
+            &[producer_id.into(), now.into()],
+        )
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        let Some(epoch) = locked.map(|e| e as i16) else { continue };
         // Abort, then fence — both in this one Postgres transaction: inside it the fence
         match finish_transaction(producer_id, epoch, false)? {
             // Ended underneath us between the SELECT and here, or never begun (state
