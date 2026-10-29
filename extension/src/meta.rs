@@ -106,12 +106,12 @@ pub fn resolve_topic(name: &str, uuid: &[u8; 16]) -> Result<Option<ResolvedTopic
     let sql = if name.is_empty() {
         "SELECT topic_id::int, name, topic_uuid,
                 (config->>'max.message.bytes')::bigint,
-                (config->>'cleanup.policy' = 'compact')
+                config->>'cleanup.policy'
            FROM kafgres_topics WHERE topic_uuid = $1"
     } else {
         "SELECT topic_id::int, name, topic_uuid,
                 (config->>'max.message.bytes')::bigint,
-                (config->>'cleanup.policy' = 'compact')
+                config->>'cleanup.policy'
            FROM kafgres_topics WHERE name = $2"
     };
     Spi::connect(|client| {
@@ -125,7 +125,10 @@ pub fn resolve_topic(name: &str, uuid: &[u8; 16]) -> Result<Option<ResolvedTopic
                     max_message_bytes: row
                         .get::<i64>(4)?
                         .unwrap_or(crate::config::DEFAULT_MAX_MESSAGE_BYTES),
-                    compacted: row.get::<bool>(5)?.unwrap_or(false),
+                    compacted: crate::config::parse_cleanup_policy(
+                        row.get::<String>(5)?.as_deref(),
+                    )
+                    .compacts,
                 }));
             }
         }

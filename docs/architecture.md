@@ -213,7 +213,9 @@ part of the log no earlier round has cleaned, then rewrites the sealed part of t
 below that point, keeping each key's latest record at its original offset. The active
 segment, anything newer than `min.compaction.lag.ms`, and anything at or above the last
 stable offset are left alone. Records of aborted transactions are removed, and a tombstone
-stays for `delete.retention.ms` after the round that cleaned it. A round starts once the
+stays for `delete.retention.ms` after the round that cleaned it. A stored batch whose
+records do not decode is logged once and kept verbatim, so it cannot stop its partition
+from being cleaned; one whose CRC fails stops the pass. A round starts once the
 uncleaned part is at least half of what could be cleaned. The broker reads at most
 `kafgres.compaction_pass_bytes` (32 MiB by default) across all partitions every
 `kafgres.retention_check_interval_ms`, so a large log never stalls its connections.

@@ -1094,6 +1094,10 @@ fn decode_err(e: kafgres_codec::records::BatchError) -> StoreError {
     StoreError::Io(format!("compaction decode: {e:?}"))
 }
 
+fn corrupt_row(base: i64, e: kafgres_codec::records::BatchError) -> StoreError {
+    StoreError::Io(format!("compaction: batch at offset {base}: {e}"))
+}
+
 impl TableStore {
     fn compact_pass(
         region: &Cleanable,
@@ -1102,7 +1106,7 @@ impl TableStore {
         delete_retention_ms: i64,
         may_start: impl FnOnce() -> bool,
     ) -> StoreResult<u64> {
-        use kafgres_codec::compaction::{clean_batch, rebuild_batch, OffsetMap};
+        use kafgres_codec::compaction::{rebuild_batch, OffsetMap};
 
         let mut plan = match cleaner.plan.take() {
             Some(p) => p,
@@ -1165,7 +1169,15 @@ impl TableStore {
                 }
                 if !judge.committed(&view)? {
                     plan.map.end = plan.map.end.max(view.last_offset());
-                } else if !plan.map.add_batch(&view, MAX_COMPACT_KEYS).map_err(decode_err)? {
+                } else if !super::map_batch(
+                    &mut plan.map,
+                    &view,
+                    MAX_COMPACT_KEYS,
+                    region.topic,
+                    region.partition,
+                )
+                .map_err(|e| corrupt_row(*base, e))?
+                {
                     plan.mapping_after = None;
                     break;
                 }
@@ -1192,8 +1204,9 @@ impl TableStore {
                     plan.rewrite_after = view.last_offset();
                     // An aborted batch goes whole, as Kafka's cleaner drops aborted data.
                     let kept = if judge.committed(&view)? {
-                        clean_batch(&view, &plan.map, &|o| judge.tombstone_goes(o))
-                            .map_err(decode_err)?
+                        let goes = |o: i64| judge.tombstone_goes(o);
+                        super::clean_or_keep(&view, &plan.map, &goes, region.topic, region.partition)
+                            .map_err(|e| corrupt_row(*base, e))?
                     } else {
                         Some(Vec::new())
                     };

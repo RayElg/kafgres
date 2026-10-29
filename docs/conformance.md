@@ -203,6 +203,31 @@ from, so a reset moves where the next acquire begins.
   whole id, matching Kafka, but a Perl-style class such as `\p{L}+`, which Kafka's RE2J
   compiles, is refused here with `INVALID_REGULAR_EXPRESSION`. Plain patterns,
   alternation and character classes behave the same on both.
+- **Records are decoded on produce only for compacted topics.** Kafka's `LogValidator`
+  reads every record of every batch, so a record that `DefaultRecord.readFrom` refuses
+  (a varint longer than five bytes, a field running past the record, bytes left over
+  inside it) gets `INVALID_RECORD` on any topic. kafgres stores batches byte-verbatim
+  (I2) and only reads records where it has to, on a topic whose `cleanup.policy`
+  includes `compact`; there it refuses the same records with the same code, along with
+  null keys. On other topics such a batch is stored if its CRC holds.
+- **Compaction keeps a batch it cannot decode.** Kafka's cleaner marks the whole
+  partition uncleanable when a batch throws. kafgres logs the batch, keeps it verbatim,
+  and goes on cleaning the rest of the partition. The batch's own records supersede
+  nothing, so older values of its keys stay. Such a batch can only be one stored before
+  produce checked these records, or one stored while the topic was not compacted. A
+  batch whose CRC fails is corruption instead: the pass stops there and logs the file
+  and position, or the offset on the table engine.
+- **A bare snappy batch past 64 MiB is refused on a compacted topic.** Produce reads a
+  compacted topic's keys while the batch decompresses, so any size Kafka accepts is
+  accepted. A bare snappy block, the framing librdkafka writes, cannot be read that way
+  and is decompressed whole, so one that expands past 64 MiB gets `MESSAGE_TOO_LARGE`
+  where Kafka accepts it, and compaction keeps it whole without mapping its keys. The
+  same goes for a single key, or a xerial snappy block, past 64 MiB.
+- **A compressed batch that expands past 1 GiB is refused on a compacted topic.** Produce
+  reads the keys of a gzip, lz4 or zstd batch while it decompresses, bounded per record
+  but not in total, so a few KiB of high-ratio data could cost the worker gigabytes of
+  work. A batch whose records add up past 1 GiB gets `MESSAGE_TOO_LARGE`. Kafka has no
+  such limit.
 - **Leader epochs are not consecutive.** Kafka increments the epoch by one per
   election. kafgres takes the next epoch on every broker start, but a promotion jumps to
   the next Postgres timeline's range, so the epoch leaps from, say, 3 to 65536. The

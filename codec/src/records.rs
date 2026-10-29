@@ -47,8 +47,16 @@ pub enum BatchError {
     TruncatedRecord {
         at: usize,
     },
-    /// A key or value length that is negative and not the `-1` that means null.
-    NegativeLength(i64),
+    /// A negative record length, header count or header key length.
+    NegativeLength {
+        field: &'static str,
+        value: i32,
+    },
+    /// Fields that end before the record's declared length (Kafka: "Invalid record size").
+    RecordSizeMismatch {
+        declared: i32,
+        read: usize,
+    },
     RecordCountMismatch {
         declared: i32,
         found: usize,
@@ -74,7 +82,8 @@ impl BatchError {
             }
             // All inside CRC coverage, so a retry reproduces the rejection exactly.
             BatchError::TruncatedRecord { .. }
-            | BatchError::NegativeLength(_)
+            | BatchError::NegativeLength { .. }
+            | BatchError::RecordSizeMismatch { .. }
             | BatchError::RecordCountMismatch { .. } => ErrorCode::InvalidRecord,
             // A payload that will not decompress is a batch the producer built wrong; it
             BatchError::Decompression(_) => ErrorCode::InvalidRecord,
@@ -121,8 +130,11 @@ impl std::fmt::Display for BatchError {
             BatchError::TruncatedRecord { at } => {
                 write!(f, "record at byte {at} runs past the end of the batch")
             }
-            BatchError::NegativeLength(n) => {
-                write!(f, "field length {n}; only -1 (null) may be negative")
+            BatchError::NegativeLength { field, value } => {
+                write!(f, "{field} is {value}, which cannot be negative")
+            }
+            BatchError::RecordSizeMismatch { declared, read } => {
+                write!(f, "record declares {declared} bytes, its fields take {read}")
             }
             BatchError::RecordCountMismatch { declared, found } => {
                 write!(f, "batch declares {declared} records, {found} remain")
@@ -669,18 +681,58 @@ pub const MAX_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 /// Snappy as Kafka's Java client writes it: `\x82SNAPPY\x00` then version and compat.
 const XERIAL_MAGIC: &[u8] = b"\x82SNAPPY\x00";
 
-pub fn decompress(codec: i16, payload: &[u8]) -> Result<Vec<u8>, BatchError> {
-    match codec {
-        1 => bounded_read(flate2::read::GzDecoder::new(payload), codec),
-        2 => decompress_snappy(payload),
-        3 => bounded_read(lz4_flex::frame::FrameDecoder::new(payload), codec),
-        4 => {
-            let decoder = ruzstd::StreamingDecoder::new(payload)
-                .map_err(|_| BatchError::Decompression(codec))?;
-            bounded_read(decoder, codec)
+pub fn decompress(codec: i16, payload: Bytes) -> Result<Vec<u8>, BatchError> {
+    bounded_read(decoder(codec, payload)?, codec)
+}
+
+/// The most a streamed batch may expand to in total. Streaming keeps one record in memory
+/// at a time, so `MAX_DECOMPRESSED_BYTES` bounds memory but not the work: a few KiB of
+/// high-ratio gzip, lz4 or zstd inside `max.message.bytes` could otherwise have the broker
+/// worker decompress gigabytes. Kafka has no such cap; this one is far above any real batch.
+pub const MAX_STREAMED_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Fails with `DecompressedTooLarge` once more than `left` bytes have been read.
+struct TotalCap<R> {
+    inner: R,
+    left: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for TotalCap<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        match self.left.checked_sub(n as u64) {
+            Some(left) => self.left = left,
+            None => {
+                return Err(std::io::Error::other(BatchError::DecompressedTooLarge));
+            }
         }
-        other => Err(BatchError::Compressed(other)),
+        Ok(n)
     }
+}
+
+/// A reader over the decompressed records. Only a bare snappy block is decoded whole, and
+/// xerial snappy one block at a time; the other codecs stream.
+fn decoder(codec: i16, payload: Bytes) -> Result<Box<dyn std::io::Read>, BatchError> {
+    use bytes::Buf;
+    Ok(match codec {
+        1 => Box::new(flate2::read::GzDecoder::new(payload.reader())),
+        2 if payload.starts_with(XERIAL_MAGIC) => Box::new(XerialReader::new(payload)?),
+        2 => Box::new(std::io::Cursor::new(decompress_snappy_block(&payload)?)),
+        3 => Box::new(lz4_flex::frame::FrameDecoder::new(payload.reader())),
+        4 => Box::new(
+            ruzstd::StreamingDecoder::new(payload.reader())
+                .map_err(|_| BatchError::Decompression(codec))?,
+        ),
+        other => return Err(BatchError::Compressed(other)),
+    })
+}
+
+/// The `BatchError` a decoder raised, else a plain decompression failure.
+fn from_io(e: std::io::Error, codec: i16) -> BatchError {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<BatchError>())
+        .copied()
+        .unwrap_or(BatchError::Decompression(codec))
 }
 
 /// Read a decompressing stream, refusing anything over the cap. `take(cap + 1)` rather
@@ -690,18 +742,14 @@ fn bounded_read(reader: impl std::io::Read, codec: i16) -> Result<Vec<u8>, Batch
     reader
         .take(MAX_DECOMPRESSED_BYTES as u64 + 1)
         .read_to_end(&mut out)
-        .map_err(|_| BatchError::Decompression(codec))?;
+        .map_err(|e| from_io(e, codec))?;
     if out.len() > MAX_DECOMPRESSED_BYTES {
         return Err(BatchError::DecompressedTooLarge);
     }
     Ok(out)
 }
 
-/// Snappy, in whichever of the two framings the producer used; the xerial magic is the
-fn decompress_snappy(payload: &[u8]) -> Result<Vec<u8>, BatchError> {
-    if payload.starts_with(XERIAL_MAGIC) {
-        return decompress_xerial(payload);
-    }
+fn decompress_snappy_block(payload: &[u8]) -> Result<Vec<u8>, BatchError> {
     // A bare snappy block. `decompress_len` reads an attacker-supplied declared length,
     let declared = snap::raw::decompress_len(payload).map_err(|_| BatchError::Decompression(2))?;
     if declared > MAX_DECOMPRESSED_BYTES {
@@ -712,75 +760,75 @@ fn decompress_snappy(payload: &[u8]) -> Result<Vec<u8>, BatchError> {
         .map_err(|_| BatchError::Decompression(2))
 }
 
-/// `\x82SNAPPY\x00`, version, compat, then repeated `int32` length + snappy block.
-fn decompress_xerial(payload: &[u8]) -> Result<Vec<u8>, BatchError> {
-    // magic(8) + version(4) + compat(4)
-    let mut pos = XERIAL_MAGIC.len() + 8;
-    if pos > payload.len() {
-        return Err(BatchError::Decompression(2));
-    }
-    let mut out = Vec::new();
-    let mut decoder = snap::raw::Decoder::new();
-    while pos < payload.len() {
-        let len_bytes: [u8; 4] = payload
-            .get(pos..pos + 4)
-            .and_then(|b| b.try_into().ok())
-            .ok_or(BatchError::Decompression(2))?;
-        pos += 4;
-        let len = i32::from_be_bytes(len_bytes);
-        if len < 0 {
+/// `\x82SNAPPY\x00`, version, compat, then repeated `int32` length + snappy block, decoded
+/// one block at a time.
+struct XerialReader {
+    payload: Bytes,
+    pos: usize,
+    block: Vec<u8>,
+    at: usize,
+    decoder: snap::raw::Decoder,
+}
+
+impl XerialReader {
+    fn new(payload: Bytes) -> Result<Self, BatchError> {
+        // magic(8) + version(4) + compat(4)
+        let pos = XERIAL_MAGIC.len() + 8;
+        if pos > payload.len() {
             return Err(BatchError::Decompression(2));
         }
-        let chunk = payload
-            .get(pos..pos + len as usize)
-            .ok_or(BatchError::Decompression(2))?;
-        pos += len as usize;
+        Ok(XerialReader {
+            payload,
+            pos,
+            block: Vec::new(),
+            at: 0,
+            decoder: snap::raw::Decoder::new(),
+        })
+    }
 
-        // Cap checked per chunk against the running total, so a bomb split across many
-        let declared =
-            snap::raw::decompress_len(chunk).map_err(|_| BatchError::Decompression(2))?;
-        if out.len().saturating_add(declared) > MAX_DECOMPRESSED_BYTES {
+    /// Decode the next block; false at the end of the payload.
+    fn next_block(&mut self) -> Result<bool, BatchError> {
+        let fail = BatchError::Decompression(2);
+        let payload = &self.payload;
+        if self.pos >= payload.len() {
+            return Ok(false);
+        }
+        let len_bytes: [u8; 4] = payload
+            .get(self.pos..self.pos + 4)
+            .and_then(|b| b.try_into().ok())
+            .ok_or(fail)?;
+        self.pos += 4;
+        let len = i32::from_be_bytes(len_bytes);
+        if len < 0 {
+            return Err(fail);
+        }
+        let chunk = payload.get(self.pos..self.pos + len as usize).ok_or(fail)?;
+        self.pos += len as usize;
+        // Attacker-supplied, so capped before it is allocated.
+        let declared = snap::raw::decompress_len(chunk).map_err(|_| fail)?;
+        if declared > MAX_DECOMPRESSED_BYTES {
             return Err(BatchError::DecompressedTooLarge);
         }
-        let mut buf = vec![0u8; declared];
-        let n = decoder
-            .decompress(chunk, &mut buf)
-            .map_err(|_| BatchError::Decompression(2))?;
-        buf.truncate(n);
-        out.extend_from_slice(&buf);
+        self.block.resize(declared, 0);
+        let n = self.decoder.decompress(chunk, &mut self.block).map_err(|_| fail)?;
+        self.block.truncate(n);
+        self.at = 0;
+        Ok(true)
     }
-    Ok(out)
 }
 
-/// Read one zigzag varint, advancing `pos`. Bounded two ways: it stops at the end of the
-fn read_varint_i64(buf: &[u8], pos: &mut usize) -> Option<i64> {
-    let mut result: u64 = 0;
-    let mut shift = 0;
-    for _ in 0..10 {
-        let byte = *buf.get(*pos)?;
-        *pos += 1;
-        result |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Some(((result >> 1) as i64) ^ -((result & 1) as i64));
+impl std::io::Read for XerialReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.at == self.block.len() {
+            if buf.is_empty() || !self.next_block().map_err(std::io::Error::other)? {
+                return Ok(0);
+            }
         }
-        shift += 7;
+        let n = buf.len().min(self.block.len() - self.at);
+        buf[..n].copy_from_slice(&self.block[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
     }
-    None
-}
-
-/// Kafka's record offset delta is an int varint: truncate the unsigned payload to
-/// 32 bits *before* zigzag decoding. A terminating fifth byte may have spill bits.
-fn read_offset_varint(buf: &[u8], pos: &mut usize) -> Option<i32> {
-    let mut result = 0u32;
-    for shift in (0..35).step_by(7) {
-        let byte = *buf.get(*pos)?;
-        *pos += 1;
-        result |= ((byte & 0x7f) as u32).wrapping_shl(shift);
-        if byte & 0x80 == 0 {
-            return Some(((result >> 1) as i32) ^ -((result & 1) as i32));
-        }
-    }
-    None
 }
 
 #[derive(Debug, Clone)]
@@ -797,14 +845,152 @@ pub struct RecordRef {
     pub attributes: i8,
 }
 
-/// Iterate the records inside an **uncompressed** batch. Exists for log compaction: a
+/// A record's key and offset delta, from [`RecordBatch::stream_keys`].
+#[derive(Debug, Clone)]
+pub struct RecordKey {
+    pub offset_delta: i32,
+    pub key: Option<Bytes>,
+}
+
+/// The records' bytes: a buffer holding all of them, or a decompressing stream.
+enum Source {
+    Mem {
+        buf: Bytes,
+        pos: usize,
+    },
+    Stream {
+        reader: std::io::BufReader<Box<dyn std::io::Read>>,
+        pos: usize,
+        codec: i16,
+    },
+}
+
+impl Source {
+    fn pos(&self) -> usize {
+        match self {
+            Source::Mem { pos, .. } | Source::Stream { pos, .. } => *pos,
+        }
+    }
+
+    /// Whether the records reach `end`. A stream cannot tell before reading.
+    fn fits(&self, end: usize) -> bool {
+        match self {
+            Source::Mem { buf, .. } => end <= buf.len(),
+            Source::Stream { .. } => true,
+        }
+    }
+
+    fn at_end(&mut self) -> Result<bool, BatchError> {
+        use std::io::BufRead;
+        match self {
+            Source::Mem { buf, pos } => Ok(*pos >= buf.len()),
+            Source::Stream { reader, codec, .. } => {
+                Ok(reader.fill_buf().map_err(|e| from_io(e, *codec))?.is_empty())
+            }
+        }
+    }
+
+    /// The next byte, `None` at the end of the records.
+    fn byte(&mut self) -> Result<Option<u8>, BatchError> {
+        use std::io::BufRead;
+        match self {
+            Source::Mem { buf, pos } => {
+                let byte = buf.get(*pos).copied();
+                *pos += byte.is_some() as usize;
+                Ok(byte)
+            }
+            Source::Stream { reader, pos, codec } => {
+                let Some(&byte) = reader.fill_buf().map_err(|e| from_io(e, *codec))?.first()
+                else {
+                    return Ok(None);
+                };
+                reader.consume(1);
+                *pos += 1;
+                Ok(Some(byte))
+            }
+        }
+    }
+
+    /// The next `n` bytes, `None` when the records end first. A stream skips them and
+    /// returns them empty unless `keep`, and keeps at most `MAX_DECOMPRESSED_BYTES`.
+    fn bytes(&mut self, n: usize, keep: bool) -> Result<Option<Bytes>, BatchError> {
+        use std::io::Read;
+        match self {
+            Source::Mem { buf, pos } => {
+                let Some(stop) = pos.checked_add(n).filter(|s| *s <= buf.len()) else {
+                    return Ok(None);
+                };
+                let field = buf.slice(*pos..stop);
+                *pos = stop;
+                Ok(Some(field))
+            }
+            Source::Stream { reader, pos, codec } => {
+                let mut limited = reader.take(n as u64);
+                if keep {
+                    if n > MAX_DECOMPRESSED_BYTES {
+                        return Err(BatchError::DecompressedTooLarge);
+                    }
+                    let mut field = Vec::new();
+                    limited.read_to_end(&mut field).map_err(|e| from_io(e, *codec))?;
+                    *pos += field.len();
+                    Ok((field.len() == n).then(|| Bytes::from(field)))
+                } else {
+                    let skipped = std::io::copy(&mut limited, &mut std::io::sink())
+                        .map_err(|e| from_io(e, *codec))?;
+                    *pos += skipped as usize;
+                    Ok((skipped == n as u64).then(Bytes::new))
+                }
+            }
+        }
+    }
+
+    /// Kafka's `ByteUtils.readVarint`: at most five bytes, truncated to 32 bits before zigzag
+    /// decoding, so spill bits in a terminating fifth byte are dropped. `None` unless it
+    /// ends before `end`.
+    fn varint_i32(&mut self, end: usize) -> Result<Option<i32>, BatchError> {
+        let mut result = 0u32;
+        for shift in (0..35).step_by(7) {
+            if self.pos() >= end {
+                return Ok(None);
+            }
+            let Some(byte) = self.byte()? else { return Ok(None) };
+            result |= ((byte & 0x7f) as u32).wrapping_shl(shift);
+            if byte & 0x80 == 0 {
+                return Ok(Some(((result >> 1) as i32) ^ -((result & 1) as i32)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A zigzag varlong of at most ten bytes, bounded by `end` as `varint_i32` is.
+    fn varint_i64(&mut self, end: usize) -> Result<Option<i64>, BatchError> {
+        let mut result: u64 = 0;
+        for shift in (0..70).step_by(7) {
+            if self.pos() >= end {
+                return Ok(None);
+            }
+            let Some(byte) = self.byte()? else { return Ok(None) };
+            result |= ((byte & 0x7f) as u64).wrapping_shl(shift);
+            if byte & 0x80 == 0 {
+                return Ok(Some(((result >> 1) as i64) ^ -((result & 1) as i64)));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Iterate the records of a batch, from a buffer or a decompressing stream.
 pub struct RecordIter {
-    buf: Bytes,
-    pos: usize,
+    src: Source,
     remaining: i32,
     declared: i32,
     done: bool,
+    /// False reads keys only: values and headers are checked and skipped.
+    full: bool,
 }
+
+/// [`RecordIter`] reading keys only, with every record checked the same way.
+pub struct KeyIter(RecordIter);
 
 impl RecordBatch {
     /// Records in this batch, if it is uncompressed; refuses a compressed batch rather
@@ -813,7 +999,7 @@ impl RecordBatch {
         if codec != 0 {
             return Err(BatchError::Compressed(codec));
         }
-        self.record_iter(self.bytes.clone(), RECORD_BATCH_OVERHEAD)
+        self.record_iter(Source::Mem { buf: self.bytes.clone(), pos: RECORD_BATCH_OVERHEAD }, true)
     }
 
     /// Records in this batch, decompressing first if the producer compressed them. The
@@ -822,12 +1008,39 @@ impl RecordBatch {
         if codec == 0 {
             return self.records();
         }
-        let plain = decompress(codec, &self.bytes[RECORD_BATCH_OVERHEAD..])?;
-        self.record_iter(Bytes::from(plain), 0)
+        let plain = decompress(codec, self.bytes.slice(RECORD_BATCH_OVERHEAD..))?;
+        self.record_iter(Source::Mem { buf: Bytes::from(plain), pos: 0 }, true)
     }
 
-    /// The declared record count, checked, over whichever buffer holds the records.
-    fn record_iter(&self, buf: Bytes, pos: usize) -> Result<RecordIter, BatchError> {
+    /// `records_decompressed`, decompressing as it reads: the cap applies to each record,
+    /// not to the batch.
+    pub fn stream_records(&self) -> Result<RecordIter, BatchError> {
+        self.streamed(true)
+    }
+
+    /// Each record's key and offset delta, decompressing as it reads, one key in memory at
+    /// a time.
+    pub fn stream_keys(&self) -> Result<KeyIter, BatchError> {
+        self.streamed(false).map(KeyIter)
+    }
+
+    fn streamed(&self, full: bool) -> Result<RecordIter, BatchError> {
+        let codec = self.compression_type();
+        let src = if codec == 0 {
+            Source::Mem { buf: self.bytes.clone(), pos: RECORD_BATCH_OVERHEAD }
+        } else {
+            let reader = TotalCap {
+                inner: decoder(codec, self.bytes.slice(RECORD_BATCH_OVERHEAD..))?,
+                left: MAX_STREAMED_BYTES,
+            };
+            let reader: Box<dyn std::io::Read> = Box::new(reader);
+            Source::Stream { reader: std::io::BufReader::new(reader), pos: 0, codec }
+        };
+        self.record_iter(src, full)
+    }
+
+    /// The declared record count, checked, over whichever source holds the records.
+    fn record_iter(&self, src: Source, full: bool) -> Result<RecordIter, BatchError> {
         let count = self.record_count();
         if count < 0 {
             return Err(BatchError::NegativeExtent {
@@ -836,56 +1049,92 @@ impl RecordBatch {
             });
         }
         Ok(RecordIter {
-            buf,
-            pos,
+            src,
             remaining: count,
             declared: count,
             done: false,
+            full,
         })
     }
 }
 
 impl RecordIter {
+    /// Reads stay inside the record's declared extent, and the fields must fill it exactly.
     fn next_record(&mut self) -> Result<RecordRef, BatchError> {
-        let at = self.pos;
+        let at = self.src.pos();
         let fail = || BatchError::TruncatedRecord { at };
 
-        let length = read_varint_i64(&self.buf, &mut self.pos).ok_or_else(fail)?;
+        let length = self.src.varint_i32(usize::MAX)?.ok_or_else(fail)?;
         if length < 0 {
-            return Err(BatchError::NegativeLength(length));
+            return Err(BatchError::NegativeLength {
+                field: "record length",
+                value: length,
+            });
         }
-        // The record's declared extent, checked before any field inside it is read, so a
-        let end = self
-            .pos
+        // A whole record read from a stream is held in memory.
+        if self.full
+            && matches!(self.src, Source::Stream { .. })
+            && length as usize > MAX_DECOMPRESSED_BYTES
+        {
+            return Err(BatchError::DecompressedTooLarge);
+        }
+        let start = self.src.pos();
+        let end = start
             .checked_add(length as usize)
-            .filter(|e| *e <= self.buf.len())
+            .filter(|e| self.src.fits(*e))
             .ok_or_else(fail)?;
 
-        let attributes = *self.buf.get(self.pos).ok_or_else(fail)?;
-        self.pos += 1;
-        let timestamp_delta = read_varint_i64(&self.buf, &mut self.pos).ok_or_else(fail)?;
-        let offset_delta = read_offset_varint(&self.buf[..end], &mut self.pos).ok_or_else(fail)?;
+        if start >= end {
+            return Err(fail());
+        }
+        let attributes = self.src.byte()?.ok_or_else(fail)?;
+        // A varlong in Kafka too, so this one stays on the ten-byte reader.
+        let timestamp_delta = self.src.varint_i64(end)?.ok_or_else(fail)?;
+        let offset_delta = self.src.varint_i32(end)?.ok_or_else(fail)?;
 
-        let key = self.read_field(end)?;
-        let value = self.read_field(end)?;
+        let key = self.read_field(end, true)?;
+        let value = self.read_field(end, self.full)?;
 
-        // Headers are bounded by the record's own declared extent; the count is
-        let header_count = read_varint_i64(&self.buf, &mut self.pos).ok_or_else(fail)?;
+        let header_count = self.read_len(end)?;
         if header_count < 0 {
-            return Err(BatchError::NegativeLength(header_count));
+            return Err(BatchError::NegativeLength {
+                field: "header count",
+                value: header_count,
+            });
+        }
+        // Each header held costs more than its two wire bytes, so a stream caps the count too.
+        let entry = std::mem::size_of::<(Bytes, Option<Bytes>)>();
+        if self.full
+            && matches!(self.src, Source::Stream { .. })
+            && (header_count as usize).saturating_mul(entry) > MAX_DECOMPRESSED_BYTES
+        {
+            return Err(BatchError::DecompressedTooLarge);
         }
         let mut headers = Vec::new();
         for _ in 0..header_count {
-            if self.pos >= end {
+            if self.src.pos() >= end {
                 return Err(fail());
             }
-            let name = self.read_field(end)?.ok_or_else(fail)?;
-            let value = self.read_field(end)?;
-            headers.push((name, value));
+            let name_len = self.read_len(end)?;
+            if name_len < 0 {
+                return Err(BatchError::NegativeLength {
+                    field: "header key length",
+                    value: name_len,
+                });
+            }
+            let name = self.read_bytes(end, name_len, self.full)?;
+            let value = self.read_field(end, self.full)?;
+            if self.full {
+                headers.push((name, value));
+            }
         }
 
-        // The record's own length advances the cursor, so a miscounted header list cannot
-        self.pos = end;
+        if self.src.pos() != end {
+            return Err(BatchError::RecordSizeMismatch {
+                declared: length,
+                read: self.src.pos() - start,
+            });
+        }
         Ok(RecordRef {
             offset_delta,
             timestamp_delta,
@@ -896,25 +1145,27 @@ impl RecordIter {
         })
     }
 
-    /// A length-prefixed field: `-1` is null, anything else must fit inside the record.
-    fn read_field(&mut self, end: usize) -> Result<Option<Bytes>, BatchError> {
-        let at = self.pos;
-        let len =
-            read_varint_i64(&self.buf, &mut self.pos).ok_or(BatchError::TruncatedRecord { at })?;
-        if len == -1 {
+    fn read_len(&mut self, end: usize) -> Result<i32, BatchError> {
+        let at = self.src.pos();
+        self.src.varint_i32(end)?.ok_or(BatchError::TruncatedRecord { at })
+    }
+
+    fn read_bytes(&mut self, end: usize, len: i32, keep: bool) -> Result<Bytes, BatchError> {
+        let at = self.src.pos();
+        let fail = BatchError::TruncatedRecord { at };
+        if at.checked_add(len as usize).filter(|s| *s <= end).is_none() {
+            return Err(fail);
+        }
+        self.src.bytes(len as usize, keep)?.ok_or(fail)
+    }
+
+    /// Key, value or header value: any negative length is null (Kafka's `Utils.readBytes`).
+    fn read_field(&mut self, end: usize, keep: bool) -> Result<Option<Bytes>, BatchError> {
+        let len = self.read_len(end)?;
+        if len < 0 {
             return Ok(None);
         }
-        if len < 0 {
-            return Err(BatchError::NegativeLength(len));
-        }
-        let stop = self
-            .pos
-            .checked_add(len as usize)
-            .filter(|s| *s <= end)
-            .ok_or(BatchError::TruncatedRecord { at })?;
-        let field = self.buf.slice(self.pos..stop);
-        self.pos = stop;
-        Ok(Some(field))
+        self.read_bytes(end, len, keep).map(Some)
     }
 }
 
@@ -926,7 +1177,14 @@ impl Iterator for RecordIter {
             return None;
         }
         // Driven by the buffer, with `recordCount` as a cross-check. Trusting the count is
-        if self.pos >= self.buf.len() {
+        let at_end = match self.src.at_end() {
+            Ok(at_end) => at_end,
+            Err(e) => {
+                self.done = true;
+                return Some(Err(e));
+            }
+        };
+        if at_end {
             self.done = true;
             if self.remaining != 0 {
                 return Some(Err(BatchError::RecordCountMismatch {
@@ -952,6 +1210,18 @@ impl Iterator for RecordIter {
                 Some(Err(e))
             }
         }
+    }
+}
+
+impl Iterator for KeyIter {
+    type Item = Result<RecordKey, BatchError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let record = self.0.next()?;
+        Some(record.map(|r| RecordKey {
+            offset_delta: r.offset_delta,
+            key: r.key,
+        }))
     }
 }
 
@@ -1229,6 +1499,59 @@ mod build_tests {
     }
 }
 
+/// A hand-patched test batch with `batchLength` and the CRC repaired.
+#[cfg(test)]
+pub(crate) fn resealed(mut wire: Vec<u8>) -> RecordBatch {
+    let length = (wire.len() - LENGTH_OFFSET - 4) as i32;
+    wire[LENGTH_OFFSET..LENGTH_OFFSET + 4].copy_from_slice(&length.to_be_bytes());
+    let crc = crc32c::crc32c(&wire[ATTRIBUTES_OFFSET..]);
+    wire[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+    RecordBatch::validated(Bytes::from(wire)).unwrap().0
+}
+
+/// One test record with zero attributes and timestamp delta, and no headers.
+#[cfg(test)]
+pub(crate) fn raw_record(offset_delta: i32, key: Option<&[u8]>, value: &[u8]) -> Vec<u8> {
+    let mut body = bytes::BytesMut::from(&[0u8, 0][..]);
+    put_varint_i32(&mut body, offset_delta);
+    match key {
+        Some(k) => {
+            put_varint_i32(&mut body, k.len() as i32);
+            body.extend_from_slice(k);
+        }
+        None => put_varint_i32(&mut body, -1),
+    }
+    put_varint_i32(&mut body, value.len() as i32);
+    body.extend_from_slice(value);
+    put_varint_i32(&mut body, 0);
+    let mut out = bytes::BytesMut::new();
+    put_varint_i32(&mut out, body.len() as i32);
+    out.extend_from_slice(&body);
+    out.to_vec()
+}
+
+/// A gzip test batch of `count` records whose plain bytes are `plain`, the compressed
+/// payload cut in half if `truncate`.
+#[cfg(test)]
+pub(crate) fn gzipped(count: i32, plain: &[u8], truncate: bool) -> RecordBatch {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(plain).unwrap();
+    let mut payload = enc.finish().unwrap();
+    if truncate {
+        payload.truncate(payload.len() / 2);
+    }
+    let mut wire = build_batch(&[NewRecord { key: None, value: None, timestamp: 1 }]).to_vec();
+    wire.truncate(RECORD_BATCH_OVERHEAD);
+    wire[ATTRIBUTES_OFFSET + 1] |= 1;
+    let last_delta = (count - 1).max(0);
+    wire[LAST_OFFSET_DELTA_OFFSET..LAST_OFFSET_DELTA_OFFSET + 4]
+        .copy_from_slice(&last_delta.to_be_bytes());
+    wire[RECORD_COUNT_OFFSET..RECORD_COUNT_OFFSET + 4].copy_from_slice(&count.to_be_bytes());
+    wire.extend_from_slice(&payload);
+    resealed(wire)
+}
+
 #[cfg(test)]
 mod record_decoder_tests {
     use super::*;
@@ -1263,12 +1586,7 @@ mod record_decoder_tests {
             wire.truncate(start + 3 + offset.len());
         }
         wire[start] = ((wire.len() - start - 1) * 2) as u8;
-        let length = (wire.len() - LENGTH_OFFSET - 4) as i32;
-        wire[LENGTH_OFFSET..LENGTH_OFFSET + 4].copy_from_slice(&length.to_be_bytes());
-        let crc = crc32c::crc32c(&wire[ATTRIBUTES_OFFSET..]);
-        wire[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
-        let validated = RecordBatch::validated(Bytes::from(wire)).unwrap();
-        RecordBatch::new(validated.as_bytes().clone()).unwrap()
+        resealed(wire)
     }
 
     #[test]
@@ -1309,6 +1627,143 @@ mod record_decoder_tests {
                 "offset bytes {wire:02x?}"
             );
         }
+    }
+
+    /// `records` after a batch header, with count, length and CRC repaired.
+    fn sealed(count: i32, records: &[u8]) -> RecordBatch {
+        let mut wire = build_batch(&[NewRecord {
+            key: Some(b"k".to_vec()),
+            value: None,
+            timestamp: 1,
+        }])
+        .to_vec();
+        wire.truncate(RECORD_BATCH_OVERHEAD);
+        wire.extend_from_slice(records);
+        wire[RECORD_COUNT_OFFSET..RECORD_COUNT_OFFSET + 4].copy_from_slice(&count.to_be_bytes());
+        resealed(wire)
+    }
+
+    /// One record: zero attributes and deltas, then `parts`, under its canonical length.
+    fn record_of(parts: &[&[u8]]) -> Vec<u8> {
+        let mut body = vec![0u8, 0, 0];
+        for p in parts {
+            body.extend_from_slice(p);
+        }
+        let mut out = bytes::BytesMut::new();
+        put_varint_i32(&mut out, body.len() as i32);
+        out.extend_from_slice(&body);
+        out.to_vec()
+    }
+
+    fn first(batch: &RecordBatch) -> Result<RecordRef, BatchError> {
+        batch.records().unwrap().next().unwrap()
+    }
+
+    #[test]
+    fn key_and_value_lengths_follow_kafka_int_varints() {
+        let null: Option<&[u8]> = None;
+        type Case<'a> = (&'a [u8], &'a [u8], Option<&'a [u8]>);
+        let cases: &[Case] = &[
+            (&[0x81, 0x80, 0x80, 0x80, 0x10], b"", null), // alias of -1
+            (&[0x82, 0x80, 0x80, 0x80, 0x10], b"k", Some(b"k")), // alias of 1
+            (&[0x03], b"", null),                         // -2
+            (&[0xff, 0xff, 0xff, 0xff, 0x0f], b"", null), // i32::MIN
+        ];
+        for &(len, bytes, want) in cases {
+            let key = sealed(1, &record_of(&[len, bytes, &[0x01], &[0x00]]));
+            assert_eq!(first(&key).unwrap().key.as_deref(), want, "key length {len:02x?}");
+            let value = sealed(1, &record_of(&[&[0x02], b"k", len, bytes, &[0x00]]));
+            let got = first(&value).unwrap();
+            assert_eq!(got.key.as_deref(), Some(&b"k"[..]));
+            assert_eq!(got.value.as_deref(), want, "value length {len:02x?}");
+        }
+    }
+
+    #[test]
+    fn a_six_byte_length_varint_is_refused() {
+        // Kafka refuses a varint longer than five bytes.
+        let six: &[u8] = &[0x81, 0x80, 0x80, 0x80, 0x80, 0x00];
+        for record in [
+            record_of(&[six, &[0x01], &[0x00]]),
+            record_of(&[&[0x02], b"k", six, &[0x00]]),
+            record_of(&[&[0x02], b"k", &[0x01], six]),
+        ] {
+            assert!(
+                matches!(first(&sealed(1, &record)), Err(BatchError::TruncatedRecord { .. })),
+                "{record:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_fields_follow_kafka_int_varints() {
+        let alias_one: &[u8] = &[0x82, 0x80, 0x80, 0x80, 0x10];
+        let b = sealed(1, &record_of(&[&[0x02], b"k", &[0x01], alias_one, &[0x02], b"h", &[0x03]]));
+        let got = first(&b).unwrap();
+        assert_eq!(got.headers.len(), 1);
+        assert_eq!(&got.headers[0].0[..], b"h");
+        assert!(got.headers[0].1.is_none(), "a header value length of -2 is null");
+
+        let b = sealed(1, &record_of(&[&[0x02], b"k", &[0x01], &[0x02], alias_one, b"h", &[0x01]]));
+        assert_eq!(&first(&b).unwrap().headers[0].0[..], b"h");
+
+        // Kafka: "Invalid negative header key size".
+        for key_len in [&[0x01][..], &[0x81, 0x80, 0x80, 0x80, 0x10]] {
+            let b = sealed(1, &record_of(&[&[0x02], b"k", &[0x01], &[0x02], key_len, &[0x01]]));
+            assert!(
+                matches!(
+                    first(&b),
+                    Err(BatchError::NegativeLength { field: "header key length", value: -1 })
+                ),
+                "{:?}",
+                first(&b)
+            );
+        }
+        let b = sealed(1, &record_of(&[&[0x02], b"k", &[0x01], &[0x01]]));
+        assert!(matches!(
+            first(&b),
+            Err(BatchError::NegativeLength { field: "header count", value: -1 })
+        ));
+    }
+
+    #[test]
+    fn the_record_length_is_an_int_varint() {
+        let canonical = record_of(&[&[0x02], b"k", &[0x01], &[0x00]]);
+        let body = &canonical[1..];
+        // zigzag(len) with spill bits in a terminating fifth byte.
+        let mut aliased = vec![(body.len() as u8 * 2) | 0x80, 0x80, 0x80, 0x80, 0x10];
+        aliased.extend_from_slice(body);
+        assert_eq!(first(&sealed(1, &aliased)).unwrap().key.as_deref(), Some(&b"k"[..]));
+
+        let mut six = vec![(body.len() as u8 * 2) | 0x80, 0x80, 0x80, 0x80, 0x80, 0x00];
+        six.extend_from_slice(body);
+        assert!(matches!(first(&sealed(1, &six)), Err(BatchError::TruncatedRecord { .. })));
+
+        let mut negative = vec![0x01];
+        negative.extend_from_slice(body);
+        assert!(matches!(
+            first(&sealed(1, &negative)),
+            Err(BatchError::NegativeLength { field: "record length", value: -1 })
+        ));
+    }
+
+    #[test]
+    fn trailing_bytes_inside_a_record_are_refused() {
+        let b = sealed(1, &record_of(&[&[0x02], b"k", &[0x01], &[0x00], &[0xaa]]));
+        assert!(
+            matches!(first(&b), Err(BatchError::RecordSizeMismatch { declared: 8, read: 7 })),
+            "{:?}",
+            first(&b)
+        );
+    }
+
+    #[test]
+    fn a_record_cannot_read_its_fields_out_of_the_next_one() {
+        // The first record's length stops before its header count.
+        let short = record_of(&[&[0x02], b"k", &[0x01]]);
+        let next = record_of(&[&[0x02], b"k", &[0x01], &[0x00]]);
+        let b = sealed(2, &[short, next].concat());
+        assert!(matches!(first(&b), Err(BatchError::TruncatedRecord { .. })));
     }
 
     #[test]
@@ -1574,9 +2029,17 @@ mod decompression_tests {
             "the bomb is not compressed enough to be a bomb"
         );
         assert!(matches!(
-            decompress(1, &bomb),
+            decompress(1, Bytes::from(bomb)),
             Err(BatchError::DecompressedTooLarge)
         ));
+    }
+
+    #[test]
+    fn the_total_cap_fails_a_stream_with_decompressed_too_large() {
+        use std::io::Read;
+        let mut capped = TotalCap { inner: std::io::repeat(0).take(100), left: 64 };
+        let err = capped.read_to_end(&mut Vec::new()).unwrap_err();
+        assert!(matches!(from_io(err, 1), BatchError::DecompressedTooLarge));
     }
 
     #[test]
@@ -1586,7 +2049,7 @@ mod decompression_tests {
         payload.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x7F]);
         payload.extend_from_slice(b"junk");
         assert!(matches!(
-            decompress(2, &payload),
+            decompress(2, Bytes::from(payload)),
             Err(BatchError::DecompressedTooLarge) | Err(BatchError::Decompression(2))
         ));
     }
@@ -1602,7 +2065,7 @@ mod decompression_tests {
                 &[0xFF; 64][..],
                 XERIAL_MAGIC,
             ] {
-                let _ = decompress(codec, payload);
+                let _ = decompress(codec, Bytes::copy_from_slice(payload));
             }
         }
     }
@@ -1610,8 +2073,99 @@ mod decompression_tests {
     #[test]
     fn an_unknown_codec_is_reported_rather_than_guessed() {
         assert!(matches!(
-            decompress(7, b"whatever"),
+            decompress(7, Bytes::from_static(b"whatever")),
             Err(BatchError::Compressed(7))
         ));
+    }
+
+    #[test]
+    fn keys_stream_past_the_decompressed_cap() {
+        let value = vec![0u8; 1 << 20];
+        let n = MAX_DECOMPRESSED_BYTES / value.len() + 2;
+        let mut plain = Vec::new();
+        for i in 0..n {
+            plain.extend(raw_record(i as i32, Some(format!("k{i}").as_bytes()), &value));
+        }
+        plain.extend(raw_record(n as i32, None, b"v"));
+        let b = gzipped(n as i32 + 1, &plain, false);
+        assert!(matches!(b.records_decompressed(), Err(BatchError::DecompressedTooLarge)));
+
+        let keys: Vec<RecordKey> = b.stream_keys().unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(keys.len(), n + 1);
+        let last_keyed = &keys[n - 1];
+        assert_eq!(last_keyed.key.as_deref(), Some(format!("k{}", n - 1).as_bytes()));
+        assert_eq!(last_keyed.offset_delta, n as i32 - 1);
+        assert!(keys[n].key.is_none(), "the null key past the cap was not reached");
+        let records: Result<Vec<RecordRef>, _> = b.stream_records().unwrap().collect();
+        assert_eq!(records.unwrap().len(), n + 1);
+    }
+
+    #[test]
+    fn a_streamed_record_cannot_declare_more_headers_than_fit_in_memory() {
+        let mut body = bytes::BytesMut::from(&[0u8, 0, 0, 0x02, b'k', 0x02, b'v'][..]);
+        put_varint_i32(&mut body, 1 << 22);
+        let mut plain = bytes::BytesMut::new();
+        put_varint_i32(&mut plain, body.len() as i32);
+        plain.extend_from_slice(&body);
+        let b = gzipped(1, &plain, false);
+        let first = b.stream_records().unwrap().next().unwrap();
+        assert!(matches!(first, Err(BatchError::DecompressedTooLarge)), "{first:?}");
+        let key = b.stream_keys().unwrap().next().unwrap();
+        assert!(matches!(key, Err(BatchError::TruncatedRecord { .. })), "{key:?}");
+    }
+
+    #[test]
+    fn streaming_reads_what_the_buffer_reads() {
+        let six: &[u8] = &[0x81, 0x80, 0x80, 0x80, 0x80, 0x00];
+        let raw = |parts: &[&[u8]]| {
+            let mut body = vec![0u8, 0, 0];
+            parts.iter().for_each(|p| body.extend_from_slice(p));
+            let mut out = bytes::BytesMut::new();
+            put_varint_i32(&mut out, body.len() as i32);
+            out.extend_from_slice(&body);
+            out.to_vec()
+        };
+        let two = [raw_record(0, Some(b"a"), b"1"), raw_record(1, None, b"2")].concat();
+        let cases: Vec<(i32, Vec<u8>, bool)> = vec![
+            (2, two.clone(), false),
+            (2, two.clone(), true),
+            (3, two.clone(), false),
+            (1, two, false),
+            (1, raw(&[six, &[0x01], &[0x00]]), false),
+            (1, raw(&[&[0x02], b"k", &[0x01], &[0x00], &[0xaa]]), false),
+            (1, raw(&[&[0x02], b"k", &[0x01], &[0x02], &[0x01], &[0x01]]), false),
+            (1, raw(&[&[0x02], b"k", &[0x01], &[0x01]]), false),
+            (1, raw(&[&[0x02], b"k", &[0x01]]), false),
+            (1, vec![0x40, 0x00, 0x00], false),
+        ];
+        type Seen = Result<Vec<(i32, Option<Bytes>, Option<Bytes>)>, std::mem::Discriminant<BatchError>>;
+        let seen = |iter: Result<RecordIter, BatchError>| -> Seen {
+            iter.and_then(|records| {
+                records.map(|r| r.map(|r| (r.offset_delta, r.key, r.value))).collect()
+            })
+            .map_err(|e| std::mem::discriminant(&e))
+        };
+        for (count, plain, truncate) in cases {
+            let b = gzipped(count, &plain, truncate);
+            let buffered = seen(b.records_decompressed());
+            assert_eq!(seen(b.stream_records()), buffered, "{plain:02x?}");
+            let keys: Result<Vec<_>, _> = b
+                .stream_keys()
+                .and_then(|keys| keys.map(|k| k.map(|k| (k.offset_delta, k.key))).collect())
+                .map_err(|e| std::mem::discriminant(&e));
+            let buffered_keys =
+                buffered.map(|rs| rs.into_iter().map(|(o, k, _)| (o, k)).collect::<Vec<_>>());
+            assert_eq!(keys, buffered_keys, "{plain:02x?}");
+        }
+        for name in [
+            "librdkafka_gzip",
+            "librdkafka_snappy_raw",
+            "librdkafka_lz4",
+            "librdkafka_zstd",
+            "java_snappy_xerial",
+        ] {
+            let b = fixture(name);
+            assert_eq!(seen(b.stream_records()), seen(b.records_decompressed()), "{name}");
+        }
     }
 }

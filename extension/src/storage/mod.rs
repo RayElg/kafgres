@@ -106,6 +106,91 @@ fn forget_cleaned(topic: TopicId, partition: i32) {
     if let Some(all) = CLEANED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         all.remove(&(topic, partition));
     }
+    if let Some(all) = UNDECODABLE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        all.remove(&(topic, partition));
+    }
+}
+
+/// Add `view`'s keys to `map`; false when they would not fit. A batch whose records do not
+/// decode supersedes nothing, but the map moves past it so the partition is not stuck.
+/// A bad CRC is corruption on disk, and the error the caller abandons its plan on.
+fn map_batch(
+    map: &mut kafgres_codec::compaction::OffsetMap,
+    view: &kafgres_codec::records::RecordBatch,
+    max_keys: usize,
+    topic: TopicId,
+    partition: i32,
+) -> Result<bool, kafgres_codec::records::BatchError> {
+    view.verify_crc()?;
+    if is_known_undecodable(topic, partition, view) {
+        map.end = map.end.max(view.last_offset());
+        return Ok(true);
+    }
+    match map.add_batch(view, max_keys) {
+        Ok(fits) => Ok(fits),
+        Err(e) => {
+            undecodable(topic, partition, view, e);
+            map.end = map.end.max(view.last_offset());
+            Ok(true)
+        }
+    }
+}
+
+/// `clean_batch`, except that a stored batch whose records do not decode is kept verbatim.
+/// A bad CRC is an error, as in `map_batch`.
+fn clean_or_keep(
+    view: &kafgres_codec::records::RecordBatch,
+    map: &kafgres_codec::compaction::OffsetMap,
+    tombstone_goes: &dyn Fn(i64) -> bool,
+    topic: TopicId,
+    partition: i32,
+) -> Result<Option<Vec<kafgres_codec::compaction::KeptRecord>>, kafgres_codec::records::BatchError>
+{
+    view.verify_crc()?;
+    if is_known_undecodable(topic, partition, view) {
+        return Ok(None);
+    }
+    Ok(kafgres_codec::compaction::clean_batch(view, map, tombstone_goes).unwrap_or_else(|e| {
+        undecodable(topic, partition, view, e);
+        None
+    }))
+}
+
+/// Per partition, the (base offset, CRC) of each stored batch found not to decode, so each
+/// is logged and decoded once per process rather than every pass.
+static UNDECODABLE: std::sync::Mutex<Option<std::collections::HashMap<(TopicId, i32), std::collections::HashSet<(i64, u32)>>>> =
+    std::sync::Mutex::new(None);
+
+/// Entries kept per partition. Past it a batch is decoded on each pass but no longer logged,
+/// so a partition full of them is neither logged every pass nor grown without bound.
+const UNDECODABLE_HISTORY: usize = 4096;
+
+fn is_known_undecodable(topic: TopicId, partition: i32, view: &RecordBatchView) -> bool {
+    let id = (view.base_offset(), view.stored_crc());
+    UNDECODABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|all| all.get(&(topic, partition)))
+        .is_some_and(|seen| seen.contains(&id))
+}
+
+fn undecodable(
+    topic: TopicId,
+    partition: i32,
+    view: &RecordBatchView,
+    e: kafgres_codec::records::BatchError,
+) {
+    let mut all = UNDECODABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = all.get_or_insert_with(Default::default).entry((topic, partition)).or_default();
+    if seen.len() >= UNDECODABLE_HISTORY {
+        return;
+    }
+    seen.insert((view.base_offset(), view.stored_crc()));
+    pgrx::log!(
+        "kafgres: compaction keeps batch {} of topic {topic} partition {partition} verbatim: its records do not decode ({e})",
+        view.base_offset()
+    );
 }
 
 /// What a compaction pass may do with a batch, beyond what the offset map says (I10).
