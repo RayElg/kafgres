@@ -21,10 +21,19 @@ pub unsafe extern "C-unwind" fn _PG_output_plugin_init(cb: *mut pg_sys::OutputPl
 
 #[pg_guard]
 unsafe extern "C-unwind" fn startup(
-    _ctx: *mut pg_sys::LogicalDecodingContext,
+    ctx: *mut pg_sys::LogicalDecodingContext,
     opt: *mut pg_sys::OutputPluginOptions,
     _is_init: bool,
 ) {
+    // Per-change scratch, reset after each change; the callback's context lasts the whole decode.
+    (*ctx).output_plugin_private = pg_sys::AllocSetContextCreateExtended(
+        (*ctx).context,
+        b"kafgres decoding\0".as_ptr().cast(),
+        0,
+        8 * 1024,
+        8 * 1024 * 1024,
+    )
+    .cast();
     (*opt).output_type = pg_sys::OutputPluginOutputType::OUTPUT_PLUGIN_TEXTUAL_OUTPUT;
     (*opt).receive_rewrites = false;
 }
@@ -56,6 +65,19 @@ unsafe extern "C-unwind" fn commit(
 
 #[pg_guard]
 unsafe extern "C-unwind" fn change(
+    ctx: *mut pg_sys::LogicalDecodingContext,
+    txn: *mut pg_sys::ReorderBufferTXN,
+    relation: pg_sys::Relation,
+    change: *mut pg_sys::ReorderBufferChange,
+) {
+    let scratch: pg_sys::MemoryContext = (*ctx).output_plugin_private.cast();
+    let caller = pg_sys::MemoryContextSwitchTo(scratch);
+    change_in(ctx, txn, relation, change);
+    pg_sys::MemoryContextSwitchTo(caller);
+    pg_sys::MemoryContextReset(scratch);
+}
+
+unsafe fn change_in(
     ctx: *mut pg_sys::LogicalDecodingContext,
     txn: *mut pg_sys::ReorderBufferTXN,
     relation: pg_sys::Relation,

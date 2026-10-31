@@ -142,10 +142,10 @@ fn kafgres_preview_mapping(
         )?;
         for r in rows {
             return Ok::<_, pgrx::spi::Error>(Some((
-                r.get::<String>(1)?.unwrap_or_default(),
-                r.get::<String>(2)?.unwrap_or_default(),
-                r.get::<String>(3)?,
-                r.get::<String>(4)?,
+                utf8(r.get::<Utf8Text>(1)?).unwrap_or_default(),
+                utf8(r.get::<Utf8Text>(2)?).unwrap_or_default(),
+                utf8(r.get::<Utf8Text>(3)?),
+                utf8(r.get::<Utf8Text>(4)?),
             )));
         }
         Ok(None)
@@ -168,7 +168,7 @@ fn kafgres_preview_mapping(
         let rows = client.select(&sql, None, &[])?;
         let mut out = Vec::new();
         for r in rows {
-            out.push((r.get::<String>(1)?, r.get::<String>(2)?));
+            out.push((utf8(r.get::<Utf8Text>(1)?), utf8(r.get::<Utf8Text>(2)?)));
         }
         Ok::<_, pgrx::spi::Error>(out)
     })
@@ -580,6 +580,8 @@ struct Run {
     body: String,
     hold: Option<u64>,
     last: Pos,
+    /// Summary runs only: each transaction's end LSN and where its element ends in `body`.
+    ends: Vec<(u64, usize)>,
 }
 
 type Appended = std::collections::BTreeSet<(u32, i32)>;
@@ -624,6 +626,8 @@ struct Drain<'a> {
     lanes: Vec<Lane<'a>>,
     appended: Appended,
     produced: usize,
+    /// While the peek is read, a flush also syncs its partitions and records its position.
+    streaming: bool,
 }
 
 impl Drain<'_> {
@@ -634,7 +638,10 @@ impl Drain<'_> {
         }
         // I1: rows arrive in commit order and runs flush in that order. A shape change closes
         // the run for good, since a recurring shape must not merge two runs apart in time.
-        if l.run.as_ref().is_some_and(|r| r.cols != cols) {
+        // A stalling run holds the slot at its start, so it covers one transaction.
+        if l.run.as_ref().is_some_and(|r| {
+            r.cols != cols || (l.m.on_error == "stall" && r.last.0 != pos.0)
+        }) {
             self.flush(lane);
         }
         while self.buffered > 0 && self.buffered + element.len() + 2 > self.chunk_bytes {
@@ -654,6 +661,7 @@ impl Drain<'_> {
             body: String::from("["),
             hold,
             last: pos,
+            ends: Vec::new(),
         });
         let before = run.body.len();
         if before > 1 {
@@ -661,29 +669,62 @@ impl Drain<'_> {
         }
         run.body.push_str(element);
         run.last = pos;
+        if pos.1 == SUMMARY_SEQ {
+            run.ends.push((pos.0, run.body.len()));
+        }
         self.buffered += run.body.len() - before + usize::from(before == 1);
     }
 
     fn flush(&mut self, lane: usize) {
-        if self.lanes[lane].m.source == TRANSACTION_SOURCE && !self.flush_changes_first(lane) {
-            return;
+        // For a summary run: where the stopped table mappings hold the slot.
+        let mut held = None;
+        if self.lanes[lane].m.source == TRANSACTION_SOURCE {
+            held = self.changes_first(lane);
         }
         let Some(mut run) = self.lanes[lane].run.take() else {
             return;
         };
         self.buffered -= run.body.len();
+        if let Some((hold, reason)) = &held {
+            // Summaries past the earliest stopped transaction wait for it.
+            let keep = run
+                .ends
+                .iter()
+                .take_while(|(end, _)| hold.is_some_and(|h| *end <= h))
+                .last()
+                .copied();
+            let Some((end, len)) = keep else {
+                self.lanes[lane].stopped = Some((run.hold, reason.clone()));
+                return;
+            };
+            run.body.truncate(len);
+            run.last = (end, SUMMARY_SEQ);
+        }
         run.body.push(']');
         let m = self.lanes[lane].m;
         let done = serde_json::from_str::<Vec<(String, String)>>(&run.cols)
             .map_err(|e| format!("unreadable change shape {:?}: {e}", run.cols))
-            .and_then(|cols| step(self.mode, || render_and_produce(m, &cols, &run.body)));
+            .and_then(|cols| step(self.mode, || render_and_produce(m, &cols, &run.body)))
+            .and_then(|(n, partitions)| {
+                // Recorded now, so a failure later in the peek does not replay it.
+                let persisted = self.streaming && !partitions.is_empty();
+                if persisted {
+                    self.persist(m, run.last, &partitions)?;
+                }
+                Ok((n, partitions, persisted))
+            });
         let l = &mut self.lanes[lane];
         match done {
-            Ok((n, partitions)) => {
+            Ok((n, partitions, persisted)) => {
                 self.produced += n;
-                self.appended.extend(partitions);
+                if !persisted {
+                    self.appended.extend(partitions);
+                }
                 l.delivered = Some(run.last);
-                l.moved = true;
+                l.moved = !persisted;
+                if held.is_some() {
+                    l.stopped = held;
+                }
             }
             Err(e) => {
                 l.stopped = Some((run.hold, format!("mapping {:?} stopped the CDC slot: {e}", m.name)))
@@ -691,30 +732,39 @@ impl Drain<'_> {
         }
     }
 
+    fn persist(&self, m: &Mapping, last: Pos, partitions: &Appended) -> Result<(), String> {
+        let mode = self.mode;
+        sync_then(
+            partitions,
+            |topic, partition| {
+                step(mode, || crate::storage::open().sync_partition(topic, partition).map_err(|e| e.to_string()))
+            },
+            || step(mode, || save_positions(&[(m, last)])),
+        )
+    }
+
     /// A summary follows its transaction's changes on every mapping. While a table mapping is
-    /// stopped its changes are still to come, so the summary mapping stops with it.
-    fn flush_changes_first(&mut self, lane: usize) -> bool {
+    /// stopped its changes are still to come: returns where the earliest stopped one holds
+    /// the slot, and why.
+    fn changes_first(&mut self, lane: usize) -> Option<(Option<u64>, String)> {
         for other in 0..self.lanes.len() {
             if self.lanes[other].m.source != TRANSACTION_SOURCE {
                 self.flush(other);
             }
         }
-        let Some(blocker) = self
+        let blockers: Vec<(Option<u64>, &str)> = self
             .lanes
             .iter()
-            .find(|l| l.m.source != TRANSACTION_SOURCE && l.stopped.is_some())
-        else {
-            return true;
-        };
+            .filter(|l| l.m.source != TRANSACTION_SOURCE)
+            .filter_map(|l| l.stopped.as_ref().map(|s| (s.0, l.m.name.as_str())))
+            .collect();
+        let first = blockers.first()?.1;
+        let hold = advance_target(None, &blockers.iter().map(|b| b.0).collect::<Vec<_>>());
         let reason = format!(
-            "mapping {:?} waits for stopped mapping {:?}, so no summary precedes its changes",
-            self.lanes[lane].m.name, blocker.m.name
+            "mapping {:?} waits for stopped mapping {first:?}, so no summary precedes its changes",
+            self.lanes[lane].m.name
         );
-        if let Some(run) = self.lanes[lane].run.take() {
-            self.buffered -= run.body.len();
-            self.lanes[lane].stopped = Some((run.hold, reason));
-        }
-        false
+        Some((hold, reason))
     }
 }
 
@@ -808,6 +858,7 @@ fn stream<'a>(
             .collect(),
         appended: Default::default(),
         produced: 0,
+        streaming: true,
     };
     let summary_lanes: Vec<usize> =
         (0..mappings.len()).filter(|&i| mappings[i].source == TRANSACTION_SOURCE).collect();
@@ -882,6 +933,7 @@ fn stream<'a>(
         let budget = d.chunk_bytes;
         rows = step(mode, || fetch_peeked(budget))?;
     }
+    d.streaming = false;
     for lane in (0..d.lanes.len()).filter(|i| !summary_lanes.contains(i)) {
         d.flush(lane);
     }
@@ -992,13 +1044,13 @@ fn load_mappings() -> Result<Vec<Mapping>, String> {
         let mut out = Vec::new();
         for r in rows {
             out.push(Mapping {
-                name: r.get::<String>(1)?.unwrap_or_default(),
-                source: r.get::<String>(2)?.unwrap_or_default(),
-                topic: r.get::<String>(3)?.unwrap_or_default(),
-                value_expr: r.get::<String>(4)?.unwrap_or_default(),
-                key_expr: r.get::<String>(5)?,
-                filter_expr: r.get::<String>(6)?,
-                on_error: r.get::<String>(7)?.unwrap_or_else(|| "skip".into()),
+                name: utf8(r.get::<Utf8Text>(1)?).unwrap_or_default(),
+                source: utf8(r.get::<Utf8Text>(2)?).unwrap_or_default(),
+                topic: utf8(r.get::<Utf8Text>(3)?).unwrap_or_default(),
+                value_expr: utf8(r.get::<Utf8Text>(4)?).unwrap_or_default(),
+                key_expr: utf8(r.get::<Utf8Text>(5)?),
+                filter_expr: utf8(r.get::<Utf8Text>(6)?),
+                on_error: utf8(r.get::<Utf8Text>(7)?).unwrap_or_else(|| "skip".into()),
                 delivered: match (r.get::<String>(8)?, r.get::<i64>(9)?) {
                     (Some(lsn), Some(seq)) => parse_lsn(&lsn).map(|end| (end, seq)),
                     _ => None,
@@ -1359,8 +1411,8 @@ fn pending_snapshots() -> Result<Vec<SnapshotState>, String> {
         let mut out = Vec::new();
         for r in rows {
             out.push(SnapshotState {
-                name: r.get::<String>(1)?.unwrap_or_default(),
-                source: r.get::<String>(2)?.unwrap_or_default(),
+                name: utf8(r.get::<Utf8Text>(1)?).unwrap_or_default(),
+                source: utf8(r.get::<Utf8Text>(2)?).unwrap_or_default(),
                 cursor: utf8(r.get::<Utf8Text>(3)?),
             });
         }
@@ -1392,7 +1444,7 @@ fn primary_key_of(source: &str) -> Result<Vec<(String, String)>, String> {
         )?;
         let mut out = Vec::new();
         for r in rows {
-            if let (Some(n), Some(t)) = (r.get::<String>(1)?, r.get::<String>(2)?) {
+            if let (Some(n), Some(t)) = (utf8(r.get::<Utf8Text>(1)?), utf8(r.get::<Utf8Text>(2)?)) {
                 out.push((n, t));
             }
         }
@@ -1422,7 +1474,7 @@ fn shape_of(source: &str) -> Result<Vec<(String, String)>, String> {
         )?;
         let mut out = Vec::new();
         for r in rows {
-            if let (Some(n), Some(t)) = (r.get::<String>(1)?, r.get::<String>(2)?) {
+            if let (Some(n), Some(t)) = (utf8(r.get::<Utf8Text>(1)?), utf8(r.get::<Utf8Text>(2)?)) {
                 out.push((n, t));
             }
         }
@@ -1553,13 +1605,13 @@ fn load_mapping(name: &str) -> Result<Option<Mapping>, String> {
         )?;
         for r in rows {
             return Ok::<_, pgrx::spi::Error>(Some(Mapping {
-                name: r.get::<String>(1)?.unwrap_or_default(),
-                source: r.get::<String>(2)?.unwrap_or_default(),
-                topic: r.get::<String>(3)?.unwrap_or_default(),
-                value_expr: r.get::<String>(4)?.unwrap_or_default(),
-                key_expr: r.get::<String>(5)?,
-                filter_expr: r.get::<String>(6)?,
-                on_error: r.get::<String>(7)?.unwrap_or_else(|| "skip".into()),
+                name: utf8(r.get::<Utf8Text>(1)?).unwrap_or_default(),
+                source: utf8(r.get::<Utf8Text>(2)?).unwrap_or_default(),
+                topic: utf8(r.get::<Utf8Text>(3)?).unwrap_or_default(),
+                value_expr: utf8(r.get::<Utf8Text>(4)?).unwrap_or_default(),
+                key_expr: utf8(r.get::<Utf8Text>(5)?),
+                filter_expr: utf8(r.get::<Utf8Text>(6)?),
+                on_error: utf8(r.get::<Utf8Text>(7)?).unwrap_or_else(|| "skip".into()),
                 delivered: None,
             }));
         }
@@ -1652,11 +1704,11 @@ fn kafgres_cdc_snapshots() -> TableIterator<
         let mut out = Vec::new();
         for r in rows {
             out.push((
-                r.get::<String>(1)?,
-                r.get::<String>(2)?,
-                r.get::<String>(3)?,
+                utf8(r.get::<Utf8Text>(1)?),
+                utf8(r.get::<Utf8Text>(2)?),
+                utf8(r.get::<Utf8Text>(3)?),
                 r.get::<i64>(4)?,
-                r.get::<String>(5)?,
+                utf8(r.get::<Utf8Text>(5)?),
                 r.get::<pgrx::datum::TimestampWithTimeZone>(6)?,
                 r.get::<pgrx::datum::TimestampWithTimeZone>(7)?,
             ));
