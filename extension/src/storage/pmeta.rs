@@ -1,6 +1,5 @@
 //! Partition metadata, shared by both engines: not log data, so not engine-specific.
 
-use crate::clock::now_millis;
 use pgrx::prelude::*;
 
 use super::{EpochEnd, StoreError, StoreResult, TopicId};
@@ -314,58 +313,14 @@ pub fn kafka_txn_lso(topic: TopicId, partition: i32) -> StoreResult<Option<i64>>
     .map_err(spi_err)
 }
 
-/// Register one (topic, partition) as part of this producer's transaction, and begin the
-/// transaction if nothing else did. A transaction-V2 producer (KIP-890 part two) never
-/// sends `AddPartitionsToTxn`, so the first transactional append is what moves the
-/// transaction out of `empty` and what the LSO and the `EndTxn` marker write read. The
-/// first batch's offset wins as `first_offset`; later batches keep it.
+/// Register a partition in the ongoing transaction `txn::verify_produce` checked. Never
+/// begins one. The first batch's offset wins as `first_offset`.
 pub fn register_txn_partition(
     producer_id: i64,
-    epoch: i16,
     topic: TopicId,
     partition: i32,
     base_offset: i64,
 ) -> StoreResult<()> {
-    let state: Option<String> = Spi::get_one_with_args(
-        "SELECT (SELECT state FROM kafgres_txns WHERE producer_id = $1)",
-        &[producer_id.into()],
-    )
-    .map_err(spi_err)?;
-    match state.as_deref() {
-        Some("ongoing") => {
-            // Carry the batch's epoch the way AddPartitionsToTxn does, and leave
-            // `started_at` alone so the expiry sweep keeps its deadline.
-            Spi::run_with_args(
-                "UPDATE kafgres_txns SET producer_epoch = $2 WHERE producer_id = $1",
-                &[producer_id.into(), (epoch as i32).into()],
-            )
-            .map_err(spi_err)?;
-        }
-        Some(_) => {
-            // A transaction the client never began, or a finished predecessor: this
-            // append starts the next one. Stale partition rows from the previous
-            // transaction must not feed the marker write or the LSO.
-            Spi::run_with_args(
-                "DELETE FROM kafgres_txn_partitions WHERE producer_id = $1",
-                &[producer_id.into()],
-            )
-            .map_err(spi_err)?;
-            Spi::run_with_args(
-                "UPDATE kafgres_txns
-                    SET state = 'ongoing', producer_epoch = $2, started_at = $3
-                  WHERE producer_id = $1",
-                &[
-                    producer_id.into(),
-                    (epoch as i32).into(),
-                    now_millis().into(),
-                ],
-            )
-            .map_err(spi_err)?;
-        }
-        // No row at all: the producer's own epoch and sequence checks govern the append,
-        // and there is nothing to register against.
-        None => return Ok(()),
-    }
     Spi::run_with_args(
         "INSERT INTO kafgres_txn_partitions (producer_id, topic_id, partition, first_offset)
          VALUES ($1, $2::oid, $3, $4)
