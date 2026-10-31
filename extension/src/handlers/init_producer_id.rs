@@ -39,6 +39,26 @@ pub fn handle(
         let timeout = req
             .transaction_timeout_ms
             .clamp(1_000, MAX_TRANSACTION_TIMEOUT_MS);
+        // One row per transactional id: a finished row left by an evicted producer would be
+        // listed beside the live one.
+        for table in ["kafgres_txn_partitions", "kafgres_txn_offsets"] {
+            Spi::run_with_args(
+                &format!(
+                    "DELETE FROM {table} WHERE producer_id IN
+                        (SELECT producer_id FROM kafgres_txns
+                          WHERE transactional_id = $1 AND producer_id <> $2
+                            AND state <> 'ongoing')"
+                ),
+                &[id.to_string().into(), producer_id.into()],
+            )
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        }
+        Spi::run_with_args(
+            "DELETE FROM kafgres_txns
+              WHERE transactional_id = $1 AND producer_id <> $2 AND state <> 'ongoing'",
+            &[id.to_string().into(), producer_id.into()],
+        )
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
         Spi::run_with_args(
             "INSERT INTO kafgres_txns
                     (producer_id, producer_epoch, transactional_id, state, started_at,

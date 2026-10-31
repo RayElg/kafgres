@@ -536,6 +536,11 @@ fn plan_partition(
         let producer_id = view.producer_id();
         let first_seq = view.base_sequence();
         if producer_id == NO_PRODUCER_ID || first_seq == NO_SEQUENCE {
+            // Kafka refuses a transactional batch without a producer id and sequence. Appended
+            // plain, no marker would ever close it.
+            if view.is_transactional() && !view.is_control() {
+                return Err(AppendError::Txn(ErrorCode::InvalidRecord));
+            }
             batches.push((view, Decision::Plain));
             continue;
         }

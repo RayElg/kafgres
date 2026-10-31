@@ -380,6 +380,8 @@ pub struct Retention {
 pub fn sweep(policy: Retention) -> Result<u64, spi::Error> {
     // Producers with an open transaction are exempt, as in Kafka's `ProducerStateManager`:
     // nothing in a transaction refreshes `last_ts`, and without the row EndTxn fails.
+    // A transaction beginning concurrently is not yet visible here: `begin_or_continue`
+    // refreshes `last_ts`, and victims are locked and skipped if locked.
     let mut dropped = 0;
 
     if policy.expiration_ms > 0 {
@@ -390,7 +392,8 @@ pub fn sweep(policy: Retention) -> Result<u64, spi::Error> {
                     AND NOT EXISTS (SELECT 1 FROM kafgres_txns t
                                      WHERE t.producer_id = p.producer_id
                                        AND t.state = 'ongoing')
-                  ORDER BY last_ts LIMIT $2),
+                  ORDER BY last_ts LIMIT $2
+                    FOR UPDATE OF p SKIP LOCKED),
                   gone AS (
                 DELETE FROM kafgres_producers p
                  USING victims v WHERE p.producer_id = v.producer_id
@@ -419,7 +422,8 @@ pub fn sweep(policy: Retention) -> Result<u64, spi::Error> {
                     AND NOT EXISTS (SELECT 1 FROM kafgres_txns t
                                      WHERE t.producer_id = p.producer_id
                                        AND t.state = 'ongoing')
-                  ORDER BY p.last_ts LIMIT $2),
+                  ORDER BY p.last_ts LIMIT $2
+                    FOR UPDATE OF p SKIP LOCKED),
                   gone AS (
                 DELETE FROM kafgres_producers p
                  USING victims v WHERE p.producer_id = v.producer_id

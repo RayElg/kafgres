@@ -207,6 +207,12 @@ pub fn handle_add_partitions(
 /// Mark the transaction ongoing at the admitted epoch; a new one clears the previous one's rows.
 pub fn begin_or_continue(admitted: Admitted, txn_id: &str) -> Result<(), pgrx::spi::Error> {
     let Admitted { producer_id, epoch } = admitted;
+    // Locks the producer row and refreshes `last_ts`, so the retention sweep skips it
+    // until this commits.
+    Spi::run_with_args(
+        "UPDATE kafgres_producers SET last_ts = now() WHERE producer_id = $1",
+        &[producer_id.into()],
+    )?;
     let beginning: bool = Spi::get_one_with_args::<bool>(
         "SELECT (SELECT COALESCE(
                     (SELECT state <> 'ongoing' FROM kafgres_txns WHERE producer_id = $1),

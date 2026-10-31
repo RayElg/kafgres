@@ -735,10 +735,66 @@ def test_a_transaction_whose_producer_is_gone_is_still_aborted(topic, by):
         else:
             new_pid, _ = b.init_pid(txn)
             assert new_pid != pid
-        assert sql(f"SELECT state FROM kafgres_txns WHERE producer_id = {pid}") == "aborted"
+        # A reinit aborts the orphan and removes its row.
+        state = sql(f"SELECT state FROM kafgres_txns WHERE producer_id = {pid}")
+        assert state == ("aborted" if by == "timeout" else "")
 
         after = record_batch([b"after"], producer_id=-1, producer_epoch=-1, base_sequence=-1)
         assert b.produce(3, None, topic, 0, after)[0] == NONE
         assert read_committed(topic) == [b"after"], "the orphan is visible or the LSO is pinned"
+    finally:
+        b.close()
+
+
+def txn_rows(txn):
+    return int(sql(f"SELECT count(*) FROM kafgres_txns WHERE transactional_id = '{txn}'"))
+
+
+def test_a_reinit_after_eviction_leaves_one_row(topic, retention):
+    """The evicted producer's finished row is replaced, not listed beside the new one."""
+    b = Broker()
+    txn = txn_id(topic)
+    try:
+        pid, epoch = open_txn(b, txn, topic, b"done")
+        assert b.end_txn(txn, pid, epoch, True) == NONE
+        backdate(pid, 3600)
+        retention(expiration_ms=3000)
+        sql("SELECT kafgres_expire_producers()")
+        assert not producer_exists(pid), "the sweep did not run"
+        new_pid, _ = b.init_pid(txn)
+        assert new_pid != pid
+        assert txn_rows(txn) == 1
+    finally:
+        b.close()
+
+
+def test_a_reinit_leaves_one_row_per_transactional_id(topic):
+    """InitProducerId clears an orphaned row."""
+    b = Broker()
+    txn = txn_id(topic)
+    try:
+        pid, epoch = open_txn(b, txn, topic, b"done")
+        assert b.end_txn(txn, pid, epoch, True) == NONE
+        sql(f"DELETE FROM kafgres_producers WHERE producer_id = {pid}")
+        assert txn_rows(txn) == 1
+        new_pid, _ = b.init_pid(txn)
+        assert new_pid != pid
+        assert txn_rows(txn) == 1
+        assert sql(f"SELECT producer_id FROM kafgres_txns WHERE transactional_id = '{txn}'") == str(new_pid)
+    finally:
+        b.close()
+
+
+def test_a_transactional_batch_without_a_sequence_is_refused(topic):
+    """Appended plain, no marker would ever close it."""
+    b = Broker()
+    txn = txn_id(topic)
+    try:
+        pid, epoch = b.init_pid(txn)
+        assert b.add_partitions(txn, pid, epoch, topic) == NONE
+        bad = record_batch([b"x"], producer_id=pid, producer_epoch=epoch, base_sequence=-1,
+                           transactional=True)
+        assert b.produce(3, txn, topic, 0, bad)[0] == 87  # INVALID_RECORD
+        assert high_watermark(topic) == 0
     finally:
         b.close()
