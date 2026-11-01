@@ -43,7 +43,7 @@ STALE_MEMBER_EPOCH = 113
 TRANSACTION_ABORTABLE = 120
 
 # api key -> first flexible version
-FLEX = {0: 9, 8: 8, 11: 6, 14: 4, 22: 2, 24: 3, 25: 3, 26: 3, 28: 3, 68: 0, 76: 0}
+FLEX = {0: 9, 8: 8, 11: 6, 14: 4, 22: 2, 24: 3, 25: 3, 26: 3, 27: 1, 28: 3, 68: 0, 76: 0}
 
 
 def uvarint(n):
@@ -414,6 +414,10 @@ class Interleave:
             assert line, "the interleaving session failed"
 
     def abort(self):
+        self.release("SELECT kafgres_expire_transactions();")
+
+    def release(self, script):
+        """Once the broker waits on the held rows, run `script` and commit."""
         # Inside the broker's 2 s lock_timeout.
         self._run("""DO $$ BEGIN
             FOR i IN 1..300 LOOP
@@ -425,7 +429,7 @@ class Interleave:
             END LOOP;
             RAISE EXCEPTION 'the broker never waited on the held rows';
         END $$;
-        SELECT kafgres_expire_transactions();
+        """ + script + """
         COMMIT;
         """)
 
@@ -434,6 +438,46 @@ class Interleave:
             self.p.stdin.write("ROLLBACK;\n\\q\n")
             self.p.stdin.flush()
         self.p.wait(timeout=30)
+
+
+def test_a_marker_for_a_fenced_epoch_does_not_end_its_successors_transaction(topic):
+    """A marker passes its unlocked epoch check, then waits on the transaction row while
+    the producer is fenced and a transaction at a higher epoch takes that partition: the
+    marker, written for the old epoch, must not end the new one."""
+    b = Broker()
+    txn = txn_id(topic)
+    try:
+        pid, e0 = open_txn(b, txn, topic, b"first")
+        before = high_watermark(topic, 0)
+        held = Interleave(pid)
+        try:
+            with ThreadPoolExecutor(1) as pool:
+                sent = pool.submit(b.call, 27, 1, markers_body(pid, e0, topic))
+                held.release(f"UPDATE kafgres_producers SET producer_epoch = {e0 + 1} WHERE producer_id = {pid};\n"
+                             f"UPDATE kafgres_txns SET producer_epoch = {e0 + 1} WHERE producer_id = {pid};")
+                answer = sent.result(timeout=30)
+        finally:
+            held.close()
+        assert marker_code(answer) == INVALID_PRODUCER_EPOCH, "the refused marker was reported as written"
+        assert sql(f"SELECT state FROM kafgres_txns WHERE producer_id = {pid}") == "ongoing"
+        assert sql(f"SELECT count(*) FROM kafgres_txn_partitions WHERE producer_id = {pid}") == "1"
+        assert high_watermark(topic, 0) == before, "a marker was written into the new transaction"
+    finally:
+        b.close()
+
+
+def marker_code(d):
+    """The one partition's error code from a v1 WriteTxnMarkers response."""
+    d.arrlen(); d.i64(); d.arrlen(); d.str(); d.arrlen(); d.i32()
+    return d.i16()
+
+
+def markers_body(pid, epoch, topic):
+    """One abort marker for partition 0, flexible (v1) encoding."""
+    name = topic.encode()
+    return (uvarint(2) + struct.pack(">qh?", pid, epoch, False) + uvarint(2)
+            + uvarint(len(name) + 1) + name + uvarint(2) + struct.pack(">i", 0) + b"\x00"
+            + struct.pack(">i", 0) + b"\x00" + b"\x00")
 
 
 @pytest.mark.parametrize("request_kind", ["add_partitions", "produce_v12", "produce_v3"])

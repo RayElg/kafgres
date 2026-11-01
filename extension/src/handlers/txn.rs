@@ -987,21 +987,28 @@ fn finish_partition(
     topic_id: u32,
     partition: i32,
     committed: bool,
-) -> Result<(), HandlerError> {
+) -> Result<ErrorCode, HandlerError> {
     // The same lock `finish_transaction` takes: two markers for one transaction — one
-    let first_offset: Option<i64> = Spi::get_one_with_args(
-        "SELECT (SELECT tp.first_offset
+    let found: Option<String> = Spi::get_one_with_args(
+        "SELECT (SELECT tp.first_offset || '|' || (t.producer_epoch <= $4)::text
                    FROM kafgres_txns t
                    JOIN kafgres_txn_partitions tp ON tp.producer_id = t.producer_id
                   WHERE t.producer_id = $1 AND tp.topic_id = $2::oid AND tp.partition = $3
                     AND t.state = 'ongoing'
                   FOR UPDATE OF t)",
-        &[producer_id.into(), (topic_id as i32).into(), partition.into()],
+        &[producer_id.into(), (topic_id as i32).into(), partition.into(), (producer_epoch as i32).into()],
     )
     .map_err(|e| HandlerError::Internal(e.to_string()))?;
-    let Some(first_offset) = first_offset else {
-        return Ok(());
+    // The epoch is re-checked under the lock: the producer may have been fenced, and a
+    // transaction at a higher epoch given this partition, since the caller looked.
+    let Some(found) = found else {
+        return Ok(ErrorCode::None);
     };
+    let (first_offset, current) = found.split_once('|').unwrap_or(("-1", "false"));
+    if current != "true" {
+        return Ok(ErrorCode::InvalidProducerEpoch);
+    }
+    let first_offset: i64 = first_offset.parse().unwrap_or(-1);
 
     let mut store = crate::storage::open();
     append_marker(
@@ -1041,7 +1048,7 @@ fn finish_partition(
             if committed { "COMMIT" } else { "ABORT" },
             remaining.unwrap_or(0)
         );
-        return Ok(());
+        return Ok(ErrorCode::None);
     }
 
     // Last partition: the transaction is over, so it lands exactly as `EndTxn` would.
@@ -1082,7 +1089,7 @@ fn finish_partition(
          fenced at epoch {epoch}",
         if committed { "committed" } else { "aborted" }
     );
-    Ok(())
+    Ok(ErrorCode::None)
 }
 
 /// `27 WriteTxnMarkers` — force a transaction's outcome onto named partitions: the escape
@@ -1180,6 +1187,5 @@ fn mark_one(
         return Ok(ErrorCode::InvalidTxnState);
     }
 
-    finish_partition(producer_id, producer_epoch, topic_id, partition, committed)?;
-    Ok(ErrorCode::None)
+    finish_partition(producer_id, producer_epoch, topic_id, partition, committed)
 }
