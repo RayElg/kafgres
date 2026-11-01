@@ -798,3 +798,170 @@ def test_a_transactional_batch_without_a_sequence_is_refused(topic):
         assert high_watermark(topic) == 0
     finally:
         b.close()
+
+
+# ---------------------------------------------------------------- Interleavings and stale state
+
+
+class Session:
+    """A second Postgres session running a script that holds its locks until `commit()`."""
+
+    def __init__(self):
+        self.p = subprocess.Popen(
+            ["docker", "compose", "exec", "-T", "postgres",
+             "psql", "-U", "postgres", "-qtA", "-v", "ON_ERROR_STOP=1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+    def run(self, script):
+        self.p.stdin.write(script + "\n\\echo MARK\n")
+        self.p.stdin.flush()
+        while (line := self.p.stdout.readline()) != "MARK\n":
+            assert line, "the session failed"
+
+    def until_broker_waits(self):
+        # Inside the broker's 2 s lock_timeout.
+        self.run("""DO $$ BEGIN
+            FOR i IN 1..300 LOOP
+                PERFORM pg_stat_clear_snapshot();
+                IF EXISTS (SELECT 1 FROM pg_stat_activity
+                            WHERE backend_type = 'kafgres_broker' AND wait_event_type = 'Lock')
+                THEN RETURN; END IF;
+                PERFORM pg_sleep(0.005);
+            END LOOP;
+            RAISE EXCEPTION 'the broker never waited';
+        END $$;""")
+
+    def close(self):
+        if self.p.poll() is None:
+            self.p.stdin.write("ROLLBACK;\n\\q\n")
+            self.p.stdin.flush()
+        self.p.wait(timeout=30)
+
+
+# `TXN_ID_LOCK_CLASS` in handlers/txn.rs.
+TXN_ID_LOCK = "pg_advisory_xact_lock(1801942136, hashtext('{}'))"
+
+
+def test_an_init_waits_for_the_instance_it_fences_and_aborts_what_it_began(topic):
+    """A transaction begun by the fenced instance must not be inherited by the new epoch."""
+    b = Broker()
+    txn = txn_id(topic)
+    session = Session()
+    try:
+        pid, epoch = b.init_pid(txn)
+        session.run(f"""BEGIN;
+            SELECT {TXN_ID_LOCK.format(txn)};
+            SELECT 1 FROM kafgres_txns WHERE producer_id = {pid} FOR UPDATE;
+            SELECT 1 FROM kafgres_producers WHERE producer_id = {pid} FOR SHARE;
+            UPDATE kafgres_txns SET state = 'ongoing', started_at = started_at WHERE producer_id = {pid};
+            INSERT INTO kafgres_txn_partitions (producer_id, topic_id, partition, first_offset)
+                SELECT {pid}, topic_id, 0, -1 FROM kafgres_topics WHERE name = '{topic}';""")
+        with ThreadPoolExecutor(1) as pool:
+            init = pool.submit(Broker().init_pid, txn)
+            session.until_broker_waits()
+            session.run("COMMIT;")
+            new_pid, new_epoch = init.result(timeout=30)
+        assert (new_pid, new_epoch) == (pid, epoch + 1)
+        assert sql(f"SELECT state FROM kafgres_txns WHERE producer_id = {pid}") == "empty", (
+            "the new epoch adopted the transaction its predecessor was beginning")
+        assert sql(f"SELECT count(*) FROM kafgres_txn_partitions WHERE producer_id = {pid}") == "0"
+    finally:
+        session.close()
+        b.close()
+
+
+def test_the_producer_sweep_skips_a_producer_whose_transaction_is_beginning(topic, retention):
+    """The open-transaction exemption cannot see an uncommitted begin."""
+    b = Broker()
+    txn = txn_id(topic)
+    session = Session()
+    try:
+        pid, _ = b.init_pid(txn)
+        backdate(pid, 3600)
+        session.run(f"""BEGIN;
+            UPDATE kafgres_producers SET last_ts = now() WHERE producer_id = {pid};
+            UPDATE kafgres_txns SET state = 'ongoing' WHERE producer_id = {pid};""")
+        retention(expiration_ms=3000)
+        sql("SELECT kafgres_expire_producers()")
+        session.run("COMMIT;")
+        assert producer_exists(pid), "the sweep evicted a producer whose transaction was beginning"
+    finally:
+        session.close()
+        b.close()
+
+
+def test_a_forced_result_does_not_outlive_its_transaction(topic):
+    """A forced outcome belongs to one transaction, not to the producer's row."""
+    b = Broker()
+    txn = txn_id(topic)
+    try:
+        pid, epoch = open_txn(b, txn, topic, b"forced")
+        sql(f"UPDATE kafgres_txns SET forced_result = false WHERE producer_id = {pid}")
+        assert b.end_txn(txn, pid, epoch, True) == INVALID_PRODUCER_EPOCH
+
+        pid2, epoch2 = b.init_pid(txn)
+        assert sql(f"SELECT coalesce(forced_result::text, 'none') FROM kafgres_txns "
+                   f"WHERE producer_id = {pid2}") == "none"
+        assert b.add_partitions(txn, pid2, epoch2, topic) == NONE
+        assert b.produce(3, txn, topic, 0, txn_batch(b"kept", pid2, epoch2, 0))[0] == NONE
+        assert b.end_txn(txn, pid2, epoch2, True) == NONE
+        assert read_committed(topic) == [b"kept"], "the stale forced result aborted a later commit"
+    finally:
+        b.close()
+
+
+def test_a_forced_result_left_on_a_finished_row_does_not_reach_the_next_transaction(topic):
+    """Beginning a transaction clears it, not only InitProducerId."""
+    b = Broker()
+    txn = txn_id(topic)
+    try:
+        pid, epoch = b.init_pid(txn)
+        assert b.add_partitions(txn, pid, epoch, topic) == NONE
+        assert b.end_txn(txn, pid, epoch, True) == NONE
+        sql(f"UPDATE kafgres_txns SET forced_result = false WHERE producer_id = {pid}")
+        assert b.add_partitions(txn, pid, epoch, topic) == NONE
+        assert b.produce(3, txn, topic, 0, txn_batch(b"next", pid, epoch, 0))[0] == NONE
+        assert b.end_txn(txn, pid, epoch, True) == NONE
+        assert read_committed(topic) == [b"next"]
+    finally:
+        b.close()
+
+
+@pytest.mark.parametrize("version", [3, 12])
+def test_a_produce_to_a_missing_partition_registers_nothing(topic, version):
+    """A registered missing partition makes every later marker append fail."""
+    b = Broker()
+    txn = txn_id(topic)
+    try:
+        pid, epoch = b.init_pid(txn)
+        if version < 12:
+            assert b.add_partitions(txn, pid, epoch, topic) == NONE
+        code, _ = b.produce(version, txn, topic, 99, txn_batch(b"x", pid, epoch, 0))
+        assert code == UNKNOWN_TOPIC_OR_PARTITION
+        assert sql(f"SELECT count(*) FROM kafgres_txn_partitions "
+                   f"WHERE producer_id = {pid} AND partition = 99") == "0"
+
+        assert b.produce(version, txn, topic, 0, txn_batch(b"ok", pid, epoch, 0))[0] == NONE
+        assert b.end_txn(txn, pid, epoch, True) == NONE
+        assert read_committed(topic) == [b"ok"]
+    finally:
+        b.close()
+
+
+def test_every_transaction_partition_row_names_a_partition_that_exists(topic):
+    """No request may leave a row that a marker append cannot reach."""
+    b = Broker()
+    txn = txn_id(topic)
+    try:
+        pid, epoch = b.init_pid(txn)
+        b.add_partitions(txn, pid, epoch, topic, (0, 1, 99, -1))
+        b.produce(12, txn, topic, 77, txn_batch(b"x", pid, epoch, 0))
+        b.produce(12, txn, topic, -1, txn_batch(b"x", pid, epoch, 0))
+        bad = sql("SELECT count(*) FROM kafgres_txn_partitions tp "
+                  "JOIN kafgres_topics t USING (topic_id) "
+                  "WHERE tp.partition < 0 OR tp.partition >= "
+                  "(SELECT count(*) FROM kafgres_partitions p WHERE p.topic_id = tp.topic_id)")
+        assert bad == "0"
+        assert b.end_txn(txn, pid, epoch, False) == NONE
+    finally:
+        b.close()

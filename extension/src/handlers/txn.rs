@@ -85,6 +85,7 @@ fn judge(
     if transactional_id.is_empty() {
         return Ok((Err(Verdict::NoTransactionalId), false));
     }
+    lock_transactional_id(transactional_id)?;
     let txn = lock_txn(producer_id)?;
     let (topic_id, index) = partition.map_or((None, None), |(t, p)| (Some(t as i32), Some(p)));
     let row: Option<String> = Spi::get_one_with_args(
@@ -113,6 +114,17 @@ fn judge(
     Ok((Ok(Admitted { producer_id, epoch }), added))
 }
 
+const TXN_ID_LOCK_CLASS: i32 = 0x6b67_7478;
+
+/// First in every lock order: this, then the `kafgres_txns` row, then the `kafgres_producers`
+/// row. It also covers a first transaction, which has no row to lock yet.
+pub(super) fn lock_transactional_id(transactional_id: &str) -> Result<(), pgrx::spi::Error> {
+    Spi::run_with_args(
+        "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+        &[TXN_ID_LOCK_CLASS.into(), transactional_id.into()],
+    )
+}
+
 fn lock_txn(producer_id: i64) -> Result<Option<String>, pgrx::spi::Error> {
     Spi::get_one_with_args(
         "SELECT (SELECT state || '|' || producer_epoch FROM kafgres_txns
@@ -122,7 +134,8 @@ fn lock_txn(producer_id: i64) -> Result<Option<String>, pgrx::spi::Error> {
 }
 
 /// `judge`'s locks, taken by a produce before its savepoint so a rollback keeps them.
-pub fn hold_for_produce(producer_id: i64) -> Result<(), pgrx::spi::Error> {
+pub fn hold_for_produce(transactional_id: &str, producer_id: i64) -> Result<(), pgrx::spi::Error> {
+    lock_transactional_id(transactional_id)?;
     lock_txn(producer_id)?;
     Spi::run_with_args(
         "SELECT FROM kafgres_producers WHERE producer_id = $1 FOR SHARE",
@@ -247,7 +260,9 @@ pub fn begin_or_continue(admitted: Admitted, txn_id: &str) -> Result<(), pgrx::s
                                   ELSE EXCLUDED.started_at END,
                 offsets_partitions = CASE WHEN kafgres_txns.state = 'ongoing'
                                           THEN kafgres_txns.offsets_partitions
-                                          ELSE '{}' END",
+                                          ELSE '{}' END,
+                forced_result = CASE WHEN kafgres_txns.state = 'ongoing'
+                                     THEN kafgres_txns.forced_result END",
         &[
             producer_id.into(),
             (epoch as i32).into(),

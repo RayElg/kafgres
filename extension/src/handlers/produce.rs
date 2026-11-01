@@ -175,9 +175,9 @@ pub fn handle(
 
     // Outside the savepoint below: rolling it back releases row locks taken inside it, and a
     // sweep could then abort a transaction whose batch already landed in a segment file.
-    if req.transactional_id.is_some() {
+    if let Some(transactional_id) = req.transactional_id.as_deref() {
         for producer_id in transactional_producers(req) {
-            super::txn::hold_for_produce(producer_id)
+            super::txn::hold_for_produce(transactional_id, producer_id)
                 .map_err(|e| HandlerError::Internal(e.to_string()))?;
         }
     }
@@ -332,6 +332,7 @@ fn build(
             .err();
 
         let mut partitions = Vec::with_capacity(topic_data.partition_data.len());
+        let mut partition_limit: Option<i32> = None;
         for (pi, pd) in topic_data.partition_data.iter().enumerate() {
             entries.push(((name.clone(), pd.index), (ti, pi)));
             if let Some(code) = denied {
@@ -353,6 +354,26 @@ fn build(
                 ));
                 continue;
             };
+            // Before a v12+ produce registers the partition with its transaction.
+            if req.transactional_id.is_some() {
+                let count = match partition_limit {
+                    Some(n) => n,
+                    None => {
+                        let n = meta::partition_count(tid)
+                            .map_err(|e| HandlerError::Internal(format!("partition count: {e}")))?;
+                        partition_limit = Some(n);
+                        n
+                    }
+                };
+                if pd.index < 0 || pd.index >= count {
+                    partitions.push(failed(
+                        pd.index,
+                        &AppendError::Store(StoreError::UnknownTopicOrPartition),
+                        &name,
+                    ));
+                    continue;
+                }
+            }
             if let Some(err) = oversized(pd.records.as_ref(), max_message_bytes) {
                 partitions.push(failed(pd.index, &err, &name));
                 continue;
