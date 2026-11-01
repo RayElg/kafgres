@@ -132,7 +132,7 @@ fn render_check(source: &str, value_expr: &str, key_expr: Option<&str>, filter_e
 fn kafgres_preview_mapping(
     mapping_name: &str,
     predicate: &str,
-) -> TableIterator<'static, (name!(key, Option<String>), name!(value, Option<String>))> {
+) -> TableIterator<'static, (name!(key, Option<Utf8Text>), name!(value, Option<Utf8Text>))> {
     let row: Option<(String, String, Option<String>, Option<String>)> = Spi::connect(|client| {
         let rows = client.select(
             "SELECT source_table, value_expr, key_expr, filter_expr
@@ -164,11 +164,11 @@ fn kafgres_preview_mapping(
         "I",
         predicate,
     );
-    let out: Vec<(Option<String>, Option<String>)> = Spi::connect(|client| {
+    let out: Vec<(Option<Utf8Text>, Option<Utf8Text>)> = Spi::connect(|client| {
         let rows = client.select(&sql, None, &[])?;
         let mut out = Vec::new();
         for r in rows {
-            out.push((utf8(r.get::<Utf8Text>(1)?), utf8(r.get::<Utf8Text>(2)?)));
+            out.push((r.get::<Utf8Text>(1)?, r.get::<Utf8Text>(2)?));
         }
         Ok::<_, pgrx::spi::Error>(out)
     })
@@ -488,6 +488,8 @@ unsafe fn to_server(s: &str) -> pg_sys::Datum {
     pg_sys::Datum::from(text)
 }
 
+use pgrx::pgrx_sql_entity_graph::metadata::{ArgumentError, Returns, ReturnsError, SqlMapping, SqlTranslatable};
+
 /// SQL `text` read into UTF-8: pgrx's `String` passes server-encoded bytes through unconverted.
 struct Utf8Text(String);
 
@@ -506,6 +508,25 @@ impl pgrx::datum::IntoDatum for Utf8Text {
     }
     fn type_oid() -> pg_sys::Oid {
         pg_sys::TEXTOID
+    }
+}
+
+// So a function can return what `Utf8Text` read.
+unsafe impl SqlTranslatable for Utf8Text {
+    fn argument_sql() -> Result<SqlMapping, ArgumentError> {
+        Ok(SqlMapping::literal("text"))
+    }
+    fn return_sql() -> Result<Returns, ReturnsError> {
+        Ok(Returns::One(SqlMapping::literal("text")))
+    }
+}
+
+unsafe impl pgrx::callconv::BoxRet for Utf8Text {
+    unsafe fn box_into<'fcx>(self, fcinfo: &mut pgrx::callconv::FcInfo<'fcx>) -> pgrx::datum::Datum<'fcx> {
+        match pgrx::datum::IntoDatum::into_datum(self) {
+            Some(datum) => unsafe { fcinfo.return_raw_datum(datum) },
+            None => fcinfo.return_null(),
+        }
     }
 }
 
@@ -871,16 +892,9 @@ fn drain(max_changes: i32, mode: Mode) -> Result<Drained, String> {
 
     let holds: Vec<Option<u64>> = d.lanes.iter().filter_map(|l| l.stopped.as_ref().map(|s| s.0)).collect();
     let appended = std::mem::take(&mut d.appended);
-    // With nothing appended and nothing held, a replay would produce nothing to duplicate.
-    let moved: Vec<(&Mapping, Pos)> = if appended.is_empty() && holds.is_empty() {
-        Vec::new()
-    } else {
-        d.lanes
-            .iter()
-            .filter(|l| l.moved)
-            .filter_map(|l| l.delivered.map(|p| (l.m, p)))
-            .collect()
-    };
+    // Even with nothing appended: a dead letter has already committed, and a replay repeats it.
+    let moved: Vec<(&Mapping, Pos)> =
+        d.lanes.iter().filter(|l| l.moved).filter_map(|l| l.delivered.map(|p| (l.m, p))).collect();
     let stalled: Vec<String> = d.lanes.iter_mut().filter_map(|l| l.stopped.take().map(|s| s.1)).collect();
 
     sync_then(
@@ -1749,11 +1763,11 @@ fn kafgres_snapshot_mapping(mapping_name: &str) -> bool {
 fn kafgres_cdc_snapshots() -> TableIterator<
     'static,
     (
-        name!(mapping_name, Option<String>),
-        name!(source_table, Option<String>),
-        name!(state, Option<String>),
+        name!(mapping_name, Option<Utf8Text>),
+        name!(source_table, Option<Utf8Text>),
+        name!(state, Option<Utf8Text>),
         name!(rows_emitted, Option<i64>),
-        name!(cursor, Option<String>),
+        name!(cursor, Option<Utf8Text>),
         name!(started_at, Option<pgrx::datum::TimestampWithTimeZone>),
         name!(finished_at, Option<pgrx::datum::TimestampWithTimeZone>),
     ),
@@ -1771,11 +1785,11 @@ fn kafgres_cdc_snapshots() -> TableIterator<
         let mut out = Vec::new();
         for r in rows {
             out.push((
-                utf8(r.get::<Utf8Text>(1)?),
-                utf8(r.get::<Utf8Text>(2)?),
-                utf8(r.get::<Utf8Text>(3)?),
+                r.get::<Utf8Text>(1)?,
+                r.get::<Utf8Text>(2)?,
+                r.get::<Utf8Text>(3)?,
                 r.get::<i64>(4)?,
-                utf8(r.get::<Utf8Text>(5)?),
+                r.get::<Utf8Text>(5)?,
                 r.get::<pgrx::datum::TimestampWithTimeZone>(6)?,
                 r.get::<pgrx::datum::TimestampWithTimeZone>(7)?,
             ));

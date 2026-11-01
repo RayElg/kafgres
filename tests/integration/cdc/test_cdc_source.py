@@ -845,3 +845,14 @@ def test_a_chunk_that_renders_nothing_is_still_recorded_while_the_peek_is_read()
                    "WHERE mapping_name = 'm1'") == "t"
     finally:
         set_guc("kafgres.cdc_chunk_bytes", "16777216")
+
+
+def test_a_drain_that_only_dead_letters_still_records_its_position():
+    """The dead letter has committed, so a crash before the slot moves would repeat it."""
+    add_mapping("jsonb_build_object('n', new.note::int)")
+    start_slot()
+    sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','oops')")
+    assert drain() == 0
+    assert sql("SELECT count(*) FROM kafgres_cdc_errors") == "1"
+    assert sql("SELECT delivered_lsn IS NOT NULL FROM kafgres_cdc_mappings "
+               "WHERE mapping_name = 'm1'") == "t"

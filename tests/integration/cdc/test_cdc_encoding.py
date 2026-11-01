@@ -127,3 +127,21 @@ def test_a_non_ascii_expression_is_refused_rather_than_rendered_as_other_charact
     assert ok("SELECT kafgres_cdc_drain()", DB) == "0"
     assert consume("enc-expr") == []
     assert "not UTF-8" in ok("SELECT error FROM kafgres_cdc_errors WHERE mapping_name = 'expr'", DB)
+
+
+def test_text_returned_to_a_client_is_in_the_server_encoding(latin1):
+    """The preview and snapshot listings read text as UTF-8; a client of a LATIN1 database
+    must get LATIN1 back, or it sees `cafÃ©`."""
+    ok("CREATE TABLE enc_out (id int primary key, note text)", DB)
+    ok("SELECT kafgres_create_topic('enc-out', 1)", DB)
+    name = "'out' || chr(233)"
+    # Direct inserts: the SQL functions refuse non-ASCII text on a non-UTF-8 database.
+    ok(f"INSERT INTO kafgres_cdc_mappings (mapping_name, source_table, topic, key_expr, value_expr, snapshot) "
+       f"SELECT m, 'public.enc_out', 'enc-out', 'new.note', "
+       "'jsonb_build_object(''note'', new.note)', 'pending' FROM (VALUES ('encout'), ("
+       f"{name})) v(m)", DB)
+    ok("INSERT INTO enc_out VALUES (1, 'caf' || chr(233))", DB)
+
+    assert ok(f"SELECT bool_and(key = 'caf' || chr(233) AND value::jsonb->>'note' = 'caf' || chr(233)) "
+              f"FROM kafgres_preview_mapping('encout', 'true')", DB) == "t"
+    assert ok(f"SELECT count(*) FROM kafgres_cdc_snapshots() WHERE mapping_name = {name}", DB) == "1"
