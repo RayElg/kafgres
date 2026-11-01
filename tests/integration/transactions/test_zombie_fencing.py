@@ -391,7 +391,7 @@ class Interleave:
     waits until the broker blocks behind them, then runs the expiry sweep and commits, so
     the transaction is aborted and fenced between a request's check and its write."""
 
-    def __init__(self, pid):
+    def __init__(self, pid, stale=False):
         self.p = subprocess.Popen(
             ["docker", "compose", "exec", "-T", "postgres",
              "psql", "-U", "postgres", "-qtA", "-v", "ON_ERROR_STOP=1"],
@@ -399,6 +399,13 @@ class Interleave:
         self._run(f"BEGIN;\n"
                   f"SELECT 1 FROM kafgres_txns WHERE producer_id = {pid} FOR UPDATE;\n"
                   f"SELECT 1 FROM kafgres_producers WHERE producer_id = {pid} FOR UPDATE;\n")
+        if stale:
+            # A stale `last_ts` is refreshed in phase 2, so an unlocked check would wait
+            # there, between the check and the write.
+            self._run(f"UPDATE kafgres_txns SET timeout_ms = 1000, started_at = started_at - 60000 "
+                      f"WHERE producer_id = {pid};\n"
+                      f"UPDATE kafgres_producers SET last_ts = now() - interval '3600 seconds' "
+                      f"WHERE producer_id = {pid};\n")
 
     def _run(self, script):
         self.p.stdin.write(script + "\\echo MARK\n")
@@ -439,13 +446,10 @@ def test_a_transaction_aborted_behind_a_waiting_request_stays_aborted(topic, req
     with ThreadPoolExecutor(1) as pool:
         try:
             pid, e0 = open_txn(b, txn, topic, b"first")
-            sql(f"UPDATE kafgres_txns SET timeout_ms = 1000, started_at = started_at - 60000 "
-                f"WHERE producer_id = {pid}")
-            # A stale `last_ts` is refreshed in phase 2, so an unlocked check would wait there,
-            # between the check and the write.
-            backdate(pid, 3600)
             before = (high_watermark(topic, 0), high_watermark(topic, 1))
-            held = Interleave(pid)
+            # Stale only inside the holding session: the broker's own expiry sweep would
+            # otherwise abort it before the interleaving starts.
+            held = Interleave(pid, stale=True)
             try:
                 if request_kind == "add_partitions":
                     sent = pool.submit(b.add_partitions, txn, pid, e0, topic, (1,))
