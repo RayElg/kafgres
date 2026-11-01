@@ -779,3 +779,69 @@ def test_the_chunk_budget_is_shared_by_every_mapping():
     vs = values(rows)
     assert sorted(v["id"] for v in vs) == [1, 1, 2, 2], vs
     assert len({v["tx"] for v in vs}) >= 3, f"each mapping had a budget of its own: {vs}"
+
+
+def held_changes():
+    return sql("SELECT count(*) FROM pg_logical_slot_peek_changes('kafgres_cdc', NULL, NULL) "
+               "WHERE data::jsonb->>'op' IN ('I','U','D')")
+
+
+def test_a_stalling_mapping_delivers_the_good_transaction_before_the_bad_one():
+    """Same shape, one peek: the slot is held at the bad transaction, not at the first."""
+    sql("SELECT kafgres_drop_topic('src-stall')")
+    sql("SELECT kafgres_create_topic('src-stall', 1)")
+    try:
+        add_mapping("jsonb_build_object('n', 1 / (new.id - 2))", name="b_stall", topic="src-stall")
+        sql("UPDATE kafgres_cdc_mappings SET on_error = 'stall'")
+        start_slot()
+        sql("INSERT INTO src_orders VALUES (1,1,1,'placed','x')")
+        sql("INSERT INTO src_orders VALUES (2,1,1,'placed','x')")
+        sql("INSERT INTO src_orders VALUES (3,1,1,'placed','x')")
+        _, err = drain_warning()
+        assert "b_stall" in err and "stopped the CDC slot" in err, err[-400:]
+        assert [v["n"] for v in values(consume("src-stall"))] == [-1]
+        assert held_changes() == "2", "the slot is not held at the bad transaction"
+    finally:
+        sql("SELECT kafgres_drop_topic('src-stall')")
+
+
+def test_a_summary_is_delivered_for_a_transaction_before_a_stalled_one():
+    """A stalled table mapping holds back its own transaction's summary, not earlier ones."""
+    for topic in ("src-stall", "src-txn"):
+        sql(f"SELECT kafgres_drop_topic('{topic}')")
+        sql(f"SELECT kafgres_create_topic('{topic}', 1)")
+    try:
+        add_mapping("jsonb_build_object('n', 1 / (new.id - 2))", name="b_stall", topic="src-stall")
+        sql("UPDATE kafgres_cdc_mappings SET on_error = 'stall'")
+        add_mapping("jsonb_build_object('xid', xid)", key_expr=None, name="a_txn",
+                    source="kafgres.transaction", topic="src-txn")
+        start_slot()
+        sql("INSERT INTO src_orders VALUES (1,1,1,'placed','x')")
+        sql("INSERT INTO src_orders VALUES (2,1,1,'placed','x')")
+        _, err = drain_warning()
+        assert "stopped the CDC slot" in err, err[-400:]
+        assert len(consume("src-txn")) == 1, "the first transaction's summary was dropped"
+        assert held_changes() == "1", "the slot is pinned before the first transaction"
+
+        add_mapping("jsonb_build_object('n', new.id)", name="b_stall", topic="src-stall")
+        drain_warning()
+        assert len(consume("src-txn")) == 2, "a summary was repeated or lost"
+        assert [v["n"] for v in values(consume("src-stall"))] == [-1, 2]
+    finally:
+        for topic in ("src-stall", "src-txn"):
+            sql(f"SELECT kafgres_drop_topic('{topic}')")
+
+
+def test_a_chunk_that_renders_nothing_is_still_recorded_while_the_peek_is_read():
+    """Filtered or dead-lettered, it would otherwise be repeated by a replay."""
+    add_mapping("jsonb_build_object('id', new.id)", filter_expr="false")
+    start_slot()
+    set_guc("kafgres.cdc_chunk_bytes", "1024")
+    try:
+        sql("INSERT INTO src_orders SELECT g, 1, 1, 'placed', repeat('n', 110) "
+            "FROM generate_series(1, 30) g")
+        assert drain() == 0
+        assert sql("SELECT delivered_lsn IS NOT NULL FROM kafgres_cdc_mappings "
+                   "WHERE mapping_name = 'm1'") == "t"
+    finally:
+        set_guc("kafgres.cdc_chunk_bytes", "16777216")

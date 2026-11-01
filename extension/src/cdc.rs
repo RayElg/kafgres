@@ -580,8 +580,8 @@ struct Run {
     body: String,
     hold: Option<u64>,
     last: Pos,
-    /// Summary runs only: each transaction's end LSN and where its element ends in `body`.
-    ends: Vec<(u64, usize)>,
+    /// Per transaction: last position, the slot position that keeps it, end offset in `body`.
+    ends: Vec<(Pos, Option<u64>, usize)>,
 }
 
 type Appended = std::collections::BTreeSet<(u32, i32)>;
@@ -612,6 +612,39 @@ fn step<T>(mode: Mode, f: impl FnOnce() -> Result<T, String>) -> Result<T, Strin
     }
 }
 
+enum Failed {
+    /// Nothing was appended.
+    Render(String),
+    Persist(String),
+}
+
+impl Failed {
+    fn message(self) -> String {
+        match self {
+            Failed::Render(e) | Failed::Persist(e) => e,
+        }
+    }
+}
+
+/// The last transaction of a run that ended at or before `hold`.
+fn deliverable(ends: &[(Pos, Option<u64>, usize)], hold: Option<u64>) -> Option<(Pos, Option<u64>, usize)> {
+    ends.iter().take_while(|(pos, _, _)| hold.is_some_and(|h| pos.0 <= h)).last().copied()
+}
+
+/// A run's transactions in order, each as its hold, last position and JSON array of elements.
+/// `body` has no closing bracket.
+fn transactions(run: &Run) -> Vec<(Option<u64>, Pos, String)> {
+    let mut start = 1;
+    run.ends
+        .iter()
+        .map(|&(last, hold, end)| {
+            let part = format!("[{}]", &run.body[start..end]);
+            start = end + 1;
+            (hold, last, part)
+        })
+        .collect()
+}
+
 pub struct Drained {
     pub produced: usize,
     /// One line per mapping that stopped, the slot held for it.
@@ -638,10 +671,7 @@ impl Drain<'_> {
         }
         // I1: rows arrive in commit order and runs flush in that order. A shape change closes
         // the run for good, since a recurring shape must not merge two runs apart in time.
-        // A stalling run holds the slot at its start, so it covers one transaction.
-        if l.run.as_ref().is_some_and(|r| {
-            r.cols != cols || (l.m.on_error == "stall" && r.last.0 != pos.0)
-        }) {
+        if l.run.as_ref().is_some_and(|r| r.cols != cols) {
             self.flush(lane);
         }
         while self.buffered > 0 && self.buffered + element.len() + 2 > self.chunk_bytes {
@@ -669,8 +699,12 @@ impl Drain<'_> {
         }
         run.body.push_str(element);
         run.last = pos;
-        if pos.1 == SUMMARY_SEQ {
-            run.ends.push((pos.0, run.body.len()));
+        match run.ends.last_mut() {
+            Some(e) if e.0 .0 == pos.0 => {
+                e.0 = pos;
+                e.2 = run.body.len();
+            }
+            _ => run.ends.push((pos, hold, run.body.len())),
         }
         self.buffered += run.body.len() - before + usize::from(before == 1);
     }
@@ -687,49 +721,72 @@ impl Drain<'_> {
         self.buffered -= run.body.len();
         if let Some((hold, reason)) = &held {
             // Summaries past the earliest stopped transaction wait for it.
-            let keep = run
-                .ends
-                .iter()
-                .take_while(|(end, _)| hold.is_some_and(|h| *end <= h))
-                .last()
-                .copied();
-            let Some((end, len)) = keep else {
+            let Some((pos, _, len)) = deliverable(&run.ends, *hold) else {
                 self.lanes[lane].stopped = Some((run.hold, reason.clone()));
                 return;
             };
             run.body.truncate(len);
-            run.last = (end, SUMMARY_SEQ);
+            run.ends.retain(|e| e.0 .0 <= pos.0);
+            run.last = pos;
         }
-        run.body.push(']');
         let m = self.lanes[lane].m;
-        let done = serde_json::from_str::<Vec<(String, String)>>(&run.cols)
-            .map_err(|e| format!("unreadable change shape {:?}: {e}", run.cols))
-            .and_then(|cols| step(self.mode, || render_and_produce(m, &cols, &run.body)))
-            .and_then(|(n, partitions)| {
-                // Recorded now, so a failure later in the peek does not replay it.
-                let persisted = self.streaming && !partitions.is_empty();
-                if persisted {
-                    self.persist(m, run.last, &partitions)?;
-                }
-                Ok((n, partitions, persisted))
-            });
-        let l = &mut self.lanes[lane];
-        match done {
-            Ok((n, partitions, persisted)) => {
-                self.produced += n;
-                if !persisted {
-                    self.appended.extend(partitions);
-                }
-                l.delivered = Some(run.last);
-                l.moved = !persisted;
-                if held.is_some() {
-                    l.stopped = held;
-                }
-            }
+        let cols = match serde_json::from_str::<Vec<(String, String)>>(&run.cols) {
+            Ok(cols) => cols,
             Err(e) => {
-                l.stopped = Some((run.hold, format!("mapping {:?} stopped the CDC slot: {e}", m.name)))
+                let why = format!("unreadable change shape {:?}: {e}", run.cols);
+                self.lanes[lane].stopped =
+                    Some((run.hold, format!("mapping {:?} stopped the CDC slot: {why}", m.name)));
+                return;
             }
+        };
+
+        let mut failed: Option<(Option<u64>, String)> = None;
+        match self.produce(lane, &cols, &format!("{}]", run.body), run.last) {
+            Ok(()) => {}
+            // Nothing was appended, so retry one transaction at a time and hold the slot at
+            // the one that fails.
+            Err(Failed::Render(e)) if m.on_error == "stall" && run.ends.len() > 1 => {
+                failed = Some((run.hold, e));
+                for (hold, last, body) in transactions(&run) {
+                    match self.produce(lane, &cols, &body, last) {
+                        Ok(()) => failed = None,
+                        Err(f) => {
+                            failed = Some((hold, f.message()));
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(f) => failed = Some((run.hold, f.message())),
         }
+        if let Some((hold, why)) = failed {
+            self.lanes[lane].stopped = Some((hold, format!("mapping {:?} stopped the CDC slot: {why}", m.name)));
+        } else if held.is_some() {
+            self.lanes[lane].stopped = held;
+        }
+    }
+
+    /// Render and append one run; on success `last` becomes the lane's delivered position.
+    fn produce(&mut self, lane: usize, cols: &[(String, String)], body: &str, last: Pos) -> Result<(), Failed> {
+        let m = self.lanes[lane].m;
+        let mode = self.mode;
+        let (n, partitions) = step(mode, || render_and_produce(m, cols, body)).map_err(Failed::Render)?;
+        self.produced += n;
+        // Recorded now (even with nothing appended, to avoid a second dead letter), so a
+        // failure later in the peek does not replay it.
+        let persisted = self.streaming;
+        if persisted {
+            if let Err(e) = self.persist(m, last, &partitions) {
+                self.appended.extend(partitions);
+                return Err(Failed::Persist(e));
+            }
+        } else {
+            self.appended.extend(partitions);
+        }
+        let l = &mut self.lanes[lane];
+        l.delivered = Some(last);
+        l.moved = !persisted;
+        Ok(())
     }
 
     fn persist(&self, m: &Mapping, last: Pos, partitions: &Appended) -> Result<(), String> {
@@ -974,14 +1031,14 @@ fn save_positions(moved: &[(&Mapping, Pos)]) -> Result<(), String> {
                 AND value_expr = $6 AND key_expr IS NOT DISTINCT FROM $7
                 AND filter_expr IS NOT DISTINCT FROM $8",
             &[
-                m.name.as_str().into(),
+                ServerText(&m.name).into(),
                 format_lsn(*end).into(),
                 (*seq).into(),
-                m.source.as_str().into(),
-                m.topic.as_str().into(),
-                m.value_expr.as_str().into(),
-                m.key_expr.as_deref().into(),
-                m.filter_expr.as_deref().into(),
+                ServerText(&m.source).into(),
+                ServerText(&m.topic).into(),
+                ServerText(&m.value_expr).into(),
+                m.key_expr.as_deref().map(ServerText).into(),
+                m.filter_expr.as_deref().map(ServerText).into(),
             ],
         )
         .map_err(|e| format!("recording what mapping {:?} delivered: {e}", m.name))?;
@@ -1074,6 +1131,16 @@ fn render(
     columns: &[(String, String)],
     changes: &str,
 ) -> Result<Vec<(Option<String>, Option<String>)>, String> {
+    // The statement text is sent as UTF-8, which another server encoding reads as other characters.
+    let sql_text = columns.iter().flat_map(|(n, t)| [n, t]).chain([&m.value_expr])
+        .chain(m.key_expr.iter()).chain(m.filter_expr.iter());
+    if !encoding_passthrough() && sql_text.into_iter().any(|t| !t.is_ascii()) {
+        return Err(format!(
+            "mapping {:?} or its table has non-ASCII names or expressions, which cannot be \
+             rendered on a database whose encoding is not UTF-8",
+            m.name
+        ));
+    }
     let sql = render_query(
         columns,
         &m.value_expr,
@@ -1223,7 +1290,7 @@ struct Target {
 fn resolve_topic(topic: &str) -> Result<Target, String> {
     let topic_id: i32 = read_one(
         "SELECT (SELECT topic_id::int FROM kafgres_topics WHERE name = $1)",
-        &[topic.into()],
+        &[ServerText(topic).into()],
     )?
     .ok_or_else(|| format!("no such topic {topic:?}"))?;
 
@@ -1266,7 +1333,7 @@ fn dead_letter(m: &Mapping, one: &str, err: &str) {
         "INSERT INTO kafgres_cdc_errors (mapping_name, lsn, change, error)
          SELECT $1, (e->>'lsn')::pg_lsn, e->'ch', $3
            FROM jsonb_array_elements($2::jsonb) AS e",
-        &[m.name.clone().into(), ServerText(one).into(), err.into()],
+        &[ServerText(&m.name).into(), ServerText(one).into(), ServerText(err).into()],
     );
     if let Err(e) = stored {
         log!("kafgres: could not dead-letter a change for mapping {:?}: {e}", m.name);
@@ -1440,7 +1507,7 @@ fn primary_key_of(source: &str) -> Result<Vec<(String, String)>, String> {
               WHERE i.indrelid = $1::regclass AND i.indisprimary
               ORDER BY array_position(i.indkey::int2[], a.attnum)",
             None,
-            &[qualified.as_str().into()],
+            &[ServerText(&qualified).into()],
         )?;
         let mut out = Vec::new();
         for r in rows {
@@ -1470,7 +1537,7 @@ fn shape_of(source: &str) -> Result<Vec<(String, String)>, String> {
               WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped
               ORDER BY attnum",
             None,
-            &[qualified.as_str().into()],
+            &[ServerText(&qualified).into()],
         )?;
         let mut out = Vec::new();
         for r in rows {
@@ -1587,7 +1654,7 @@ fn snapshot_step(st: &SnapshotState, limit: i32) -> Result<bool, String> {
                         snapshot_started_at = COALESCE(snapshot_started_at, now()),
                         snapshot_finished_at = CASE WHEN $3 THEN now() ELSE NULL END
                   WHERE mapping_name = $1",
-                &[st.name.as_str().into(), last.as_deref().map(ServerText).into(), done.into(), n.into()],
+                &[ServerText(&st.name).into(), last.as_deref().map(ServerText).into(), done.into(), n.into()],
             )
             .map_err(|e| e.to_string())?;
             Ok(done)
@@ -1601,7 +1668,7 @@ fn load_mapping(name: &str) -> Result<Option<Mapping>, String> {
             "SELECT mapping_name, source_table, topic, value_expr, key_expr, filter_expr, on_error
                FROM kafgres_cdc_mappings WHERE mapping_name = $1",
             Some(1),
-            &[name.into()],
+            &[ServerText(name).into()],
         )?;
         for r in rows {
             return Ok::<_, pgrx::spi::Error>(Some(Mapping {
@@ -1729,7 +1796,7 @@ fn kafgres_cdc_snapshot(max_batches: default!(i32, 10_000)) -> i64 {
         let Some(st) = pending.into_iter().next() else { break };
         let before = Spi::get_one_with_args::<i64>(
             "SELECT (SELECT snapshot_rows FROM kafgres_cdc_mappings WHERE mapping_name = $1)",
-            &[st.name.as_str().into()],
+            &[ServerText(&st.name).into()],
         )
         .ok()
         .flatten()
@@ -1737,7 +1804,7 @@ fn kafgres_cdc_snapshot(max_batches: default!(i32, 10_000)) -> i64 {
         let done = snapshot_step(&st, limit).unwrap_or_else(|e| error!("kafgres: {e}"));
         let after = Spi::get_one_with_args::<i64>(
             "SELECT (SELECT snapshot_rows FROM kafgres_cdc_mappings WHERE mapping_name = $1)",
-            &[st.name.as_str().into()],
+            &[ServerText(&st.name).into()],
         )
         .ok()
         .flatten()
@@ -1803,6 +1870,32 @@ mod tests {
         assert_eq!(advance_target(Some(900), &[]), Some(900));
         assert_eq!(advance_target(Some(900), &[Some(400), Some(300)]), Some(300));
         assert_eq!(advance_target(Some(900), &[Some(400), None]), None);
+    }
+
+    fn run_of(body: &str, ends: Vec<(Pos, Option<u64>, usize)>) -> Run {
+        Run { cols: "[]".into(), body: body.into(), hold: None, last: ends.last().unwrap().0, ends }
+    }
+
+    #[test]
+    fn a_run_splits_into_its_transactions() {
+        let run = run_of(
+            r#"[{"a":1},{"a":2},{"a":3}"#,
+            vec![((10, 2), None, 16), ((30, 1), Some(10), 24)],
+        );
+        let parts = transactions(&run);
+        assert_eq!(parts[0], (None, (10, 2), r#"[{"a":1},{"a":2}]"#.to_string()));
+        assert_eq!(parts[1], (Some(10), (30, 1), r#"[{"a":3}]"#.to_string()));
+    }
+
+    #[test]
+    fn a_summary_run_is_cut_at_the_earliest_stopped_transaction() {
+        let ends = vec![((10, 0), None, 5), ((20, 0), Some(10), 9), ((30, 0), Some(20), 13)];
+        // Stopped at the third transaction, the slot is held at the second's end.
+        assert_eq!(deliverable(&ends, Some(20)).map(|e| e.0), Some((20, 0)));
+        // Stopped at the first: nothing precedes it.
+        assert_eq!(deliverable(&ends, None), None);
+        // Held before the first transaction's end.
+        assert_eq!(deliverable(&ends, Some(5)), None);
     }
 
     #[test]

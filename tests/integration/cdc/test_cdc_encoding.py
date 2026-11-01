@@ -91,3 +91,39 @@ def test_a_latin1_value_reaches_the_topic_as_utf8(latin1):
     key, value = rows[0]
     assert key == "café".encode(), key
     assert json.loads(value.decode()) == {"id": 1, "note": "café"}, value
+
+
+def test_text_read_from_a_mapping_is_written_back_in_the_server_encoding(latin1):
+    """Text read as UTF-8 goes back as LATIN1, or the position never lands on its row."""
+    ok("CREATE TABLE enc_back (id int primary key, note text)", DB)
+    ok("SELECT kafgres_create_topic('enc-back', 1)", DB)
+    name = "'caf' || chr(233)"
+    # Inserted directly: the SQL function refuses non-ASCII text on a non-UTF-8 database.
+    ok(f"INSERT INTO kafgres_cdc_mappings (mapping_name, source_table, topic, key_expr, value_expr) "
+       f"VALUES ({name}, 'public.enc_back', 'enc-back', $$new.id::text$$, "
+       "$$jsonb_build_object('id', 1 / (new.id - 2))$$)", DB)
+    assert ok("SELECT kafgres_cdc_create_slot()", DB) in ("t", "f")
+
+    ok("INSERT INTO enc_back VALUES (1, 'a')", DB)
+    ok("INSERT INTO enc_back VALUES (2, 'b')", DB)
+    ok("SELECT kafgres_cdc_drain()", DB)
+
+    assert ok(f"SELECT delivered_lsn IS NOT NULL FROM kafgres_cdc_mappings "
+              f"WHERE mapping_name = {name}", DB) == "t", "the position was not recorded"
+    assert ok(f"SELECT count(*) FROM kafgres_cdc_errors WHERE mapping_name = {name}", DB) == "1"
+
+
+def test_a_non_ascii_expression_is_refused_rather_than_rendered_as_other_characters(latin1):
+    """Its UTF-8 bytes would be read as LATIN1, so the value would come out as mojibake."""
+    ok("CREATE TABLE enc_expr (id int primary key)", DB)
+    ok("SELECT kafgres_create_topic('enc-expr', 1)", DB)
+    # The literal é arrives as UTF-8 and is stored as LATIN1.
+    ok("SET client_encoding = 'UTF8'; "
+       "INSERT INTO kafgres_cdc_mappings (mapping_name, source_table, topic, key_expr, value_expr) "
+       "VALUES ('expr', 'public.enc_expr', 'enc-expr', $$new.id::text$$, "
+       "$$jsonb_build_object('id', new.id, 'tag', 'é')$$)", DB)
+    assert ok("SELECT kafgres_cdc_create_slot()", DB) in ("t", "f")
+    ok("INSERT INTO enc_expr VALUES (1)", DB)
+    assert ok("SELECT kafgres_cdc_drain()", DB) == "0"
+    assert consume("enc-expr") == []
+    assert "not UTF-8" in ok("SELECT error FROM kafgres_cdc_errors WHERE mapping_name = 'expr'", DB)
