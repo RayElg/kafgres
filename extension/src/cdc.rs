@@ -814,13 +814,8 @@ impl Drain<'_> {
 
     fn persist(&self, m: &Mapping, last: Pos, partitions: &Appended) -> Result<(), String> {
         let mode = self.mode;
-        sync_then(
-            partitions,
-            |topic, partition| {
-                step(mode, || crate::storage::open().sync_partition(topic, partition).map_err(|e| e.to_string()))
-            },
-            || step(mode, || save_positions(&[(m, last)])),
-        )
+        sync_all(mode, partitions)?;
+        step(mode, || save_positions(&[(m, last)]))
     }
 
     /// A summary follows its transaction's changes on every mapping. While a table mapping is
@@ -854,6 +849,20 @@ fn advance_target(high: Option<u64>, holds: &[Option<u64>]) -> Option<u64> {
         return high;
     }
     holds.iter().copied().try_fold(u64::MAX, |acc, h| h.map(|h| acc.min(h)))
+}
+
+/// All of them in one transaction: a sync needs none of its own, and each costs a commit.
+fn sync_all(mode: Mode, appended: &Appended) -> Result<(), String> {
+    if appended.is_empty() {
+        return Ok(());
+    }
+    step(mode, || {
+        sync_then(
+            appended,
+            |topic, partition| crate::storage::open().sync_partition(topic, partition).map_err(|e| e.to_string()),
+            || Ok(()),
+        )
+    })
 }
 
 /// Every partition appended to is made durable before anything records the changes as
@@ -959,23 +968,17 @@ fn drain_locked(max_changes: i32, mode: Mode, lock: &DrainLock) -> Result<Draine
         d.lanes.iter().filter(|l| l.moved).filter_map(|l| l.delivered.map(|p| (l.m, p))).collect();
     let stalled: Vec<String> = d.lanes.iter_mut().filter_map(|l| l.stopped.take().map(|s| s.1)).collect();
 
-    sync_then(
-        &appended,
-        |topic, partition| step(mode, || crate::storage::open().sync_partition(topic, partition).map_err(|e| e.to_string())),
-        || {
-            // Recorded before the slot moves: a crash between the two replays nothing twice.
-            if !moved.is_empty() {
-                step(mode, || save_positions(&moved))?;
-            }
-            if let Some(target) = advance_target(Some(high), &holds) {
-                step(mode, || {
-                    advance(&format_lsn(target))?;
-                    lock.release()
-                })?;
-            }
-            Ok(())
-        },
-    )?;
+    sync_all(mode, &appended)?;
+    // Recorded before the slot moves: a crash between the two replays nothing twice.
+    if !moved.is_empty() {
+        step(mode, || save_positions(&moved))?;
+    }
+    if let Some(target) = advance_target(Some(high), &holds) {
+        step(mode, || {
+            advance(&format_lsn(target))?;
+            lock.release()
+        })?;
+    }
     Ok(Drained { produced: d.produced, stalled })
 }
 
