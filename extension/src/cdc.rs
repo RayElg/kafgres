@@ -871,34 +871,60 @@ fn sync_then<T>(
 }
 
 /// One drain at a time, whoever starts it. The SQL entry point waits (its lock ends with the
-/// transaction); the worker is not made to wait, and skips the tick instead.
-fn drain(max_changes: i32, mode: Mode) -> Result<Drained, String> {
-    let held = step(mode, || match mode {
-        Mode::Sql => Spi::run(&format!("SELECT pg_advisory_xact_lock({DRAIN_LOCK_KEY})"))
-            .map(|_| true)
-            .map_err(|e| format!("waiting for another CDC drain: {e}")),
-        Mode::Worker => Spi::get_one::<bool>(&format!("SELECT pg_try_advisory_lock({DRAIN_LOCK_KEY})"))
-            .map(|got| got == Some(true))
-            .map_err(|e| format!("locking the CDC drain: {e}")),
-    })?;
-    if !held {
-        return Ok(Drained { produced: 0, stalled: Vec::new() });
+/// transaction); the worker is not made to wait, and skips the tick instead. The worker's lock
+/// outlives its transactions, so it is released inside the last one a drain runs rather than in
+/// a transaction of its own; `drain` releases it only when no such step ran (a failure, or a
+/// slot held where it is).
+struct DrainLock {
+    mode: Mode,
+    held: std::cell::Cell<bool>,
+}
+
+impl DrainLock {
+    /// In a step. False when another drain holds it.
+    fn take(&self) -> Result<bool, String> {
+        match self.mode {
+            Mode::Sql => Spi::run(&format!("SELECT pg_advisory_xact_lock({DRAIN_LOCK_KEY})"))
+                .map(|_| true)
+                .map_err(|e| format!("waiting for another CDC drain: {e}")),
+            Mode::Worker => {
+                let got = Spi::get_one::<bool>(&format!("SELECT pg_try_advisory_lock({DRAIN_LOCK_KEY})"))
+                    .map_err(|e| format!("locking the CDC drain: {e}"))?
+                    == Some(true);
+                self.held.set(got);
+                Ok(got)
+            }
+        }
     }
-    let drained = drain_locked(max_changes, mode);
-    if matches!(mode, Mode::Worker) {
-        // A session lock outlives the worker's transactions, so it is released by hand.
-        if let Err(e) = step(mode, || {
-            Spi::run(&format!("SELECT pg_advisory_unlock({DRAIN_LOCK_KEY})")).map_err(|e| e.to_string())
-        }) {
+
+    /// In a step.
+    fn release(&self) -> Result<(), String> {
+        if self.held.get() {
+            Spi::run(&format!("SELECT pg_advisory_unlock({DRAIN_LOCK_KEY})")).map_err(|e| e.to_string())?;
+            self.held.set(false);
+        }
+        Ok(())
+    }
+}
+
+fn drain(max_changes: i32, mode: Mode) -> Result<Drained, String> {
+    let lock = DrainLock { mode, held: std::cell::Cell::new(false) };
+    let drained = drain_locked(max_changes, mode, &lock);
+    if lock.held.get() {
+        if let Err(e) = step(mode, || lock.release()) {
             log!("kafgres: could not release the CDC drain lock: {e}");
         }
     }
     drained
 }
 
-fn drain_locked(max_changes: i32, mode: Mode) -> Result<Drained, String> {
+fn drain_locked(max_changes: i32, mode: Mode, lock: &DrainLock) -> Result<Drained, String> {
     let opened = step(mode, || {
+        if !lock.take()? {
+            return Ok(None);
+        }
         if !slot_exists() {
+            lock.release()?;
             return Ok(None);
         }
         let mappings = load_mappings()?;
@@ -911,7 +937,15 @@ fn drain_locked(max_changes: i32, mode: Mode) -> Result<Drained, String> {
     };
 
     let drained = stream(&mappings, first, mode);
-    let closed = step(mode, close_cursor);
+    // Nothing is left to do after the cursor closes unless changes were peeked.
+    let over = !matches!(&drained, Ok((_, Some(_))));
+    let closed = step(mode, || {
+        close_cursor()?;
+        if over {
+            lock.release()?;
+        }
+        Ok(())
+    });
     let (mut d, high) = drained?;
     closed?;
     let Some(high) = high else {
@@ -934,7 +968,10 @@ fn drain_locked(max_changes: i32, mode: Mode) -> Result<Drained, String> {
                 step(mode, || save_positions(&moved))?;
             }
             if let Some(target) = advance_target(Some(high), &holds) {
-                step(mode, || advance(&format_lsn(target)))?;
+                step(mode, || {
+                    advance(&format_lsn(target))?;
+                    lock.release()
+                })?;
             }
             Ok(())
         },
