@@ -7,6 +7,8 @@ use std::collections::HashMap;
 pub const SLOT: &str = "kafgres_cdc";
 
 const SLOT_CREATE_LOCK_KEY: i64 = 0x7047_4B41_0000_0002u64 as i64;
+/// Held for a whole drain: two drains peek the same changes and fight over the slot advance.
+const DRAIN_LOCK_KEY: i64 = 0x7047_4B41_0000_0003u64 as i64;
 
 /// Net of batch framing and varints, so a record at the limit still forms a within-limit batch.
 const MAX_RECORD_BYTES: usize =
@@ -868,7 +870,33 @@ fn sync_then<T>(
     then()
 }
 
+/// One drain at a time, whoever starts it. The SQL entry point waits (its lock ends with the
+/// transaction); the worker is not made to wait, and skips the tick instead.
 fn drain(max_changes: i32, mode: Mode) -> Result<Drained, String> {
+    let held = step(mode, || match mode {
+        Mode::Sql => Spi::run(&format!("SELECT pg_advisory_xact_lock({DRAIN_LOCK_KEY})"))
+            .map(|_| true)
+            .map_err(|e| format!("waiting for another CDC drain: {e}")),
+        Mode::Worker => Spi::get_one::<bool>(&format!("SELECT pg_try_advisory_lock({DRAIN_LOCK_KEY})"))
+            .map(|got| got == Some(true))
+            .map_err(|e| format!("locking the CDC drain: {e}")),
+    })?;
+    if !held {
+        return Ok(Drained { produced: 0, stalled: Vec::new() });
+    }
+    let drained = drain_locked(max_changes, mode);
+    if matches!(mode, Mode::Worker) {
+        // A session lock outlives the worker's transactions, so it is released by hand.
+        if let Err(e) = step(mode, || {
+            Spi::run(&format!("SELECT pg_advisory_unlock({DRAIN_LOCK_KEY})")).map_err(|e| e.to_string())
+        }) {
+            log!("kafgres: could not release the CDC drain lock: {e}");
+        }
+    }
+    drained
+}
+
+fn drain_locked(max_changes: i32, mode: Mode) -> Result<Drained, String> {
     let opened = step(mode, || {
         if !slot_exists() {
             return Ok(None);

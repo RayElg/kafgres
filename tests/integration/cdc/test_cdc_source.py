@@ -856,3 +856,60 @@ def test_a_drain_that_only_dead_letters_still_records_its_position():
     assert sql("SELECT count(*) FROM kafgres_cdc_errors") == "1"
     assert sql("SELECT delivered_lsn IS NOT NULL FROM kafgres_cdc_mappings "
                "WHERE mapping_name = 'm1'") == "t"
+
+
+DRAIN_LOCK_KEY = 0x7047_4B41_0000_0003
+
+
+class RunningDrain:
+    """A second session holding the lock a drain holds, as another drain would."""
+
+    def __init__(self):
+        self.p = subprocess.Popen(
+            ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-qtA"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, cwd=REPO)
+        self.p.stdin.write(f"SELECT pg_advisory_lock({DRAIN_LOCK_KEY});\n\\echo HELD\n")
+        self.p.stdin.flush()
+        while self.p.stdout.readline() != "HELD\n":
+            pass
+
+    def finish(self):
+        self.p.stdin.write("\\q\n")
+        self.p.stdin.flush()
+        self.p.wait(timeout=30)
+
+
+def test_a_sql_drain_waits_for_the_drain_that_is_running():
+    """Two drains peek the same changes: the second would deliver them again, then fail its
+    slot advance, after its appends. It waits for the first instead, and consumes nothing."""
+    add_mapping("jsonb_build_object('id', new.id)")
+    start_slot()
+    sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
+    other = RunningDrain()
+    try:
+        out = psql("SET lock_timeout = '500ms'; SELECT kafgres_cdc_drain()")
+        assert out.returncode != 0 and "lock" in out.stderr, out.stderr[-300:]
+        assert consume("src-events") == [], "the drain went ahead while another was running"
+    finally:
+        other.finish()
+    assert drain() == 1
+
+def test_the_worker_skips_its_tick_while_a_drain_is_running():
+    add_mapping("jsonb_build_object('id', new.id)")
+    start_slot()
+    sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
+    other = RunningDrain()
+    set_guc("kafgres.cdc_interval_ms", "200")
+    try:
+        time.sleep(3)
+        assert consume("src-events") == [], "the worker drained while another drain was running"
+        other.finish()
+        deadline = time.time() + 20
+        while len(consume("src-events")) != 1:
+            assert time.time() < deadline, "the worker never drained once the lock was free"
+            time.sleep(1)
+    finally:
+        set_guc("kafgres.cdc_interval_ms", "0")
+        if other.p.poll() is None:
+            other.finish()
