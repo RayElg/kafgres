@@ -9,9 +9,14 @@ import os
 import socket
 import struct
 import subprocess
+import sys
 import time
+from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integration"))
+from support.recordbatch import record_batch  # noqa: E402
 
 KAFKA_IMAGE = "apache/kafka:4.3.1"
 KAFGRES = (os.environ.get("KAFGRES_HOST", "127.0.0.1"), 9092)
@@ -173,6 +178,17 @@ class Broker:
         body += _s32(1) + _nstr(topic) + _s32(1) + _s32(0)
         r = self.call(24, version, body, False)
         r.i32()
+        r.i32()          # topics
+        r.skip_str()     # topic name
+        r.i32()          # partitions
+        r.i32()          # partition index
+        return r.i16()
+
+    def produce(self, txn_id, records, topic=TOPIC):
+        """v3, non-flexible: one partition, returns its error code."""
+        body = _nstr(txn_id) + _s16(-1) + _s32(30_000)
+        body += _s32(1) + _nstr(topic) + _s32(1) + _s32(0) + _s32(len(records)) + records
+        r = self.call(0, 3, body, False)
         r.i32()          # topics
         r.skip_str()     # topic name
         r.i32()          # partitions
@@ -775,3 +791,61 @@ def _offsets_partition(group, partitions=50):
         h = (31 * h + int.from_bytes(data[i:i + 2], "big")) & 0xFFFFFFFF
     h = h - (1 << 32) if h >= 1 << 31 else h
     return 0 if h == -(1 << 31) else abs(h) % partitions
+
+
+# The reference writes a transaction's markers after it answers EndTxn; until they land, the
+# partition still holds the transaction open and a resend is judged against that instead.
+MARKERS_WRITTEN = 3
+
+
+def _txn_batch(pid, epoch):
+    return record_batch([b"v"], producer_id=pid, producer_epoch=epoch, base_sequence=0,
+                        transactional=True)
+
+
+def _retried_batch_transcript(host, port, label):
+    """A transactional batch resent after its transaction ended. Whether the verification
+    or the duplicate window answers first decides the code, so the reference decides it."""
+    _ensure_topic(f"{host}:{port}")
+    out = {}
+
+    # No epoch rotation: the resend is at the epoch that wrote it, sequence 0 again.
+    txn = f"kip890-resend-v2-{label}"
+    b = _coordinated(host, port, txn)
+    try:
+        err, pid, epoch = _settle(lambda: b.init_producer_id(txn))
+        assert err == NONE, f"{label}: InitProducerId error {err}"
+        assert _settle(lambda: b.add_partitions(txn, pid, epoch, TOPIC)) == NONE
+        batch = _txn_batch(pid, epoch)
+        out["first"] = _settle(lambda: b.produce(txn, batch))
+        out["end"] = _settle(lambda: _end_txn_v2(b, txn, pid, epoch, True))
+        time.sleep(MARKERS_WRITTEN)
+        out["resend_after_commit"] = _settle(lambda: b.produce(txn, batch))
+        out["resend_again"] = _settle(lambda: b.produce(txn, batch))
+    finally:
+        b.close()
+
+    # Rotation: the resend is at the retired epoch, and then at the new one with no partition added.
+    txn = f"kip890-resend-v5-{label}"
+    b = _coordinated(host, port, txn)
+    try:
+        err, pid, epoch = _settle(lambda: b.init_producer_id_v5(txn))
+        assert err == NONE, f"{label}: InitProducerId error {err}"
+        assert _settle(lambda: b.add_partitions(txn, pid, epoch, TOPIC)) == NONE
+        batch = _txn_batch(pid, epoch)
+        out["v5_first"] = _settle(lambda: b.produce(txn, batch))
+        _, pid2, epoch2 = _settle(lambda: b.end_txn(txn, pid, epoch, True))
+        time.sleep(MARKERS_WRITTEN)
+        out["v5_resend_retired_epoch"] = _settle(lambda: b.produce(txn, batch))
+        fresh = _txn_batch(pid2, epoch2)
+        out["v5_new_epoch_partition_not_added"] = _settle(lambda: b.produce(txn, fresh))
+    finally:
+        b.close()
+    return out
+
+
+@needs_reference
+def test_a_batch_resent_after_its_transaction_ended_gets_the_same_answer_as_the_reference():
+    ours = _retried_batch_transcript(*KAFGRES, "kafgres")
+    theirs = _retried_batch_transcript(*REFERENCE, "reference")
+    assert ours == theirs, f"\nkafgres:   {ours}\nreference: {theirs}"

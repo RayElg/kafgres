@@ -600,6 +600,25 @@ def test_a_static_member_replaced_under_its_instance_id_is_fenced(topic, group):
         b.close()
 
 
+def test_a_restarted_static_member_replaces_its_old_member_and_can_commit(topic, group):
+    """The restart joins under a new member id. Both ids must not answer to the instance id,
+    or the live member's commit is fenced whenever the old id sorts first."""
+    old = set()
+    for _ in range(6):
+        b = Broker()
+        try:
+            gen, m, _ = b.join_full(group, instance="inst-r")
+            assert b.sync(group, gen, m, instance="inst-r", assignments=[m]) == NONE
+            assert sql(f"SELECT count(*) FROM kafgres_group_members WHERE group_id = '{group}' "
+                       "AND group_instance_id = 'inst-r'") == "1"
+            assert b.offset_commit(7, group, gen, m, "inst-r", topic, 0, 3) == NONE
+            for gone in old:
+                assert b.offset_commit(7, group, gen, gone, "inst-r", topic, 0, 3) == FENCED_INSTANCE_ID
+            old.add(m)
+        finally:
+            b.close()
+
+
 def test_a_kip848_member_commits_only_at_its_own_epoch(topic, group):
     """STALE_MEMBER_EPOCH for an epoch ahead of the member's, or behind it on a partition
     it does not hold (KIP-1251); and only from OffsetCommit v9."""
