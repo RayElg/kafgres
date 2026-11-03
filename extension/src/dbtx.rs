@@ -130,6 +130,42 @@ pub fn atomically_coded<T, E>(
     result
 }
 
+/// Run a read in a subtransaction rolled back after it, releasing its relation locks: held to
+/// the caller's transaction end, they block the table engine's segment roll. `f` must not write,
+/// and must return nothing allocated in Postgres memory: the rollback frees its context.
+pub fn released<T>(f: impl FnOnce() -> T) -> T {
+    use pgrx::pg_sys;
+    use pgrx::pg_sys::pg_try::PgTryBuilder;
+
+    struct Outer(pg_sys::MemoryContext, pg_sys::ResourceOwner);
+    impl Outer {
+        /// SAFETY: inside the subtransaction this was taken before.
+        unsafe fn restore(&self) {
+            pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            pg_sys::MemoryContextSwitchTo(self.0);
+            pg_sys::CurrentResourceOwner = self.1;
+        }
+    }
+    // SAFETY: called inside a transaction; the rollback below runs on both paths.
+    let outer = unsafe {
+        let outer = Outer(pg_sys::CurrentMemoryContext, pg_sys::CurrentResourceOwner);
+        pg_sys::BeginInternalSubTransaction(std::ptr::null_mut());
+        AssertUnwindSafe(outer)
+    };
+    let out = PgTryBuilder::new(AssertUnwindSafe(f))
+        .catch_others(|caught| {
+            // `caught` holds a copy, so Postgres's pending error is flushed before the rollback.
+            unsafe {
+                pg_sys::FlushErrorState();
+                outer.restore();
+            }
+            caught.rethrow()
+        })
+        .execute();
+    unsafe { outer.restore() };
+    out
+}
+
 fn with_subtransaction<T>(f: impl FnOnce() -> Result<T, HandlerError>) -> Result<T, HandlerError> {
     atomically(f, |message| HandlerError::Internal(format!("query aborted: {message}")))
 }
