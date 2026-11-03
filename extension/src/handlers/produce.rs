@@ -550,7 +550,7 @@ fn plan_partition(
         });
     };
 
-    // Once per producer and epoch in this partition, not per batch.
+    // Once per producer and epoch in this partition, not per batch. `handle` holds the locks.
     let mut verified: Vec<((i64, i16), ProduceTxn)> = Vec::new();
     for item in BatchIter::new(records.clone()) {
         let view = item.map_err(AppendError::Batch)?;
@@ -572,7 +572,7 @@ fn plan_partition(
             let found = match verified.iter().find(|(k, _)| *k == key) {
                 Some((_, v)) => *v,
                 None => {
-                    let v = crate::handlers::txn::verify_produce(
+                    let v = crate::handlers::txn::verify_held_produce(
                         txn.transactional_id, producer_id, key.1, tid, index, txn.version,
                     )
                     .map_err(|e| AppendError::ProducerState(e.to_string()))?;

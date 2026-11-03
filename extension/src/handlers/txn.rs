@@ -88,7 +88,7 @@ fn judge(
     lock_transactional_id(transactional_id)?;
     let txn = lock_txn(producer_id)?;
     let (topic_id, index) = partition.map_or((None, None), |(t, p)| (Some(t as i32), Some(p)));
-    let row: Option<String> = Spi::get_one_with_args(
+    let row: Option<String> = crate::plan::get_one_mut(
         "SELECT (SELECT p.producer_epoch || '|' || (p.transactional_id = $2)::text || '|'
                         || EXISTS (SELECT 1 FROM kafgres_txn_partitions tp
                                     WHERE tp.producer_id = p.producer_id
@@ -114,19 +114,59 @@ fn judge(
     Ok((Ok(Admitted { producer_id, epoch }), added))
 }
 
+/// [`judge`] for a caller that already holds `hold_for_produce`'s locks in this transaction: the
+/// three of them are not asked for again, and the transaction's state comes in the same statement.
+fn judge_held(
+    transactional_id: &str,
+    producer_id: i64,
+    epoch: i16,
+    topic_id: u32,
+    partition: i32,
+) -> Result<(Result<Admitted, Verdict>, bool), pgrx::spi::Error> {
+    if transactional_id.is_empty() {
+        return Ok((Err(Verdict::NoTransactionalId), false));
+    }
+    let row: Option<String> = crate::plan::get_one_mut(
+        "SELECT (SELECT p.producer_epoch || '|' || (p.transactional_id = $2)::text || '|'
+                        || EXISTS (SELECT 1 FROM kafgres_txn_partitions tp
+                                    WHERE tp.producer_id = p.producer_id
+                                      AND tp.topic_id = $3::oid AND tp.partition = $4)::text
+                        || '|' || COALESCE((SELECT t.state || '|' || t.producer_epoch
+                                              FROM kafgres_txns t
+                                             WHERE t.producer_id = p.producer_id), '')
+                   FROM kafgres_producers p
+                  WHERE p.producer_id = $1)",
+        &[producer_id.into(), transactional_id.into(), (topic_id as i32).into(), partition.into()],
+    )?;
+    let Some(row) = row else { return Ok((Err(Verdict::UnknownProducer), false)) };
+    let mut it = row.splitn(4, '|');
+    let current: i32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(-1);
+    let mapped = it.next() == Some("true");
+    let listed = it.next() == Some("true");
+    let txn = it.next().filter(|t| !t.is_empty());
+    if !mapped {
+        return Ok((Err(Verdict::UnknownProducer), false));
+    }
+    if (epoch as i32) != current {
+        return Ok((Err(Verdict::Stale), false));
+    }
+    let added = listed && txn == Some(format!("ongoing|{epoch}").as_str());
+    Ok((Ok(Admitted { producer_id, epoch }), added))
+}
+
 const TXN_ID_LOCK_CLASS: i32 = 0x6b67_7478;
 
 /// First in every lock order: this, then the `kafgres_txns` row, then the `kafgres_producers`
 /// row. It also covers a first transaction, which has no row to lock yet.
 pub(super) fn lock_transactional_id(transactional_id: &str) -> Result<(), pgrx::spi::Error> {
-    Spi::run_with_args(
+    crate::plan::run(
         "SELECT pg_advisory_xact_lock($1, hashtext($2))",
         &[TXN_ID_LOCK_CLASS.into(), transactional_id.into()],
     )
 }
 
 fn lock_txn(producer_id: i64) -> Result<Option<String>, pgrx::spi::Error> {
-    Spi::get_one_with_args(
+    crate::plan::get_one_mut(
         "SELECT (SELECT state || '|' || producer_epoch FROM kafgres_txns
                   WHERE producer_id = $1 FOR UPDATE)",
         &[producer_id.into()],
@@ -137,7 +177,7 @@ fn lock_txn(producer_id: i64) -> Result<Option<String>, pgrx::spi::Error> {
 pub fn hold_for_produce(transactional_id: &str, producer_id: i64) -> Result<(), pgrx::spi::Error> {
     lock_transactional_id(transactional_id)?;
     lock_txn(producer_id)?;
-    Spi::run_with_args(
+    crate::plan::run(
         "SELECT FROM kafgres_producers WHERE producer_id = $1 FOR SHARE",
         &[producer_id.into()],
     )
@@ -337,7 +377,31 @@ pub fn verify_produce(
     let Some(txn_id) = transactional_id else {
         return Ok(ProduceTxn::Refused(ErrorCode::TransactionalIdAuthorizationFailed));
     };
-    Ok(match judge(txn_id, producer_id, epoch, Some((topic_id, partition)))? {
+    Ok(produce_verdict(judge(txn_id, producer_id, epoch, Some((topic_id, partition)))?, version))
+}
+
+/// [`verify_produce`] for a produce that ran `hold_for_produce` for this producer first, as
+/// `produce::handle` does for every transactional producer in its request: the locks are held,
+/// so only the check is made, in one statement instead of the lock statements and the check.
+pub fn verify_held_produce(
+    transactional_id: Option<&str>,
+    producer_id: i64,
+    epoch: i16,
+    topic_id: u32,
+    partition: i32,
+    version: i16,
+) -> Result<ProduceTxn, pgrx::spi::Error> {
+    let Some(txn_id) = transactional_id else {
+        return Ok(ProduceTxn::Refused(ErrorCode::TransactionalIdAuthorizationFailed));
+    };
+    Ok(produce_verdict(judge_held(txn_id, producer_id, epoch, topic_id, partition)?, version))
+}
+
+fn produce_verdict(
+    judged: (Result<Admitted, Verdict>, bool),
+    version: i16,
+) -> ProduceTxn {
+    match judged {
         (Err(Verdict::Stale), _) => ProduceTxn::Refused(ErrorCode::InvalidProducerEpoch),
         (Err(_), _) => ProduceTxn::Refused(ErrorCode::InvalidProducerIdMapping),
         (Ok(_), true) => ProduceTxn::Added,
@@ -348,7 +412,7 @@ pub fn verify_produce(
             ProduceTxn::Refused(ErrorCode::TransactionAbortable)
         }
         (Ok(_), false) => ProduceTxn::Refused(ErrorCode::InvalidTxnState),
-    })
+    }
 }
 
 /// Commit or abort: write a marker to every partition the transaction touched. Markers
