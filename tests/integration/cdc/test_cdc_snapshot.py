@@ -12,7 +12,7 @@ import subprocess
 import time
 
 import pytest
-from support.docker import REPO, psql, query as sql
+from support.docker import REPO, client_network, psql, query as sql
 
 
 def set_guc(name, value):
@@ -21,7 +21,7 @@ def set_guc(name, value):
 
 def consume(topic, timeout=25):
     out = subprocess.run(
-        ["docker", "run", "--rm", "--network", "host", "kafgres-clients",
+        ["docker", "run", "--rm", "--network", client_network(), "kafgres-clients",
          "kcat", "-b", "127.0.0.1:9092", "-C", "-t", topic, "-o", "beginning", "-e",
          "-f", "%k\t%s\n"],
         capture_output=True, text=True, timeout=timeout, cwd=REPO,
