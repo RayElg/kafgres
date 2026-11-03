@@ -1,4 +1,4 @@
--- kafgres 0.3.0 -> 0.4.0: adds kafgres_read() as a fresh install defines it, not PUBLIC.
+-- kafgres 0.3.1 -> 0.4.0: adds kafgres_read() as a fresh install defines it, not PUBLIC.
 
 CREATE FUNCTION @extschema@.kafgres_read(
 	"topic" TEXT,

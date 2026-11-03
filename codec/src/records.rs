@@ -1131,7 +1131,7 @@ impl RecordIter {
         }
         if header_count as u64 > self.max_headers as u64 {
             return Err(BatchError::TooManyHeaders {
-                count: header_count,
+                count: i64::from(header_count),
                 max: self.max_headers,
             });
         }
