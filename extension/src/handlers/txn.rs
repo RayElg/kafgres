@@ -104,14 +104,27 @@ fn judge(
     let current: i32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(-1);
     let mapped = it.next() == Some("true");
     let listed = it.next() == Some("true");
+    Ok(admission(producer_id, epoch, current, mapped, listed, txn.as_deref()))
+}
+
+/// What `judge` and `judge_held` make of the rows they read, in one place so the two cannot
+/// drift: `txn` is the producer's `state|epoch` in `kafgres_txns`, if it has a row.
+fn admission(
+    producer_id: i64,
+    epoch: i16,
+    current: i32,
+    mapped: bool,
+    listed: bool,
+    txn: Option<&str>,
+) -> (Result<Admitted, Verdict>, bool) {
     if !mapped {
-        return Ok((Err(Verdict::UnknownProducer), false));
+        return (Err(Verdict::UnknownProducer), false);
     }
     if (epoch as i32) != current {
-        return Ok((Err(Verdict::Stale), false));
+        return (Err(Verdict::Stale), false);
     }
-    let added = listed && txn.as_deref() == Some(format!("ongoing|{epoch}").as_str());
-    Ok((Ok(Admitted { producer_id, epoch }), added))
+    let added = listed && txn == Some(format!("ongoing|{epoch}").as_str());
+    (Ok(Admitted { producer_id, epoch }), added)
 }
 
 /// [`judge`] for a caller that already holds `hold_for_produce`'s locks in this transaction: the
@@ -144,14 +157,7 @@ fn judge_held(
     let mapped = it.next() == Some("true");
     let listed = it.next() == Some("true");
     let txn = it.next().filter(|t| !t.is_empty());
-    if !mapped {
-        return Ok((Err(Verdict::UnknownProducer), false));
-    }
-    if (epoch as i32) != current {
-        return Ok((Err(Verdict::Stale), false));
-    }
-    let added = listed && txn == Some(format!("ongoing|{epoch}").as_str());
-    Ok((Ok(Admitted { producer_id, epoch }), added))
+    Ok(admission(producer_id, epoch, current, mapped, listed, txn))
 }
 
 const TXN_ID_LOCK_CLASS: i32 = 0x6b67_7478;
@@ -173,14 +179,36 @@ fn lock_txn(producer_id: i64) -> Result<Option<String>, pgrx::spi::Error> {
     )
 }
 
-/// `judge`'s locks, taken by a produce before its savepoint so a rollback keeps them.
-pub fn hold_for_produce(transactional_id: &str, producer_id: i64) -> Result<(), pgrx::spi::Error> {
+thread_local! {
+    /// The producers `hold_for_produce` has locked for the request in flight, so
+    /// `verify_held_produce` can tell it is not running without the locks.
+    static HELD: std::cell::RefCell<Vec<i64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Start of a produce request: nothing is held yet.
+pub fn forget_held() {
+    HELD.with(|h| h.borrow_mut().clear());
+}
+
+fn lock_producer(transactional_id: &str, producer_id: i64) -> Result<(), pgrx::spi::Error> {
     lock_transactional_id(transactional_id)?;
     lock_txn(producer_id)?;
     crate::plan::run(
         "SELECT FROM kafgres_producers WHERE producer_id = $1 FOR SHARE",
         &[producer_id.into()],
     )
+}
+
+/// `judge`'s locks, taken by a produce before its savepoint so a rollback keeps them.
+pub fn hold_for_produce(transactional_id: &str, producer_id: i64) -> Result<(), pgrx::spi::Error> {
+    lock_producer(transactional_id, producer_id)?;
+    HELD.with(|h| {
+        let mut h = h.borrow_mut();
+        if !h.contains(&producer_id) {
+            h.push(producer_id);
+        }
+    });
+    Ok(())
 }
 
 pub fn handle_add_partitions(
@@ -366,23 +394,10 @@ const PRODUCE_ABORTABLE_FROM: i16 = 11;
 /// Codes as apache/kafka 4.3.1 answers them: an unmapped producer is
 /// INVALID_PRODUCER_ID_MAPPING, any other epoch INVALID_PRODUCER_EPOCH, and a partition
 /// not added INVALID_TXN_STATE (TRANSACTION_ABORTABLE at v11). Its locks last through the append.
-pub fn verify_produce(
-    transactional_id: Option<&str>,
-    producer_id: i64,
-    epoch: i16,
-    topic_id: u32,
-    partition: i32,
-    version: i16,
-) -> Result<ProduceTxn, pgrx::spi::Error> {
-    let Some(txn_id) = transactional_id else {
-        return Ok(ProduceTxn::Refused(ErrorCode::TransactionalIdAuthorizationFailed));
-    };
-    Ok(produce_verdict(judge(txn_id, producer_id, epoch, Some((topic_id, partition)))?, version))
-}
-
-/// [`verify_produce`] for a produce that ran `hold_for_produce` for this producer first, as
-/// `produce::handle` does for every transactional producer in its request: the locks are held,
-/// so only the check is made, in one statement instead of the lock statements and the check.
+///
+/// For a produce that ran `hold_for_produce` for this producer first, as `produce::handle` does
+/// for every transactional producer in its request: only the check is made, in one statement.
+/// A producer that was not held is held here, and that is a bug in the caller.
 pub fn verify_held_produce(
     transactional_id: Option<&str>,
     producer_id: i64,
@@ -394,6 +409,12 @@ pub fn verify_held_produce(
     let Some(txn_id) = transactional_id else {
         return Ok(ProduceTxn::Refused(ErrorCode::TransactionalIdAuthorizationFailed));
     };
+    if !HELD.with(|h| h.borrow().contains(&producer_id)) {
+        debug_assert!(false, "producer {producer_id} verified without hold_for_produce");
+        // Not recorded as held: this runs inside a savepoint, whose rollback releases the
+        // locks, so the next call must take them again.
+        lock_producer(txn_id, producer_id)?;
+    }
     Ok(produce_verdict(judge_held(txn_id, producer_id, epoch, topic_id, partition)?, version))
 }
 

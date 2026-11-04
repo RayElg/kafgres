@@ -2866,7 +2866,9 @@ mod tests {
     /// Only a produce v12+ append at the current epoch may begin a transaction.
     #[pg_test]
     fn pg_only_a_verified_append_joins_a_transaction() {
-        use crate::handlers::txn::{begin_or_continue, verify_produce, ProduceTxn};
+        use crate::handlers::txn::{
+            begin_or_continue, forget_held, hold_for_produce, verify_held_produce, ProduceTxn,
+        };
         use kafgres_codec::errors::ErrorCode;
 
         crate::ensure_tables_exist();
@@ -2891,24 +2893,28 @@ mod tests {
                 .expect("state query failed")
                 .expect("txn row missing")
         };
-        let verify = |epoch: i16, version: i16| {
-            verify_produce(id, 424242, epoch, topic, 0, version).expect("verify failed")
+        // As `produce::handle` does: lock the producer, then check it under the locks.
+        forget_held();
+        let verify_as = |txn_id: Option<&str>, pid: i64, epoch: i16, version: i16| {
+            hold_for_produce(txn_id.unwrap_or("pg-register"), pid).expect("hold failed");
+            verify_held_produce(txn_id, pid, epoch, topic, 0, version).expect("verify failed")
         };
+        let verify = |epoch: i16, version: i16| verify_as(id, 424242, epoch, version);
 
         for version in [3, 10, 11, 12] {
             assert_eq!(verify(0, version), ProduceTxn::Refused(ErrorCode::InvalidProducerEpoch));
         }
         assert_eq!(verify(2, 12), ProduceTxn::Refused(ErrorCode::InvalidProducerEpoch));
         assert_eq!(
-            verify_produce(Some("other-id"), 424242, 1, topic, 0, 12).expect("verify failed"),
+            verify_as(Some("other-id"), 424242, 1, 12),
             ProduceTxn::Refused(ErrorCode::InvalidProducerIdMapping)
         );
         assert_eq!(
-            verify_produce(id, 434343, 1, topic, 0, 12).expect("verify failed"),
+            verify_as(id, 434343, 1, 12),
             ProduceTxn::Refused(ErrorCode::InvalidProducerIdMapping)
         );
         assert_eq!(
-            verify_produce(None, 424242, 1, topic, 0, 12).expect("verify failed"),
+            verify_as(None, 424242, 1, 12),
             ProduceTxn::Refused(ErrorCode::TransactionalIdAuthorizationFailed)
         );
 

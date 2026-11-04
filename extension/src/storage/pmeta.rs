@@ -313,7 +313,7 @@ pub fn kafka_txn_lso(topic: TopicId, partition: i32) -> StoreResult<Option<i64>>
     .map_err(spi_err)
 }
 
-/// Register a partition in the ongoing transaction `txn::verify_produce` checked. Never
+/// Register a partition in the ongoing transaction `txn::verify_held_produce` checked. Never
 /// begins one. The first batch's offset wins as `first_offset`.
 pub fn register_txn_partition(
     producer_id: i64,

@@ -175,6 +175,7 @@ pub fn handle(
 
     // Outside the savepoint below: rolling it back releases row locks taken inside it, and a
     // sweep could then abort a transaction whose batch already landed in a segment file.
+    super::txn::forget_held();
     if let Some(transactional_id) = req.transactional_id.as_deref() {
         for producer_id in transactional_producers(req) {
             super::txn::hold_for_produce(transactional_id, producer_id)
@@ -430,9 +431,11 @@ fn build(
 
     match isolation {
         Isolation::Shared => {
-            // Phase 2 for every partition before phase 3 for any.
+            // Phase 2 for every partition before phase 3 for any. One transaction, so each
+            // producer begins its Kafka transaction once, and an abandon rolls that back too.
+            let mut begun: Vec<i64> = Vec::new();
             for p in &pending {
-                if let Err(e) = reserve_partition(&p.plan, req.transactional_id.as_deref()) {
+                if let Err(e) = reserve_partition(&p.plan, req.transactional_id.as_deref(), &mut begun) {
                     pgrx::log!("kafgres: produce reservation failed, retrying per partition: {e}");
                     return Err(Abandon::PartitionFailed);
                 }
@@ -450,7 +453,8 @@ fn build(
                 let attempt = |store: &mut dyn LogStore| {
                     crate::dbtx::atomically(
                         || {
-                            reserve_partition(&p.plan, req.transactional_id.as_deref())?;
+                            // Per savepoint: a rollback takes the begin with it.
+                            reserve_partition(&p.plan, req.transactional_id.as_deref(), &mut Vec::new())?;
                             Ok(write_partition(store, &p.plan, at))
                         },
                         |_| AppendError::Aborted,
@@ -683,6 +687,7 @@ fn decide_after(
 fn reserve_partition(
     plan: &PartitionPlan,
     transactional_id: Option<&str>,
+    begun: &mut Vec<i64>,
 ) -> Result<(), AppendError> {
     let mut registered: Vec<i64> = Vec::new();
     for (_, decision) in &plan.batches {
@@ -694,7 +699,8 @@ fn reserve_partition(
         if idem.transactional && !registered.contains(&idem.producer_id) {
             registered.push(idem.producer_id);
             // The registration below is what adds the partition.
-            if let Some(admitted) = idem.adds_partition {
+            if let Some(admitted) = idem.adds_partition.filter(|_| !begun.contains(&idem.producer_id)) {
+                begun.push(idem.producer_id);
                 crate::handlers::txn::begin_or_continue(
                     admitted,
                     transactional_id.unwrap_or_default(),
