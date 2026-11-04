@@ -20,6 +20,7 @@ use crate::meta;
 
 fn wire_state(stored: &str) -> &'static str {
     match stored {
+        "empty" => "Empty",
         "ongoing" => "Ongoing",
         "committed" => "CompleteCommit",
         "aborted" => "CompleteAbort",
@@ -162,10 +163,18 @@ pub fn describe_transactions(
             continue;
         }
 
-        let found: Option<(i64, i32, String, i64, i32)> = Spi::connect(|client| {
+        type Found = (i64, i32, String, i64, i32, Vec<i32>);
+        let found: Option<Found> = Spi::connect(|client| {
             let rows = client.select(
-                "SELECT producer_id, producer_epoch, state, started_at, timeout_ms
-                   FROM kafgres_txns WHERE transactional_id = $1",
+                "SELECT producer_id, producer_epoch, state, started_at, timeout_ms,
+                        offsets_partitions
+                   FROM kafgres_txns t WHERE transactional_id = $1
+                  -- Several rows can share the id (a producer whose abort did not take): the
+                  -- one the id is mapped to now, then the newest producer.
+                  ORDER BY EXISTS (SELECT 1 FROM kafgres_producers p
+                                    WHERE p.producer_id = t.producer_id
+                                      AND p.transactional_id = t.transactional_id) DESC,
+                           producer_id DESC",
                 None,
                 &[id.as_str().into()],
             )?;
@@ -177,14 +186,18 @@ pub fn describe_transactions(
                     r.get::<i64>(4)?,
                 ) {
                     let timeout = r.get::<i32>(5)?.unwrap_or(0);
-                    return Ok::<_, pgrx::spi::Error>(Some((pid, epoch, state, started, timeout)));
+                    let offsets = r.get::<Vec<i32>>(6)?.unwrap_or_default();
+                    return Ok::<_, pgrx::spi::Error>(Some((
+                        pid, epoch, state, started, timeout, offsets,
+                    )));
                 }
             }
             Ok(None)
         })
         .map_err(|e| HandlerError::Internal(e.to_string()))?;
 
-        let Some((producer_id, producer_epoch, stored, started_at, timeout_ms)) = found else {
+        let Some((producer_id, producer_epoch, stored, started_at, timeout_ms, offsets)) = found
+        else {
             out.push(DescribeTxnState {
                 error_code: ErrorCode::TransactionalIdNotFound.code(),
                 transactional_id: id.clone(),
@@ -235,6 +248,15 @@ pub fn describe_transactions(
                     ..Default::default()
                 }),
             }
+        }
+
+        // Kafka keeps transactional offsets in this internal topic, one partition per group.
+        if !offsets.is_empty() {
+            topics.push(TopicData {
+                topic: "__consumer_offsets".to_string(),
+                partitions: offsets,
+                ..Default::default()
+            });
         }
 
         out.push(DescribeTxnState {

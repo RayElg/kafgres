@@ -39,7 +39,7 @@ def _record(offset_delta, value: bytes):
     return _varint(len(body)) + body
 
 def record_batch(values, producer_id=-1, producer_epoch=-1, base_sequence=-1, base_offset=0,
-                 last_offset_delta=None, timestamp=None):
+                 last_offset_delta=None, timestamp=None, transactional=False):
     """One magic-v2 batch with a correct CRC.
 
     `baseOffset` and `partitionLeaderEpoch` are left as the producer sends them; the
@@ -52,7 +52,7 @@ def record_batch(values, producer_id=-1, producer_epoch=-1, base_sequence=-1, ba
     if last_offset_delta is None:
         last_offset_delta = len(values) - 1
 
-    covered = struct.pack(">h", 0)                       # attributes
+    covered = struct.pack(">h", 0x10 if transactional else 0)  # attributes
     covered += struct.pack(">i", last_offset_delta)
     covered += struct.pack(">q", ts)                     # firstTimestamp
     covered += struct.pack(">q", ts)                     # maxTimestamp

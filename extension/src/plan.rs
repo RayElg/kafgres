@@ -76,6 +76,17 @@ pub fn get_one<A: FromDatum + IntoDatum>(
     })
 }
 
+/// [`get_one`] for a statement that locks rows (`FOR UPDATE`, `FOR SHARE`): it cannot run
+/// read-only, and each execution takes a fresh snapshot.
+pub fn get_one_mut<A: FromDatum + IntoDatum>(
+    sql: &'static str,
+    args: &[DatumWithOid<'_>],
+) -> Result<Option<A>, Error> {
+    with_plan(sql, Kind::Write, args, |client, stmt| {
+        client.update(stmt, Some(1), args)?.first().get_one()
+    })
+}
+
 /// A multi-row read against a plan prepared once per process.
 pub fn select<R>(
     sql: &'static str,

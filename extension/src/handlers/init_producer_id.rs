@@ -30,6 +30,14 @@ pub fn handle(
     let txn_id = req.transactional_id.as_deref().filter(|s| !s.is_empty());
     // Before the epoch moves: the abort is performed at the epoch the transaction ran under.
     if let Some(id) = txn_id {
+        // Serialised with the instance being fenced, or its transaction could begin unseen
+        // and be adopted by the new epoch.
+        super::txn::lock_transactional_id(id).map_err(|e| HandlerError::Internal(e.to_string()))?;
+        Spi::run_with_args(
+            "SELECT FROM kafgres_txns WHERE transactional_id = $1 ORDER BY producer_id FOR UPDATE",
+            &[id.into()],
+        )
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
         super::txn::abort_abandoned(id)?;
     }
     let (producer_id, epoch) = producer::init_producer_id(txn_id)?;
@@ -39,6 +47,26 @@ pub fn handle(
         let timeout = req
             .transaction_timeout_ms
             .clamp(1_000, MAX_TRANSACTION_TIMEOUT_MS);
+        // One row per transactional id: a finished row left by an evicted producer would be
+        // listed beside the live one.
+        for table in ["kafgres_txn_partitions", "kafgres_txn_offsets"] {
+            Spi::run_with_args(
+                &format!(
+                    "DELETE FROM {table} WHERE producer_id IN
+                        (SELECT producer_id FROM kafgres_txns
+                          WHERE transactional_id = $1 AND producer_id <> $2
+                            AND state <> 'ongoing')"
+                ),
+                &[id.to_string().into(), producer_id.into()],
+            )
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        }
+        Spi::run_with_args(
+            "DELETE FROM kafgres_txns
+              WHERE transactional_id = $1 AND producer_id <> $2 AND state <> 'ongoing'",
+            &[id.to_string().into(), producer_id.into()],
+        )
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
         Spi::run_with_args(
             "INSERT INTO kafgres_txns
                     (producer_id, producer_epoch, transactional_id, state, started_at,
@@ -47,6 +75,8 @@ pub fn handle(
              ON CONFLICT (producer_id) DO UPDATE
                 SET producer_epoch = EXCLUDED.producer_epoch,
                     timeout_ms = EXCLUDED.timeout_ms,
+                    forced_result = CASE WHEN kafgres_txns.state = 'ongoing'
+                                         THEN kafgres_txns.forced_result END,
                     -- A completed transaction does not carry over to the new instance:
                     -- its state returns to 'empty', as Kafka's does, so a following
                     -- EndTxn is judged against nothing open.
