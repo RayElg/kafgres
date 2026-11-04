@@ -168,7 +168,13 @@ pub fn describe_transactions(
             let rows = client.select(
                 "SELECT producer_id, producer_epoch, state, started_at, timeout_ms,
                         offsets_partitions
-                   FROM kafgres_txns WHERE transactional_id = $1",
+                   FROM kafgres_txns t WHERE transactional_id = $1
+                  -- Several rows can share the id (a producer whose abort did not take): the
+                  -- one the id is mapped to now, then the newest producer.
+                  ORDER BY EXISTS (SELECT 1 FROM kafgres_producers p
+                                    WHERE p.producer_id = t.producer_id
+                                      AND p.transactional_id = t.transactional_id) DESC,
+                           producer_id DESC",
                 None,
                 &[id.as_str().into()],
             )?;
