@@ -111,6 +111,12 @@ def start_slot():
 def values(rows):
     return [json.loads(v) for _, _, v in rows]
 
+def test_a_change_right_after_add_mapping_is_captured():
+    add_mapping("jsonb_build_object('id', new.id)")
+    sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
+    assert drain() == 1
+    assert len(consume("src-events")) == 1
+
 def test_an_insert_reaches_the_topic_through_the_wal():
     add_mapping("jsonb_build_object('id', new.id, 'status', new.status, 'op', op)")
     start_slot()

@@ -325,6 +325,109 @@ pub fn forget_past(topic_id: u32, partition: i32, end: i64) -> Result<(), spi::E
     )
 }
 
+/// Offsets below the newest recorded batch that recovery rescans: a producer's row commits
+/// after its batch, so a lost row can sit below another producer's committed one.
+const REBUILD_LOOKBACK: i64 = 50_000;
+
+/// Re-create window rows for batches the log holds and the window lacks, so a retry after a
+/// crash between the append and the row's commit is not appended twice.
+pub fn rebuild_window(
+    store: &dyn crate::storage::LogStore,
+    topic_id: u32,
+    partition: i32,
+) -> Result<u64, String> {
+    use kafgres_codec::records::{RecordBatch, LENGTH_OFFSET};
+    use std::collections::HashMap;
+
+    let end = store
+        .high_watermark(topic_id, partition)
+        .map_err(|e| e.to_string())?;
+    let log_start = store
+        .log_start_offset(topic_id, partition)
+        .map_err(|e| e.to_string())?;
+    let newest_recorded: Option<i64> = crate::plan::get_one::<i64>(
+        "SELECT (SELECT max(base_offset) FROM kafgres_producer_batches
+                  WHERE topic_id = $1::oid AND partition = $2)",
+        &[(topic_id as i32).into(), partition.into()],
+    )
+    .map_err(|e| e.to_string())?;
+    let mut at = newest_recorded
+        .unwrap_or(end)
+        .saturating_sub(REBUILD_LOOKBACK)
+        .max(log_start);
+
+    // Per producer: (epoch, last_seq) of its newest row, `None` with no window here.
+    let mut newest: HashMap<i64, Option<(i16, i32)>> = HashMap::new();
+    let mut rebuilt = 0u64;
+    while at < end {
+        let slice = store
+            .read(topic_id, partition, at, 4 << 20, crate::storage::IsolationLevel::ReadUncommitted)
+            .map_err(|e| e.to_string())?;
+        if slice.bytes.is_empty() {
+            break;
+        }
+        let mut pos = 0usize;
+        while pos + LENGTH_OFFSET + 4 <= slice.bytes.len() {
+            let len = i32::from_be_bytes(
+                slice.bytes[pos + LENGTH_OFFSET..pos + LENGTH_OFFSET + 4]
+                    .try_into()
+                    .expect("4 bytes"),
+            );
+            let total = LENGTH_OFFSET + 4 + len.max(0) as usize;
+            if len <= 0 || pos + total > slice.bytes.len() {
+                break;
+            }
+            let bytes = kafgres_codec::bytes::Bytes::copy_from_slice(&slice.bytes[pos..pos + total]);
+            pos += total;
+            let Ok(batch) = RecordBatch::new(bytes) else { continue };
+            let (pid, epoch, first) = (batch.producer_id(), batch.producer_epoch(), batch.base_sequence());
+            if pid < 0 || epoch < 0 || first < 0 || batch.is_control() || batch.base_offset() < at {
+                continue;
+            }
+            let last = increment_sequence(first, batch.last_offset_delta());
+            let state = match newest.get(&pid) {
+                Some(s) => *s,
+                None => {
+                    let known = crate::plan::get_one::<bool>(
+                        "SELECT (SELECT true FROM kafgres_producers WHERE producer_id = $1)",
+                        &[pid.into()],
+                    )
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false);
+                    let s = if !known {
+                        // Expired or never registered.
+                        Some((i16::MAX, i32::MIN))
+                    } else {
+                        window(pid, topic_id, partition)
+                            .map_err(|e| e.to_string())?
+                            .0
+                            .last()
+                            .map(|r| (r.epoch, r.last_seq))
+                    };
+                    newest.insert(pid, s);
+                    s
+                }
+            };
+            let missing = match state {
+                None => true,
+                Some((e, l)) => epoch > e || (epoch == e && in_sequence(l, first)),
+            };
+            if !missing {
+                continue;
+            }
+            record(pid, epoch, topic_id, partition, first, last, batch.base_offset())
+                .map_err(|e| e.to_string())?;
+            newest.insert(pid, Some((epoch, last)));
+            rebuilt += 1;
+        }
+        if pos == 0 {
+            break;
+        }
+        at = slice.next_offset.max(at + 1);
+    }
+    Ok(rebuilt)
+}
+
 /// Stamp the offset a `base_offset = -1` reservation was appended at.
 pub fn stamp(
     producer_id: i64,

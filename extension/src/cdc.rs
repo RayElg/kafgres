@@ -42,6 +42,12 @@ fn kafgres_add_mapping(
     if !valid_source(source_table) {
         error!("kafgres: {source_table:?} is not a plain schema-qualified table name");
     }
+    // The slot must exist before the mapping commits, and before this transaction writes.
+    if !slot_exists() {
+        if let Err(e) = create_slot() {
+            error!("kafgres: {e}; call kafgres_cdc_create_slot() in its own transaction first");
+        }
+    }
     if crate::meta::topic_id_by_name(topic).ok().flatten().is_none() {
         error!("kafgres: no such topic {topic:?}; create it before mapping to it");
     }
@@ -328,6 +334,12 @@ pub fn ensure_slot() -> Result<bool, String> {
     if !enabled_mappings_exist() {
         return Ok(false);
     }
+    create_slot()?;
+    Ok(true)
+}
+
+/// Refused in a transaction that has written.
+fn create_slot() -> Result<(), String> {
     slot_preconditions()?;
 
     // Serialise, then re-check: the worker and the SQL entry point race. An advisory lock assigns no xid.
@@ -342,7 +354,7 @@ pub fn ensure_slot() -> Result<bool, String> {
     })
     .map_err(|e| format!("could not lock for CDC slot creation: {e}"))?;
     if slot_exists() {
-        return Ok(true);
+        return Ok(());
     }
 
     // `client.select`, not `Spi::run`: the latter assigns the xid that disqualifies creation.
@@ -362,7 +374,7 @@ pub fn ensure_slot() -> Result<bool, String> {
         .map_err(|e| format!("could not reset CDC delivery positions: {e}"))?;
 
     log!("kafgres: created logical replication slot {SLOT:?} for CDC");
-    Ok(true)
+    Ok(())
 }
 
 /// Peek, not `get_changes`: advancing only after producing costs duplicates on a crash, not losses.

@@ -92,6 +92,9 @@ fn kafgres_produce(
     let xid: i64 = unsafe { pg_sys::GetTopFullTransactionId().value as i64 };
     // SAFETY: as above.
     let subid = unsafe { pg_sys::GetCurrentSubTransactionId() };
+    // The boot id in the producer id is known once the epochs are raised.
+    crate::server::wait_for_epochs();
+
     // Decided before the append: a batch must never carry a pre-rollback producer id.
     let (producer_id, reserve) = enter_produce(xid, subid, topic_id, partition);
 
@@ -125,9 +128,6 @@ fn kafgres_produce(
         is_transactional: true,
         is_control: false,
     };
-
-    // After a restart the log may still lose a torn tail and take a new epoch.
-    crate::server::wait_for_epochs();
 
     // Through the factory: whether an engine supports this is the engine's call.
     let mut store = crate::storage::open();
@@ -192,29 +192,37 @@ struct Producing {
     hooked: bool,
 }
 
-/// Bits of a generation-tagged producer id below the generation. Bit 62 flags the tag, so an
-/// untagged id is the xid itself.
+/// Layout of a `kafgres_produce()` producer id, high to low: bit 62 (SQL, outside the wire
+/// producer sequence's range), boot, generation, xid.
+///
+/// The boot keeps an xid that Postgres reissues after a crash from sharing an id with the
+/// orphaned batch of its earlier holder.
 const XID_BITS: u32 = 40;
-const GENERATION_FLAG: i64 = 1 << 62;
-const MAX_GENERATION: i64 = (1 << (62 - XID_BITS)) - 1;
+const GENERATION_BITS: u32 = 10;
+const BOOT_BITS: u32 = 12;
+const SQL_FLAG: i64 = 1 << 62;
+const MAX_GENERATION: i64 = (1 << GENERATION_BITS) - 1;
+const BOOT_MASK: i64 = (1 << BOOT_BITS) - 1;
 
-/// The producer id of a batch appended under `generation` of transaction `xid`.
+/// The producer id of a batch appended under `generation` of transaction `xid` in `boot`.
 ///
 /// A rolled-back savepoint's orphan never gets an abort marker, so a client would drop every
 /// later batch of the same producer id; a new id after the rollback keeps them out of that range.
-fn sql_producer_id(xid: i64, generation: i64) -> Option<i64> {
-    if generation == 0 {
-        return Some(xid);
-    }
+fn sql_producer_id(xid: i64, generation: i64, boot: i64) -> Option<i64> {
     if xid >> XID_BITS != 0 || generation > MAX_GENERATION {
         return None;
     }
-    Some(GENERATION_FLAG | (generation << XID_BITS) | xid)
+    Some(
+        SQL_FLAG
+            | ((boot & BOOT_MASK) << (XID_BITS + GENERATION_BITS))
+            | (generation << XID_BITS)
+            | xid,
+    )
 }
 
 /// The top-level xid behind a `kafgres_produce()` batch's producer id.
 pub fn xid_of_sql_producer_id(producer_id: i64) -> i64 {
-    if producer_id & GENERATION_FLAG != 0 {
+    if producer_id & SQL_FLAG != 0 {
         producer_id & ((1 << XID_BITS) - 1)
     } else {
         producer_id
@@ -245,11 +253,12 @@ fn enter_produce(
             move |subid, _parent| rolled_back(xid, subid),
         );
     }
-    match sql_producer_id(xid, generation) {
+    match sql_producer_id(xid, generation, crate::server::sql_boot()) {
         Some(id) => (id, reserve),
-        None => error!(
+        None if generation > MAX_GENERATION => error!(
             "kafgres_produce(): too many rolled-back savepoints that produced in transaction {xid}"
         ),
+        None => error!("kafgres_produce(): transaction id {xid} is beyond the producer id range"),
     }
 }
 
@@ -430,31 +439,37 @@ mod producer_id_tests {
     use super::*;
 
     #[test]
-    fn generation_zero_is_the_xid_itself() {
-        assert_eq!(sql_producer_id(1234, 0), Some(1234));
-        assert_eq!(xid_of_sql_producer_id(1234), 1234);
-        let big = (1 << 50) + 7;
-        assert_eq!(xid_of_sql_producer_id(sql_producer_id(big, 0).unwrap()), big);
+    fn every_id_is_tagged_and_decodes_to_the_xid() {
+        for xid in [1, 1234, (1 << XID_BITS) - 1] {
+            let id = sql_producer_id(xid, 0, 7).unwrap();
+            assert!(id >= SQL_FLAG, "outside the wire sequence's range");
+            assert_eq!(xid_of_sql_producer_id(id), xid);
+        }
+        assert_eq!(xid_of_sql_producer_id(1234), 1234, "an untagged id is the xid itself");
     }
 
     #[test]
-    fn each_generation_is_a_distinct_producer_id_that_decodes_to_the_xid() {
-        let xid = (3i64 << 32) | 0xdead_beef;
-        let ids: Vec<i64> = (0..4).map(|g| sql_producer_id(xid, g).unwrap()).collect();
-        for (i, a) in ids.iter().enumerate() {
-            assert!(*a >= 0, "a Kafka producer id is non-negative");
-            assert_eq!(xid_of_sql_producer_id(*a), xid);
-            for b in &ids[i + 1..] {
-                assert_ne!(a, b);
+    fn generation_and_boot_each_make_a_distinct_producer_id() {
+        let xid = (3i64 << 32) | 0xbeef;
+        let mut ids = Vec::new();
+        for boot in 0..3 {
+            for g in 0..4 {
+                let id = sql_producer_id(xid, g, boot).unwrap();
+                assert!(id >= 0, "a Kafka producer id is non-negative");
+                assert_eq!(xid_of_sql_producer_id(id), xid);
+                ids.push(id);
             }
         }
-        assert_ne!(sql_producer_id(xid, 1), sql_producer_id(xid + 1, 1));
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n);
     }
 
     #[test]
-    fn an_unencodable_generation_is_refused() {
-        assert_eq!(sql_producer_id(1 << XID_BITS, 1), None);
-        assert_eq!(sql_producer_id(5, MAX_GENERATION + 1), None);
-        assert!(sql_producer_id(5, MAX_GENERATION).is_some());
+    fn an_unencodable_id_is_refused() {
+        assert_eq!(sql_producer_id(1 << XID_BITS, 0, 0), None);
+        assert_eq!(sql_producer_id(5, MAX_GENERATION + 1, 0), None);
+        assert!(sql_producer_id(5, MAX_GENERATION, BOOT_MASK).is_some());
     }
 }

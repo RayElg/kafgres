@@ -38,6 +38,27 @@ const MAX_FETCH_BYTES: i32 = 64 * 1024 * 1024;
 /// every quiet moment.
 const FETCH_MAX_WAIT_MS: i32 = 100;
 
+/// Records the leader held beyond the follower's fetch offsets at its last Fetch, and when
+/// it was answered (epoch ms, 0 before the first).
+pub static LAG_RECORDS: pgrx::PgAtomic<std::sync::atomic::AtomicI64> =
+    unsafe { pgrx::PgAtomic::new(c"kafgres_follower_lag_records") };
+pub static LAG_AT_MS: pgrx::PgAtomic<std::sync::atomic::AtomicI64> =
+    unsafe { pgrx::PgAtomic::new(c"kafgres_follower_lag_at_ms") };
+
+/// Follower lag in records at its last Fetch, and that Fetch's time in epoch ms. Empty
+/// before the first. `pg_stat_replication` does not cover this.
+#[pg_extern]
+fn kafgres_follower_lag() -> TableIterator<'static, (name!(lag_records, i64), name!(observed_at_ms, i64))> {
+    use std::sync::atomic::Ordering;
+    let at = LAG_AT_MS.get().load(Ordering::Acquire);
+    let rows = if at == 0 {
+        Vec::new()
+    } else {
+        vec![(LAG_RECORDS.get().load(Ordering::Acquire), at)]
+    };
+    TableIterator::new(rows)
+}
+
 /// A round returns to the worker loop after this long, so leadership and the partition
 /// list are re-read even while the leader always has more to give.
 const ROUND_BUDGET: Duration = Duration::from_millis(500);
@@ -278,6 +299,31 @@ pub fn fetch_from(
         |buf| request.encode(buf, FETCH_VERSION),
         FetchResponse::decode,
     )?;
+
+    let mut lag = 0i64;
+    for topic in &response.responses {
+        for part in &topic.partitions {
+            if part.error_code != 0 {
+                continue;
+            }
+            let from = want
+                .iter()
+                .find(|(_, n, p, _, _)| *n == topic.topic && *p == part.partition_index)
+                .map(|w| w.3);
+            if let Some(from) = from {
+                lag += (part.high_watermark - from).max(0);
+            }
+        }
+    }
+    {
+        use std::sync::atomic::Ordering;
+        LAG_RECORDS.get().store(lag, Ordering::Release);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        LAG_AT_MS.get().store(now, Ordering::Release);
+    }
 
     let mut pulled = Vec::new();
     for topic in response.responses {

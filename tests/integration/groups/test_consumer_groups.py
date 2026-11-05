@@ -149,6 +149,29 @@ def test_two_consumers_split_the_partitions(topic, group):
     finally:
         stop_consumer("p3a")
 
+def test_a_joiner_with_no_common_protocol_is_refused_alone(topic, group):
+    make(topic, partitions=2)
+    start_consumer("p3c", group, topic)
+    try:
+        await_group(group, members=1, state="Stable")
+        _, generation, _ = group_state(group)
+        subprocess.run(["docker", "rm", "-f", "p3d"], capture_output=True)
+        subprocess.run(
+            ["docker", "run", "--rm", "-d", "--network", "host", "--name", "p3d", CLIENTS,
+             "kcat", "-b", BROKER, "-G", group, topic,
+             "-X", "partition.assignment.strategy=cooperative-sticky"],
+            capture_output=True, timeout=120,
+        )
+        try:
+            time.sleep(15)
+            state, now, members = group_state(group)
+            assert (state, members) == ("Stable", 1), (state, members)
+            assert now == generation, "the existing member must not be rebalanced"
+        finally:
+            stop_consumer("p3d")
+    finally:
+        stop_consumer("p3c")
+
 def test_killing_a_consumer_rebalances_to_the_survivor(topic, group):
     """Second half. `docker kill`, not `stop`: a member that gets no chance to send
     LeaveGroup is the case that can only be recovered by the session-timeout sweep, and

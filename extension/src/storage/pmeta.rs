@@ -212,6 +212,14 @@ pub fn advance_log_start(topic: TopicId, partition: i32, offset: i64) -> StoreRe
         &[(topic as i32).into(), partition.into(), offset.into()],
     )
     .map_err(spi_err)?;
+    // Batches wholly below the log start are unreadable.
+    Spi::run_with_args(
+        "DELETE FROM kafgres_markers
+          WHERE topic_id = $1::oid AND partition = $2
+            AND base_offset < $3 AND last_offset < $3",
+        &[(topic as i32).into(), partition.into(), offset.into()],
+    )
+    .map_err(spi_err)?;
     // The abort index describes offsets; when they go its entries are dead, and this is
     forget_aborted_below(topic, partition, offset)
 }
@@ -432,6 +440,19 @@ pub fn forget_aborted_below(topic: TopicId, partition: i32, offset: i64) -> Stor
         "DELETE FROM kafgres_txn_aborted
           WHERE topic_id = $1::oid AND partition = $2 AND last_offset < $3",
         &[(topic as i32).into(), partition.into(), offset.into()],
+    )
+    .map_err(spi_err)
+}
+
+/// Markers of batches compaction removed.
+pub fn forget_markers(topic: TopicId, partition: i32, bases: &[i64]) -> StoreResult<()> {
+    if bases.is_empty() {
+        return Ok(());
+    }
+    Spi::run_with_args(
+        "DELETE FROM kafgres_markers
+          WHERE topic_id = $1::oid AND partition = $2 AND base_offset = ANY($3)",
+        &[(topic as i32).into(), partition.into(), bases.to_vec().into()],
     )
     .map_err(spi_err)
 }

@@ -68,6 +68,13 @@ fn register_and_park(
         ))));
     }
 
+    if !group::protocols_compatible(&req.group_id, member_id, &protocols)? {
+        return Ok(JoinOutcome::Reply(Box::new(error_join(
+            ErrorCode::InconsistentGroupProtocol,
+            member_id.to_string(),
+        ))));
+    }
+
     let metadata = req.protocols[0].metadata.to_vec();
 
     group::join(

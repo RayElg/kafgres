@@ -163,6 +163,19 @@ pub fn protocol_type_conflicts(group_id: &str, protocol_type: &str) -> Result<bo
     Ok(conflicts)
 }
 
+/// Whether `protocols` shares a name with every other member's.
+pub fn protocols_compatible(
+    group_id: &str,
+    member_id: &str,
+    protocols: &[String],
+) -> Result<bool, spi::Error> {
+    let mut common: Vec<String> = protocols.to_vec();
+    for m in members(group_id)?.iter().filter(|m| m.member_id != member_id) {
+        common.retain(|p| m.protocols.contains(p));
+    }
+    Ok(!common.is_empty())
+}
+
 pub fn join(
     group_id: &str,
     member_id: &str,

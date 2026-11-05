@@ -246,6 +246,14 @@ impl Server {
 pub static EPOCHS_RAISED: pgrx::PgAtomic<AtomicBool> =
     unsafe { pgrx::PgAtomic::new(c"kafgres_epochs_raised") };
 
+/// This server start's number, from `kafgres_boot_seq`; valid once `EPOCHS_RAISED` is set.
+pub static BOOT_ID: pgrx::PgAtomic<std::sync::atomic::AtomicI64> =
+    unsafe { pgrx::PgAtomic::new(c"kafgres_boot_id") };
+
+pub fn sql_boot() -> i64 {
+    BOOT_ID.get().load(Ordering::Acquire)
+}
+
 /// Wait up to 30 s for the broker to raise the leader epochs, then raise an ERROR.
 pub fn wait_for_epochs() {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1357,6 +1365,8 @@ fn raise_leader_epochs() -> bool {
     let result = BackgroundWorker::transaction(|| {
         crate::dbtx::guarded(|| {
             // The timeline increments on `pg_promote`.
+            let boot: i64 = pgrx::Spi::get_one("SELECT nextval('kafgres_boot_seq')")?.unwrap_or(0);
+            BOOT_ID.get().store(boot, Ordering::Release);
             let wal_timeline: i32 = pgrx::Spi::get_one(
                 "SELECT (('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int)",
             )?
@@ -1392,6 +1402,11 @@ fn raise_leader_epochs() -> bool {
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
                 crate::producer::forget_past(topic_id, partition, end)
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                // The table engine commits a batch and its window row together.
+                if crate::storage_engine_guc() == "segment" {
+                    crate::producer::rebuild_window(&*store, topic_id, partition)
+                        .map_err(HandlerError::Internal)?;
+                }
             }
             Ok((highest, raised))
         })
