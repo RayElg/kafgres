@@ -33,13 +33,13 @@ def kafka_tool(script, *args, timeout=240):
         capture_output=True, text=True, timeout=timeout,
     )
 
-def start_consumer(name, group, topic):
+def start_consumer(name, group, topic, *extra):
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
     subprocess.run(
         ["docker", "run", "--rm", "-d", "--network", "host", "--name", name, CLIENTS,
          "kcat", "-b", BROKER, "-G", group, topic,
          "-X", f"session.timeout.ms={SESSION_MS}",
-         "-X", f"heartbeat.interval.ms={HEARTBEAT_MS}"],
+         "-X", f"heartbeat.interval.ms={HEARTBEAT_MS}", *extra],
         capture_output=True, timeout=120,
     )
 
@@ -148,6 +148,47 @@ def test_two_consumers_split_the_partitions(topic, group):
             stop_consumer("p3b")
     finally:
         stop_consumer("p3a")
+
+def test_a_joiner_with_no_common_protocol_is_refused_alone(topic, group):
+    make(topic, partitions=2)
+    start_consumer("p3c", group, topic)
+    try:
+        await_group(group, members=1, state="Stable")
+        _, generation, _ = group_state(group)
+        subprocess.run(["docker", "rm", "-f", "p3d"], capture_output=True)
+        subprocess.run(
+            ["docker", "run", "--rm", "-d", "--network", "host", "--name", "p3d", CLIENTS,
+             "kcat", "-b", BROKER, "-G", group, topic,
+             "-X", "partition.assignment.strategy=cooperative-sticky"],
+            capture_output=True, timeout=120,
+        )
+        try:
+            time.sleep(15)
+            state, now, members = group_state(group)
+            assert (state, members) == ("Stable", 1), (state, members)
+            assert now == generation, "the existing member must not be rebalanced"
+        finally:
+            stop_consumer("p3d")
+    finally:
+        stop_consumer("p3c")
+
+def test_a_restarted_static_member_may_change_its_assignor(topic, group):
+    """The old registration of the same instance id is what the new one replaces."""
+    make(topic, partitions=2)
+    start_consumer("p3e", group, topic, "-X", "group.instance.id=static-1",
+                   "-X", "partition.assignment.strategy=range")
+    try:
+        await_group(group, members=1, state="Stable")
+        subprocess.run(["docker", "kill", "p3e"], capture_output=True, timeout=120)
+        start_consumer("p3f", group, topic, "-X", "group.instance.id=static-1",
+                       "-X", "partition.assignment.strategy=cooperative-sticky")
+        try:
+            _, _, members = await_group(group, members=1, state="Stable", timeout=40)
+            assert members == 1
+        finally:
+            stop_consumer("p3f")
+    finally:
+        stop_consumer("p3e")
 
 def test_killing_a_consumer_rebalances_to_the_survivor(topic, group):
     """Second half. `docker kill`, not `stop`: a member that gets no chance to send

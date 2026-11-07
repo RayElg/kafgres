@@ -867,6 +867,8 @@ struct Rewrite {
     pos: u64,
     written: u64,
     removed: u64,
+    /// Base offsets of batches the rewrite drops whole.
+    dropped: Vec<i64>,
     writing: bool,
     /// This process's replacement file, removed when the rewrite is dropped unfinished.
     tmp: PathBuf,
@@ -1029,6 +1031,8 @@ impl SegmentStore {
                     if let Some(bytes) = rebuild_batch(&view, &kept) {
                         out.write_all_at(&bytes, rw.written)?;
                         rw.written += bytes.len() as u64;
+                    } else {
+                        rw.dropped.push(view.base_offset());
                     }
                 }
             }
@@ -1037,7 +1041,12 @@ impl SegmentStore {
         drop(out);
         Ok(Some(
             match Self::swap_segment(topic, partition, &rw.info, rw.written == 0, generation)? {
-                Some(generation) => Cleaned::Swapped(rw.removed, generation),
+                Some(generation) => {
+                    if let Err(e) = pmeta::forget_markers(topic, partition, &rw.dropped) {
+                        pgrx::log!("kafgres: could not drop the commit markers compaction removed: {e}");
+                    }
+                    Cleaned::Swapped(rw.removed, generation)
+                }
                 None => Cleaned::Abandoned,
             },
         ))
@@ -1254,6 +1263,7 @@ impl SegmentStore {
                                 pos: 0,
                                 written: 0,
                                 removed: 0,
+                                dropped: Vec::new(),
                                 writing: false,
                                 tmp: compacting_path(topic, partition, s.base),
                             })
@@ -1995,154 +2005,164 @@ impl LogStore for SegmentStore {
         let mut next = offset;
         let mut aborted: Vec<super::AbortedTxn> = Vec::new();
 
+        let mut offset = offset;
         if offset < ceiling {
             // Enumerate from disk, not the hint map: hints are per-process, so a partition appended by
             // TODO: cache the per-Fetch `read_dir`; the list changes only on roll/reclaim.
             let bases_on_disk = Self::segment_bases(topic, partition)?;
-            // The marker load can lower the ceiling: past its cap, reading beyond it would
-            // judge a batch committed on missing evidence.
-            let (committed, ceiling) = match isolation {
-                IsolationLevel::ReadCommitted => {
-                    let (set, capped) =
-                        pmeta::committed_markers(topic, partition, offset, ceiling)?;
-                    (Some(set), capped)
-                }
-                IsolationLevel::ReadUncommitted => (None, ceiling),
-            };
-            Self::with_slot(topic, partition, |st, hints| {
-                let mut bases = bases_on_disk;
-                bases.sort_unstable();
-                let mut reclaimed: Vec<i64> = Vec::new();
-
-                for (bi, base) in bases.iter().enumerate() {
-                    if let Some(next_base) = bases.get(bi + 1) {
-                        if *next_base <= offset {
-                            continue;
-                        }
+            loop {
+                // The marker load can lower the ceiling: past its cap, reading beyond it would
+                // judge a batch committed on missing evidence.
+                let (committed, limit) = match isolation {
+                    IsolationLevel::ReadCommitted => {
+                        let (set, capped) =
+                            pmeta::committed_markers(topic, partition, offset, ceiling)?;
+                        (Some(set), capped)
                     }
+                    IsolationLevel::ReadUncommitted => (None, ceiling),
+                };
+                Self::with_slot(topic, partition, |st, hints| {
+                    let mut bases = bases_on_disk.clone();
+                    bases.sort_unstable();
+                    let mut reclaimed: Vec<i64> = Vec::new();
 
-                    let path = data_path(&segment_path(topic, partition, *base, "log"));
-                    let vfd = match Vfd::open(&path, false) {
-                        Ok(v) => v,
-                        // Reclaimed underneath us: retention runs from user backends too, and a missing file is
-                        Err(_) if bases.get(bi + 1).is_some_and(|nb| *nb <= log_start) => {
-                            reclaimed.push(*base);
-                            continue;
-                        }
-                        Err(e) => return Err(e),
-                    };
-
-                    let data_end = if *base == st.active_base {
-                        st.active_bytes
-                    } else {
-                        vfd.size()?
-                    };
-
-                    let mut pos = hints
-                        .get(base)
-                        .and_then(|entries| {
-                            entries.iter().rev().find(|(b, _)| *b <= next).map(|(_, p)| *p)
-                        })
-                        .unwrap_or(0);
-
-                    let mut header = [0u8; records::RECORD_BATCH_OVERHEAD];
-                    while pos + header.len() as u64 <= data_end {
-                        if vfd.read_at(&mut header, pos)? != header.len() {
-                            break;
-                        }
-                        let length = i32::from_be_bytes(
-                            header[records::LENGTH_OFFSET..records::LENGTH_OFFSET + 4]
-                                .try_into()
-                                .expect("4 bytes"),
-                        );
-                        if length <= 0 {
-                            break;
-                        }
-                        let total = records::LENGTH_OFFSET as u64 + 4 + length as u64;
-                        if pos + total > data_end {
-                            break;
-                        }
-                        let batch_base = i64::from_be_bytes(
-                            header[records::BASE_OFFSET_OFFSET..records::BASE_OFFSET_OFFSET + 8]
-                                .try_into()
-                                .expect("8 bytes"),
-                        );
-                        let last_delta = i32::from_be_bytes(
-                            header[records::LAST_OFFSET_DELTA_OFFSET
-                                ..records::LAST_OFFSET_DELTA_OFFSET + 4]
-                                .try_into()
-                                .expect("4 bytes"),
-                        );
-                        let batch_last = batch_base + last_delta as i64;
-
-                        // Wholly below the request; the batch containing `offset` is kept whole (the consumer
-                        if batch_last < offset {
-                            pos += total;
-                            continue;
-                        }
-                        // Stop at the ceiling rather than truncating the batch: batches
-                        if batch_base >= ceiling {
-                            break;
+                    for (bi, base) in bases.iter().enumerate() {
+                        if let Some(next_base) = bases.get(bi + 1) {
+                            if *next_base <= offset {
+                                continue;
+                            }
                         }
 
-                        // A marker-backed batch with no committed marker is an orphan: a rolled-back
-                        if let Some(committed) = &committed {
-                            let attributes = i16::from_be_bytes(
-                                header[records::ATTRIBUTES_OFFSET
-                                    ..records::ATTRIBUTES_OFFSET + 2]
+                        let path = data_path(&segment_path(topic, partition, *base, "log"));
+                        let vfd = match Vfd::open(&path, false) {
+                            Ok(v) => v,
+                            // Reclaimed underneath us: retention runs from user backends too, and a missing file is
+                            Err(_) if bases.get(bi + 1).is_some_and(|nb| *nb <= log_start) => {
+                                reclaimed.push(*base);
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
+
+                        let data_end = if *base == st.active_base {
+                            st.active_bytes
+                        } else {
+                            vfd.size()?
+                        };
+
+                        let mut pos = hints
+                            .get(base)
+                            .and_then(|entries| {
+                                entries.iter().rev().find(|(b, _)| *b <= next).map(|(_, p)| *p)
+                            })
+                            .unwrap_or(0);
+
+                        let mut header = [0u8; records::RECORD_BATCH_OVERHEAD];
+                        while pos + header.len() as u64 <= data_end {
+                            if vfd.read_at(&mut header, pos)? != header.len() {
+                                break;
+                            }
+                            let length = i32::from_be_bytes(
+                                header[records::LENGTH_OFFSET..records::LENGTH_OFFSET + 4]
                                     .try_into()
-                                    .expect("2 bytes"),
+                                    .expect("4 bytes"),
                             );
-                            let producer_id = i64::from_be_bytes(
-                                header[records::PRODUCER_ID_OFFSET
-                                    ..records::PRODUCER_ID_OFFSET + 8]
+                            if length <= 0 {
+                                break;
+                            }
+                            let total = records::LENGTH_OFFSET as u64 + 4 + length as u64;
+                            if pos + total > data_end {
+                                break;
+                            }
+                            let batch_base = i64::from_be_bytes(
+                                header[records::BASE_OFFSET_OFFSET..records::BASE_OFFSET_OFFSET + 8]
                                     .try_into()
                                     .expect("8 bytes"),
                             );
-                            let is_txn = attributes & records::TRANSACTIONAL_FLAG != 0;
-                            let is_control =
-                                attributes & records::CONTROL_BATCH_FLAG != 0;
+                            let last_delta = i32::from_be_bytes(
+                                header[records::LAST_OFFSET_DELTA_OFFSET
+                                    ..records::LAST_OFFSET_DELTA_OFFSET + 4]
+                                    .try_into()
+                                    .expect("4 bytes"),
+                            );
+                            let batch_last = batch_base + last_delta as i64;
 
-                            if is_txn
-                                && !is_control
-                                && is_marker_backed(&header)
-                                && !committed.contains(&batch_base)
-                            {
-                                aborted.push(super::AbortedTxn {
-                                    producer_id,
-                                    first_offset: batch_base,
-                                });
+                            // Wholly below the request; the batch containing `offset` is kept whole (the consumer
+                            if batch_last < offset {
+                                pos += total;
+                                continue;
                             }
-                        }
-
-                        if !out.is_empty() && out.len() + total as usize > max_bytes {
-                            for b in reclaimed {
-                                hints.remove(&b);
+                            // Stop at the ceiling rather than truncating the batch: batches
+                            if batch_base >= limit {
+                                break;
                             }
-                            return Ok(());
-                        }
 
-                        let mut buf = vec![0u8; total as usize];
-                        if vfd.read_at(&mut buf, pos)? != buf.len() {
-                            break;
-                        }
-                        out.extend_from_slice(&buf);
-                        next = batch_last + 1;
-                        pos += total;
+                            // A marker-backed batch with no committed marker is an orphan: a rolled-back
+                            if let Some(committed) = &committed {
+                                let attributes = i16::from_be_bytes(
+                                    header[records::ATTRIBUTES_OFFSET
+                                        ..records::ATTRIBUTES_OFFSET + 2]
+                                        .try_into()
+                                        .expect("2 bytes"),
+                                );
+                                let producer_id = i64::from_be_bytes(
+                                    header[records::PRODUCER_ID_OFFSET
+                                        ..records::PRODUCER_ID_OFFSET + 8]
+                                        .try_into()
+                                        .expect("8 bytes"),
+                                );
+                                let is_txn = attributes & records::TRANSACTIONAL_FLAG != 0;
+                                let is_control =
+                                    attributes & records::CONTROL_BATCH_FLAG != 0;
 
-                        if out.len() >= max_bytes {
-                            for b in reclaimed {
-                                hints.remove(&b);
+                                if is_txn
+                                    && !is_control
+                                    && is_marker_backed(&header)
+                                    && !committed.contains(&batch_base)
+                                {
+                                    aborted.push(super::AbortedTxn {
+                                        producer_id,
+                                        first_offset: batch_base,
+                                    });
+                                }
                             }
-                            return Ok(());
+
+                            if !out.is_empty() && out.len() + total as usize > max_bytes {
+                                for b in reclaimed {
+                                    hints.remove(&b);
+                                }
+                                return Ok(());
+                            }
+
+                            let mut buf = vec![0u8; total as usize];
+                            if vfd.read_at(&mut buf, pos)? != buf.len() {
+                                break;
+                            }
+                            out.extend_from_slice(&buf);
+                            next = batch_last + 1;
+                            pos += total;
+
+                            if out.len() >= max_bytes {
+                                for b in reclaimed {
+                                    hints.remove(&b);
+                                }
+                                return Ok(());
+                            }
                         }
                     }
+                    for b in reclaimed {
+                        hints.remove(&b);
+                    }
+                    Ok(())
+                })?;
+                // Nothing below the lowered ceiling (a compacted log is sparse): resume from it.
+                if out.is_empty() && limit < ceiling {
+                    offset = limit;
+                    next = limit;
+                    continue;
                 }
-                for b in reclaimed {
-                    hints.remove(&b);
-                }
-                Ok(())
-            })?;
+                break;
+            }
 
             // Kafka's aborts, scoped to what this response returned: bounding by the ceiling rather
             if matches!(isolation, IsolationLevel::ReadCommitted) {

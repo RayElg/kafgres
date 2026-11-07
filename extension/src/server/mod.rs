@@ -246,6 +246,14 @@ impl Server {
 pub static EPOCHS_RAISED: pgrx::PgAtomic<AtomicBool> =
     unsafe { pgrx::PgAtomic::new(c"kafgres_epochs_raised") };
 
+/// This server start's number, from `kafgres_boot_seq`; valid once `EPOCHS_RAISED` is set.
+pub static BOOT_ID: pgrx::PgAtomic<std::sync::atomic::AtomicI64> =
+    unsafe { pgrx::PgAtomic::new(c"kafgres_boot_id") };
+
+pub fn sql_boot() -> i64 {
+    BOOT_ID.get().load(Ordering::Acquire)
+}
+
 /// Wait up to 30 s for the broker to raise the leader epochs, then raise an ERROR.
 pub fn wait_for_epochs() {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1357,6 +1365,7 @@ fn raise_leader_epochs() -> bool {
     let result = BackgroundWorker::transaction(|| {
         crate::dbtx::guarded(|| {
             // The timeline increments on `pg_promote`.
+            let boot: i64 = pgrx::Spi::get_one("SELECT nextval('kafgres_boot_seq')")?.unwrap_or(0);
             let wal_timeline: i32 = pgrx::Spi::get_one(
                 "SELECT (('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int)",
             )?
@@ -1393,17 +1402,20 @@ fn raise_leader_epochs() -> bool {
                 crate::producer::forget_past(topic_id, partition, end)
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
             }
-            Ok((highest, raised))
+            Ok((highest, raised, boot))
         })
     });
 
     match result {
-        Ok((epoch, 0)) => {
+        Ok((epoch, 0, boot)) => {
+            // Published once committed: a raise that rolls back never exposes its number.
+            BOOT_ID.get().store(boot, Ordering::Release);
             log!("kafgres: leader epoch {epoch} already current for every partition");
             EPOCHS_RAISED.get().store(true, Ordering::Release);
             true
         }
-        Ok((epoch, n)) => {
+        Ok((epoch, n, boot)) => {
+            BOOT_ID.get().store(boot, Ordering::Release);
             log!("kafgres: took a new leader epoch (up to {epoch}) for {n} partition(s)");
             EPOCHS_RAISED.get().store(true, Ordering::Release);
             true

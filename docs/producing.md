@@ -50,11 +50,15 @@ computed from committed markers. Three properties of that mechanism are worth kn
   client that re-requests the same offset forever looks like a hung consumer.
 - Each transaction produces under its own producer id, taken from the transaction's xid.
   Kafka clients drop everything from a producer id at or after an aborted first offset,
-  so a shared producer id would let one rollback discard later committed records. For
-  the same reason, when a savepoint that produced is rolled back, the rest of the
-  transaction produces under a new producer id derived from the same xid. A transaction
-  that rolls back more than about four million such savepoints gets an error from
-  further calls.
+  so a shared producer id would let one rollback discard later committed records. The id
+  also carries a flag that keeps it apart from the ids Kafka clients are assigned, and the
+  number of the server start that produced it, so a transaction id that Postgres hands out
+  again after a crash does not share an id with the batch an earlier, lost transaction
+  left in the log. For the same reason, when a savepoint that produced is rolled back, the
+  rest of the transaction produces under a new producer id derived from the same xid. A
+  transaction that rolls back more than 1023 such savepoints (for example a loop of
+  `EXCEPTION` blocks that produce and fail) gets an error from further calls. Commit in
+  smaller batches instead of rolling back that many times in one transaction.
 - The last stable offset is the first offset of the oldest transaction still in flight on
   the partition, so `read_committed` consumers never see records that may yet commit or
   abort. A commit becomes visible once every transaction that produced to the partition
@@ -98,7 +102,12 @@ caller holds no lock that other producers need.
 
 ## CDC mappings
 
-A mapping copies changes from a table to a topic through the WAL. You register it once:
+A mapping copies changes from a table to a topic through the WAL. You register it once.
+`kafgres_add_mapping` creates the logical replication slot if it does not exist yet, so
+changes committed after the call returns are captured. A slot sees only WAL written after it
+exists, so call it before the transaction has written anything, or in a transaction of its
+own. A slot with no mapping holds WAL until one is added or `kafgres_cdc_drop_slot()`
+removes it, so drop it if the mapping is abandoned after a rolled-back call.
 
 The examples assume a `public.orders (id int, customer_id int, total numeric, status
 text)` table and a `customers (id int, name text, tier text)` lookup table.

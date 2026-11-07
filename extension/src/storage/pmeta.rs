@@ -212,6 +212,14 @@ pub fn advance_log_start(topic: TopicId, partition: i32, offset: i64) -> StoreRe
         &[(topic as i32).into(), partition.into(), offset.into()],
     )
     .map_err(spi_err)?;
+    // Batches wholly below the log start are unreadable.
+    Spi::run_with_args(
+        "DELETE FROM kafgres_markers
+          WHERE topic_id = $1::oid AND partition = $2
+            AND base_offset < $3 AND last_offset < $3",
+        &[(topic as i32).into(), partition.into(), offset.into()],
+    )
+    .map_err(spi_err)?;
     // The abort index describes offsets; when they go its entries are dead, and this is
     forget_aborted_below(topic, partition, offset)
 }
@@ -267,15 +275,26 @@ pub fn committed_markers(
 }
 
 /// Whether a `kafgres_produce()` batch's marker exists, and whether its writer has finished,
-/// in one statement so both see one snapshot.
+/// in one statement so both see one snapshot. `xid` is the low bits of the writer's xid8; the
+/// writer is the xid8 with those bits nearest the snapshot's horizon.
 pub fn marker_state(topic: TopicId, partition: i32, base: i64, xid: i64) -> StoreResult<(bool, bool)> {
+    // Below 2^40 the id holds the whole xid8, so the plain lookup is exact and cheaper.
+    let writer = if xid_epoch_is_zero()? {
+        "$4::bigint"
+    } else {
+        "(SELECT CASE WHEN d < (1::bigint << 39) THEN x - d ELSE x + (1::bigint << 40) - d END
+            FROM (SELECT x, (x - $4::bigint) & ((1::bigint << 40) - 1) AS d
+                    FROM (SELECT pg_snapshot_xmax(pg_current_snapshot())::text::bigint AS x) a) b)"
+    };
     Spi::connect(|client| {
         let row = client
             .select(
-                "SELECT EXISTS (SELECT 1 FROM kafgres_markers
-                                 WHERE topic_id = $1::oid AND partition = $2
-                                   AND base_offset = $3),
-                        pg_visible_in_snapshot($4::text::xid8, pg_current_snapshot())",
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM kafgres_markers
+                                     WHERE topic_id = $1::oid AND partition = $2
+                                       AND base_offset = $3),
+                            pg_visible_in_snapshot(({writer})::text::xid8, pg_current_snapshot())"
+                ),
                 Some(1),
                 &[(topic as i32).into(), partition.into(), base.into(), xid.into()],
             )?
@@ -286,6 +305,33 @@ pub fn marker_state(topic: TopicId, partition: i32, base: i64, xid: i64) -> Stor
         ))
     })
     .map_err(spi_err)
+}
+
+/// Whether every xid8 so far fits the producer id's xid bits; read once per process, since
+/// crossing 2^40 takes years and a restart picks it up.
+fn xid_epoch_is_zero() -> StoreResult<bool> {
+    use std::sync::atomic::{AtomicI8, Ordering};
+    static ZERO: AtomicI8 = AtomicI8::new(-1);
+    match ZERO.load(Ordering::Relaxed) {
+        -1 => {
+            // `client.select`: `get_one` would assign this read an xid.
+            let zero = Spi::connect(|client| {
+                client
+                    .select(
+                        "SELECT (pg_snapshot_xmax(pg_current_snapshot())::text::bigint >> 40) = 0",
+                        Some(1),
+                        &[],
+                    )?
+                    .first()
+                    .get_one::<bool>()
+            })
+            .map_err(spi_err)?
+            .unwrap_or(true);
+            ZERO.store(zero as i8, Ordering::Relaxed);
+            Ok(zero)
+        }
+        v => Ok(v == 1),
+    }
 }
 
 /// Whether an aborted Kafka transaction of `producer_id` covers `offset`.
@@ -432,6 +478,19 @@ pub fn forget_aborted_below(topic: TopicId, partition: i32, offset: i64) -> Stor
         "DELETE FROM kafgres_txn_aborted
           WHERE topic_id = $1::oid AND partition = $2 AND last_offset < $3",
         &[(topic as i32).into(), partition.into(), offset.into()],
+    )
+    .map_err(spi_err)
+}
+
+/// Markers of batches compaction removed.
+pub fn forget_markers(topic: TopicId, partition: i32, bases: &[i64]) -> StoreResult<()> {
+    if bases.is_empty() {
+        return Ok(());
+    }
+    Spi::run_with_args(
+        "DELETE FROM kafgres_markers
+          WHERE topic_id = $1::oid AND partition = $2 AND base_offset = ANY($3)",
+        &[(topic as i32).into(), partition.into(), bases.to_vec().into()],
     )
     .map_err(spi_err)
 }

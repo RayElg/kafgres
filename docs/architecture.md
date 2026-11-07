@@ -31,6 +31,15 @@ out of band (see below) and is always asynchronous, since `synchronous_standby_n
 does not cover files outside the WAL; a failover can lose the newest records, and the
 leader epochs described next make that visible to consumers rather than silent.
 
+On the primary, `kafgres_produce()` still commits the row and the event together. The
+loss is in replication: its row and commit marker travel in the WAL, which can be
+synchronous, but the record bytes travel with the segment follower. After a failover the new
+primary drops the markers whose records never arrived, with a logged warning, so a row can
+survive without its event. Synchronous replication does not close this.
+`kafgres_follower_lag()` on a standby reports how many records the follower was behind at
+its last Fetch, which `pg_stat_replication` does not cover. The table engine keeps the
+bytes in the WAL and has no such gap.
+
 ## Primary-only operation
 
 The broker, CDC and archiver workers run on the primary only. They are registered with
