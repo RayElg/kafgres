@@ -55,19 +55,6 @@ fn kafgres_add_mapping(
 
     render_check(source_table, value_expr, key_expr, filter_expr);
 
-    // Held until this transaction ends. A drain that loaded its mappings before this one
-    // commits would pass the slot over changes this mapping needs, so drains wait out the lock.
-    Spi::connect(|client| {
-        client
-            .select(
-                &format!("SELECT pg_advisory_xact_lock({SLOT_CREATE_LOCK_KEY})"),
-                Some(1),
-                &[],
-            )
-            .map(|_| ())
-    })
-    .unwrap_or_else(|e| error!("kafgres: could not lock for adding a mapping: {e}"));
-
     // The slot must exist before the mapping commits, and before this transaction writes.
     if !slot_exists() {
         // Not an error: the worker creates the slot once the mapping commits, and changes
@@ -967,17 +954,6 @@ fn drain_locked(max_changes: i32, mode: Mode, lock: &DrainLock) -> Result<Draine
         if !lock.take()? {
             return Ok(None);
         }
-        // A mapping being added holds this lock exclusively until it commits; draining before
-        // then would pass the slot over changes that mapping is about to want.
-        let free = read_one::<bool>(
-            "SELECT pg_try_advisory_xact_lock_shared($1)",
-            &[SLOT_CREATE_LOCK_KEY.into()],
-        )?
-        .unwrap_or(false);
-        if !free {
-            lock.release()?;
-            return Ok(None);
-        }
         if !slot_exists() {
             lock.release()?;
             return Ok(None);
@@ -985,6 +961,13 @@ fn drain_locked(max_changes: i32, mode: Mode, lock: &DrainLock) -> Result<Draine
         let mappings = load_mappings()?;
         open_cursor(max_changes)?;
         let first = fetch_peeked(chunk_bytes())?;
+        // The first fetch decodes the WAL. A mapping that committed since the load may own
+        // changes just decoded, and this drain has no lane for them; leave them for the next.
+        if !same_definitions(&mappings, &with_latest_snapshot(load_mappings)?) {
+            close_cursor()?;
+            lock.release()?;
+            return Ok(None);
+        }
         Ok(Some((mappings, first)))
     })?;
     let Some((mappings, first)) = opened else {
@@ -1215,6 +1198,23 @@ struct Mapping {
     on_error: String,
     /// The last change this mapping rendered, so a replay held for another mapping skips it.
     delivered: Option<Pos>,
+}
+
+fn same_definitions(a: &[Mapping], b: &[Mapping]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            (&x.name, &x.source, &x.topic, &x.value_expr, &x.key_expr, &x.filter_expr, &x.on_error)
+                == (&y.name, &y.source, &y.topic, &y.value_expr, &y.key_expr, &y.filter_expr, &y.on_error)
+        })
+}
+
+/// A read-only SPI query uses the active snapshot, which in a worker step predates commits
+/// since the step began; this makes it see them.
+fn with_latest_snapshot<T>(f: impl FnOnce() -> T) -> T {
+    unsafe { pg_sys::PushActiveSnapshot(pg_sys::GetLatestSnapshot()) };
+    let out = f();
+    unsafe { pg_sys::PopActiveSnapshot() };
+    out
 }
 
 fn load_mappings() -> Result<Vec<Mapping>, String> {

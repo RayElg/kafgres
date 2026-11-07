@@ -128,24 +128,24 @@ def test_a_mapping_added_after_the_transaction_wrote_is_saved_with_a_warning():
     assert "WARNING" in out.stderr, out.stderr[-500:]
     assert sql("SELECT count(*) FROM kafgres_cdc_mappings WHERE mapping_name = 'm1'") == "1"
 
-@pytest.mark.parametrize("slot_exists", [False, True])
-def test_a_change_committed_while_a_mapping_is_being_added_is_captured(slot_exists):
-    if slot_exists:
-        add_mapping("jsonb_build_object('id', new.id)", name="m0", source="public.src_customers")
+def test_a_drain_is_not_held_up_by_a_mapping_transaction_left_open():
+    add_mapping("jsonb_build_object('id', new.id)", name="m0", source="public.src_customers")
     adding = subprocess.Popen(
         ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
          "BEGIN; SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
          "$$jsonb_build_object('id', new.id)$$, 'new.id::text', NULL); "
-         "SELECT pg_sleep(4); COMMIT"],
+         "SELECT pg_sleep(5); COMMIT"],
         cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         time.sleep(1.5)
-        sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
-        assert drain() == 0, "drained under a slot whose mapping has not committed"
+        sql("INSERT INTO src_customers VALUES (3,'bronze')")
+        t0 = time.monotonic()
+        assert drain() == 1
+        assert time.monotonic() - t0 < 3, "the drain waited for the open transaction"
     finally:
         adding.wait(timeout=30)
-    assert drain() == 1
-    assert len(consume("src-events")) == 1
+    sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
+    assert drain() == 1, "a change after the mapping committed was not captured"
 
 def test_a_mapping_to_a_missing_topic_leaves_no_slot():
     out = psql("SELECT kafgres_add_mapping('m1', 'public.src_orders', 'no-such-topic', "

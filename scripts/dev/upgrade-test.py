@@ -230,6 +230,9 @@ def main():
         assert new_version != args.old, f"still {new_version}"
         assert sql("SELECT has_function_privilege('public', 'kafgres_drop_topic(text)', "
                    "'EXECUTE')") == "f", "the update left the admin functions public"
+        assert sql("SELECT count(*) FROM pg_proc WHERE proname = 'kafgres_follower_lag'") == "1", \
+            "the update did not add kafgres_follower_lag()"
+        assert sql("SELECT count(*) FROM kafgres_follower_lag()") == "0"
         restart()
         after = snapshot(args.engine)
         for topic in ("up-plain", "up-sql"):
