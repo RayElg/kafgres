@@ -1364,7 +1364,6 @@ fn exclusive_holders() -> String {
 fn raise_leader_epochs() -> bool {
     let result = BackgroundWorker::transaction(|| {
         crate::dbtx::guarded(|| {
-            // The timeline increments on `pg_promote`.
             // Once per process: a retried raise must not spend another number.
             static PROCESS_BOOT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
             let mut boot = PROCESS_BOOT.load(Ordering::Relaxed);
@@ -1372,6 +1371,7 @@ fn raise_leader_epochs() -> bool {
                 boot = pgrx::Spi::get_one("SELECT nextval('kafgres_boot_seq')")?.unwrap_or(0);
                 PROCESS_BOOT.store(boot, Ordering::Relaxed);
             }
+            // The timeline increments on `pg_promote`.
             let wal_timeline: i32 = pgrx::Spi::get_one(
                 "SELECT (('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int)",
             )?

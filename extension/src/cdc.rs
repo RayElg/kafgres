@@ -55,6 +55,19 @@ fn kafgres_add_mapping(
 
     render_check(source_table, value_expr, key_expr, filter_expr);
 
+    // Held until this transaction ends. A drain that loaded its mappings before this one
+    // commits would pass the slot over changes this mapping needs, so drains wait out the lock.
+    Spi::connect(|client| {
+        client
+            .select(
+                &format!("SELECT pg_advisory_xact_lock({SLOT_CREATE_LOCK_KEY})"),
+                Some(1),
+                &[],
+            )
+            .map(|_| ())
+    })
+    .unwrap_or_else(|e| error!("kafgres: could not lock for adding a mapping: {e}"));
+
     // The slot must exist before the mapping commits, and before this transaction writes.
     if !slot_exists() {
         // Not an error: the worker creates the slot once the mapping commits, and changes

@@ -1477,29 +1477,15 @@ impl SegmentStore {
                     if vfd.read_at(&mut header, pos)? != header.len() {
                         break;
                     }
-                    let length = i32::from_be_bytes(
-                        header[records::LENGTH_OFFSET..records::LENGTH_OFFSET + 4]
-                            .try_into()
-                            .expect("4 bytes"),
-                    );
-                    let total = records::LENGTH_OFFSET as u64 + 4 + length.max(0) as u64;
-                    if length <= 0 || pos + total > data_end {
+                    let Some(BatchSpan { total, base: batch_base, last: batch_last }) =
+                        batch_span(&header, pos, data_end)
+                    else {
                         break;
-                    }
-                    let batch_base = i64::from_be_bytes(
-                        header[records::BASE_OFFSET_OFFSET..records::BASE_OFFSET_OFFSET + 8]
-                            .try_into()
-                            .expect("8 bytes"),
-                    );
-                    let last_delta = i32::from_be_bytes(
-                        header[records::LAST_OFFSET_DELTA_OFFSET..records::LAST_OFFSET_DELTA_OFFSET + 4]
-                            .try_into()
-                            .expect("4 bytes"),
-                    );
+                    };
                     if batch_base >= ceiling {
                         return Ok(None);
                     }
-                    if batch_base + last_delta as i64 >= from {
+                    if batch_last >= from {
                         return Ok(Some(batch_base));
                     }
                     pos += total;
@@ -1969,6 +1955,37 @@ pub fn migrate_time_indexes() -> std::io::Result<usize> {
     Ok(removed)
 }
 
+/// A batch's byte length and the offsets it spans.
+struct BatchSpan {
+    total: u64,
+    base: i64,
+    last: i64,
+}
+
+/// From a batch's fixed header at `pos`; `None` when the header is corrupt or the batch runs
+/// past `data_end`.
+fn batch_span(header: &[u8], pos: u64, data_end: u64) -> Option<BatchSpan> {
+    let length = i32::from_be_bytes(
+        header[records::LENGTH_OFFSET..records::LENGTH_OFFSET + 4].try_into().ok()?,
+    );
+    if length <= 0 {
+        return None;
+    }
+    let total = records::LENGTH_OFFSET as u64 + 4 + length as u64;
+    if pos + total > data_end {
+        return None;
+    }
+    let base = i64::from_be_bytes(
+        header[records::BASE_OFFSET_OFFSET..records::BASE_OFFSET_OFFSET + 8].try_into().ok()?,
+    );
+    let last_delta = i32::from_be_bytes(
+        header[records::LAST_OFFSET_DELTA_OFFSET..records::LAST_OFFSET_DELTA_OFFSET + 4]
+            .try_into()
+            .ok()?,
+    );
+    Some(BatchSpan { total, base, last: base + last_delta as i64 })
+}
+
 /// Whether a transactional batch came from `kafgres_produce()`, which stamps producer epoch
 /// -1. From the header alone: the producer table forgets idle producers, and a SQL xid can
 /// equal a Kafka producer id.
@@ -2128,30 +2145,11 @@ impl LogStore for SegmentStore {
                             if vfd.read_at(&mut header, pos)? != header.len() {
                                 break;
                             }
-                            let length = i32::from_be_bytes(
-                                header[records::LENGTH_OFFSET..records::LENGTH_OFFSET + 4]
-                                    .try_into()
-                                    .expect("4 bytes"),
-                            );
-                            if length <= 0 {
+                            let Some(BatchSpan { total, base: batch_base, last: batch_last }) =
+                                batch_span(&header, pos, data_end)
+                            else {
                                 break;
-                            }
-                            let total = records::LENGTH_OFFSET as u64 + 4 + length as u64;
-                            if pos + total > data_end {
-                                break;
-                            }
-                            let batch_base = i64::from_be_bytes(
-                                header[records::BASE_OFFSET_OFFSET..records::BASE_OFFSET_OFFSET + 8]
-                                    .try_into()
-                                    .expect("8 bytes"),
-                            );
-                            let last_delta = i32::from_be_bytes(
-                                header[records::LAST_OFFSET_DELTA_OFFSET
-                                    ..records::LAST_OFFSET_DELTA_OFFSET + 4]
-                                    .try_into()
-                                    .expect("4 bytes"),
-                            );
-                            let batch_last = batch_base + last_delta as i64;
+                            };
 
                             // Wholly below the request; the batch containing `offset` is kept whole (the consumer
                             if batch_last < offset {

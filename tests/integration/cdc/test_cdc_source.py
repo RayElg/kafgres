@@ -128,7 +128,10 @@ def test_a_mapping_added_after_the_transaction_wrote_is_saved_with_a_warning():
     assert "WARNING" in out.stderr, out.stderr[-500:]
     assert sql("SELECT count(*) FROM kafgres_cdc_mappings WHERE mapping_name = 'm1'") == "1"
 
-def test_a_change_committed_while_a_mapping_is_being_added_is_captured():
+@pytest.mark.parametrize("slot_exists", [False, True])
+def test_a_change_committed_while_a_mapping_is_being_added_is_captured(slot_exists):
+    if slot_exists:
+        add_mapping("jsonb_build_object('id', new.id)", name="m0", source="public.src_customers")
     adding = subprocess.Popen(
         ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
          "BEGIN; SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
