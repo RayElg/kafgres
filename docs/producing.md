@@ -56,8 +56,9 @@ computed from committed markers. Three properties of that mechanism are worth kn
   again after a crash does not share an id with the batch an earlier, lost transaction
   left in the log. For the same reason, when a savepoint that produced is rolled back, the
   rest of the transaction produces under a new producer id derived from the same xid. A
-  transaction that rolls back more than 1023 such savepoints gets an error from further
-  calls.
+  transaction that rolls back more than 1023 such savepoints (for example a loop of
+  `EXCEPTION` blocks that produce and fail) gets an error from further calls. Commit in
+  smaller batches instead of rolling back that many times in one transaction.
 - The last stable offset is the first offset of the oldest transaction still in flight on
   the partition, so `read_committed` consumers never see records that may yet commit or
   abort. A commit becomes visible once every transaction that produced to the partition
