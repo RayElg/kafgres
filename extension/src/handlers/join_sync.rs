@@ -68,7 +68,12 @@ fn register_and_park(
         ))));
     }
 
-    if !group::protocols_compatible(&req.group_id, member_id, &protocols)? {
+    if !group::protocols_compatible(
+        &req.group_id,
+        member_id,
+        req.group_instance_id.as_deref(),
+        &protocols,
+    )? {
         return Ok(JoinOutcome::Reply(Box::new(error_join(
             ErrorCode::InconsistentGroupProtocol,
             member_id.to_string(),

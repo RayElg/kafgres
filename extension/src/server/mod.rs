@@ -1366,7 +1366,6 @@ fn raise_leader_epochs() -> bool {
         crate::dbtx::guarded(|| {
             // The timeline increments on `pg_promote`.
             let boot: i64 = pgrx::Spi::get_one("SELECT nextval('kafgres_boot_seq')")?.unwrap_or(0);
-            BOOT_ID.get().store(boot, Ordering::Release);
             let wal_timeline: i32 = pgrx::Spi::get_one(
                 "SELECT (('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int)",
             )?
@@ -1402,23 +1401,21 @@ fn raise_leader_epochs() -> bool {
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
                 crate::producer::forget_past(topic_id, partition, end)
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
-                // The table engine commits a batch and its window row together.
-                if crate::storage_engine_guc() == "segment" {
-                    crate::producer::rebuild_window(&*store, topic_id, partition)
-                        .map_err(HandlerError::Internal)?;
-                }
             }
-            Ok((highest, raised))
+            Ok((highest, raised, boot))
         })
     });
 
     match result {
-        Ok((epoch, 0)) => {
+        Ok((epoch, 0, boot)) => {
+            // Published once committed: a raise that rolls back never exposes its number.
+            BOOT_ID.get().store(boot, Ordering::Release);
             log!("kafgres: leader epoch {epoch} already current for every partition");
             EPOCHS_RAISED.get().store(true, Ordering::Release);
             true
         }
-        Ok((epoch, n)) => {
+        Ok((epoch, n, boot)) => {
+            BOOT_ID.get().store(boot, Ordering::Release);
             log!("kafgres: took a new leader epoch (up to {epoch}) for {n} partition(s)");
             EPOCHS_RAISED.get().store(true, Ordering::Release);
             true

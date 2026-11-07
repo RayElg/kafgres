@@ -187,6 +187,9 @@ struct Producing {
     reserved: HashSet<(u32, i32)>,
     /// Bumped when a subtransaction that produced rolls back; part of the producer id.
     generation: i64,
+    /// The server start this transaction first produced under; a restart mid-transaction
+    /// must not change its ids.
+    boot: Option<i64>,
     /// Highest subtransaction that produced under `generation`, 0 if none.
     max_subid: pg_sys::SubTransactionId,
     hooked: bool,
@@ -202,16 +205,21 @@ const GENERATION_BITS: u32 = 10;
 const BOOT_BITS: u32 = 12;
 const SQL_FLAG: i64 = 1 << 62;
 const MAX_GENERATION: i64 = (1 << GENERATION_BITS) - 1;
+const XID_MASK: i64 = (1 << XID_BITS) - 1;
 const BOOT_MASK: i64 = (1 << BOOT_BITS) - 1;
 
 /// The producer id of a batch appended under `generation` of transaction `xid` in `boot`.
 ///
 /// A rolled-back savepoint's orphan never gets an abort marker, so a client would drop every
 /// later batch of the same producer id; a new id after the rollback keeps them out of that range.
+///
+/// Only the xid's low bits are kept: a collision needs two transactions 2^40 xids apart in the
+/// same boot, both still inside a producer's retention.
 fn sql_producer_id(xid: i64, generation: i64, boot: i64) -> Option<i64> {
-    if xid >> XID_BITS != 0 || generation > MAX_GENERATION {
+    if generation > MAX_GENERATION {
         return None;
     }
+    let xid = xid & XID_MASK;
     Some(
         SQL_FLAG
             | ((boot & BOOT_MASK) << (XID_BITS + GENERATION_BITS))
@@ -223,7 +231,7 @@ fn sql_producer_id(xid: i64, generation: i64, boot: i64) -> Option<i64> {
 /// The top-level xid behind a `kafgres_produce()` batch's producer id.
 pub fn xid_of_sql_producer_id(producer_id: i64) -> i64 {
     if producer_id & SQL_FLAG != 0 {
-        producer_id & ((1 << XID_BITS) - 1)
+        producer_id & XID_MASK
     } else {
         producer_id
     }
@@ -236,7 +244,7 @@ fn enter_produce(
     topic: u32,
     partition: i32,
 ) -> (i64, bool) {
-    let (generation, reserve, hook) = PRODUCING.with(|s| {
+    let (generation, boot, reserve, hook) = PRODUCING.with(|s| {
         let mut s = s.borrow_mut();
         if s.xid != xid {
             *s = Producing { xid, ..Producing::default() };
@@ -244,7 +252,8 @@ fn enter_produce(
         s.max_subid = s.max_subid.max(subid);
         let hook = !s.hooked;
         s.hooked = true;
-        (s.generation, !s.reserved.contains(&(topic, partition)), hook)
+        let boot = *s.boot.get_or_insert_with(crate::server::sql_boot);
+        (s.generation, boot, !s.reserved.contains(&(topic, partition)), hook)
     });
     if hook {
         // pgrx drops subtransaction hooks at top-level commit or abort.
@@ -253,12 +262,11 @@ fn enter_produce(
             move |subid, _parent| rolled_back(xid, subid),
         );
     }
-    match sql_producer_id(xid, generation, crate::server::sql_boot()) {
+    match sql_producer_id(xid, generation, boot) {
         Some(id) => (id, reserve),
-        None if generation > MAX_GENERATION => error!(
+        None => error!(
             "kafgres_produce(): too many rolled-back savepoints that produced in transaction {xid}"
         ),
-        None => error!("kafgres_produce(): transaction id {xid} is beyond the producer id range"),
     }
 }
 
@@ -467,8 +475,11 @@ mod producer_id_tests {
     }
 
     #[test]
-    fn an_unencodable_id_is_refused() {
-        assert_eq!(sql_producer_id(1 << XID_BITS, 0, 0), None);
+    fn an_xid_beyond_the_id_keeps_its_low_bits_and_a_spent_generation_is_refused() {
+        assert_eq!(
+            xid_of_sql_producer_id(sql_producer_id((5 << XID_BITS) | 9, 0, 0).unwrap()),
+            9,
+        );
         assert_eq!(sql_producer_id(5, MAX_GENERATION + 1, 0), None);
         assert!(sql_producer_id(5, MAX_GENERATION, BOOT_MASK).is_some());
     }

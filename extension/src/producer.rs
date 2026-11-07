@@ -329,6 +329,32 @@ pub fn forget_past(topic_id: u32, partition: i32, end: i64) -> Result<(), spi::E
 /// after its batch, so a lost row can sit below another producer's committed one.
 const REBUILD_LOOKBACK: i64 = 50_000;
 
+static WINDOW_REBUILT: std::sync::Mutex<Option<std::collections::HashSet<(u32, i32)>>> =
+    std::sync::Mutex::new(None);
+
+/// Before the first idempotent produce to a partition after this process starts, rebuild its
+/// window from the log (segment engine only; the table engine commits a batch and its row
+/// together). A failure leaves the partition unmarked, so the next produce tries again.
+pub fn ensure_window(topic_id: u32, partition: i32) -> Result<(), String> {
+    if crate::storage_engine_guc() != "segment" {
+        return Ok(());
+    }
+    let done = |s: &Option<std::collections::HashSet<(u32, i32)>>| {
+        s.as_ref().is_some_and(|s| s.contains(&(topic_id, partition)))
+    };
+    if done(&WINDOW_REBUILT.lock().unwrap_or_else(|e| e.into_inner())) {
+        return Ok(());
+    }
+    let store = crate::storage::open();
+    rebuild_window(&*store, topic_id, partition)?;
+    WINDOW_REBUILT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert((topic_id, partition));
+    Ok(())
+}
+
 /// Re-create window rows for batches the log holds and the window lacks, so a retry after a
 /// crash between the append and the row's commit is not appended twice.
 pub fn rebuild_window(

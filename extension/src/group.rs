@@ -163,14 +163,20 @@ pub fn protocol_type_conflicts(group_id: &str, protocol_type: &str) -> Result<bo
     Ok(conflicts)
 }
 
-/// Whether `protocols` shares a name with every other member's.
+/// Whether `protocols` shares a name with every other member's. A static member's earlier
+/// registration is the one this join replaces, so it is left out.
 pub fn protocols_compatible(
     group_id: &str,
     member_id: &str,
+    group_instance_id: Option<&str>,
     protocols: &[String],
 ) -> Result<bool, spi::Error> {
     let mut common: Vec<String> = protocols.to_vec();
-    for m in members(group_id)?.iter().filter(|m| m.member_id != member_id) {
+    let others = members(group_id)?.into_iter().filter(|m| {
+        m.member_id != member_id
+            && !(group_instance_id.is_some() && m.group_instance_id.as_deref() == group_instance_id)
+    });
+    for m in others {
         common.retain(|p| m.protocols.contains(p));
     }
     Ok(!common.is_empty())

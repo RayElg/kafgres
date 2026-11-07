@@ -104,8 +104,9 @@ caller holds no lock that other producers need.
 A mapping copies changes from a table to a topic through the WAL. You register it once.
 `kafgres_add_mapping` creates the logical replication slot if it does not exist yet, so
 changes committed after the call returns are captured. A slot sees only WAL written after it
-exists, so call it before the transaction has written anything; otherwise run
-`kafgres_cdc_create_slot()` first in its own transaction.
+exists, so call it before the transaction has written anything, or in a transaction of its
+own. A slot with no mapping holds WAL until one is added or `kafgres_cdc_drop_slot()`
+removes it, so drop it if the mapping is abandoned after a rolled-back call.
 
 The examples assume a `public.orders (id int, customer_id int, total numeric, status
 text)` table and a `customers (id int, name text, tier text)` lookup table.

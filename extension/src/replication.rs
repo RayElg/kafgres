@@ -45,6 +45,13 @@ pub static LAG_RECORDS: pgrx::PgAtomic<std::sync::atomic::AtomicI64> =
 pub static LAG_AT_MS: pgrx::PgAtomic<std::sync::atomic::AtomicI64> =
     unsafe { pgrx::PgAtomic::new(c"kafgres_follower_lag_at_ms") };
 
+/// Forget the last reading: the node no longer follows, or the last Fetch was incomplete.
+pub fn clear_lag() {
+    use std::sync::atomic::Ordering;
+    LAG_AT_MS.get().store(0, Ordering::Release);
+    LAG_RECORDS.get().store(0, Ordering::Release);
+}
+
 /// Follower lag in records at its last Fetch, and that Fetch's time in epoch ms. Empty
 /// before the first. `pg_stat_replication` does not cover this.
 #[pg_extern]
@@ -301,9 +308,11 @@ pub fn fetch_from(
     )?;
 
     let mut lag = 0i64;
+    let mut complete = true;
     for topic in &response.responses {
         for part in &topic.partitions {
             if part.error_code != 0 {
+                complete = false;
                 continue;
             }
             let from = want
@@ -315,7 +324,7 @@ pub fn fetch_from(
             }
         }
     }
-    {
+    if complete {
         use std::sync::atomic::Ordering;
         LAG_RECORDS.get().store(lag, Ordering::Release);
         let now = std::time::SystemTime::now()
@@ -323,6 +332,9 @@ pub fn fetch_from(
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         LAG_AT_MS.get().store(now, Ordering::Release);
+    } else {
+        // A partial sum would understate the lag; no reading is better than a low one.
+        clear_lag();
     }
 
     let mut pulled = Vec::new();

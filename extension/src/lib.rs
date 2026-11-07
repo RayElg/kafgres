@@ -1062,12 +1062,14 @@ pub unsafe extern "C-unwind" fn kafgres_follower_worker_main(_arg: pg_sys::Datum
             reload_config();
             if replicate_from().is_none() {
                 log!("kafgres: follower stopping — replicate_from was cleared");
+                replication::clear_lag();
                 return;
             }
         }
         // Stop before the broker starts serving: never two writers on one partition.
         if !pg_sys::RecoveryInProgress() {
             log!("kafgres: follower stopping — this node was promoted, the broker takes over");
+            replication::clear_lag();
             return;
         }
 

@@ -42,17 +42,25 @@ fn kafgres_add_mapping(
     if !valid_source(source_table) {
         error!("kafgres: {source_table:?} is not a plain schema-qualified table name");
     }
-    // The slot must exist before the mapping commits, and before this transaction writes.
-    if !slot_exists() {
-        if let Err(e) = create_slot() {
-            error!("kafgres: {e}; call kafgres_cdc_create_slot() in its own transaction first");
-        }
-    }
-    if crate::meta::topic_id_by_name(topic).ok().flatten().is_none() {
+    // Checked with reads that assign no xid, so the slot can still be created below.
+    let topic_exists = read_one::<i32>(
+        "SELECT (SELECT topic_id::int FROM kafgres_topics WHERE name = $1)",
+        &[topic.into()],
+    )
+    .unwrap_or_else(|e| error!("kafgres: {e}"))
+    .is_some();
+    if !topic_exists {
         error!("kafgres: no such topic {topic:?}; create it before mapping to it");
     }
 
     render_check(source_table, value_expr, key_expr, filter_expr);
+
+    // The slot must exist before the mapping commits, and before this transaction writes.
+    if !slot_exists() {
+        if let Err(e) = create_slot() {
+            error!("kafgres: {e}; call kafgres_add_mapping() before this transaction writes, or in a transaction of its own");
+        }
+    }
 
     Spi::run_with_args(
         "INSERT INTO kafgres_cdc_mappings
