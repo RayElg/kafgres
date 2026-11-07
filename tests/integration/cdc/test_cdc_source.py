@@ -120,6 +120,30 @@ def test_a_change_right_after_add_mapping_is_captured():
 def slot_count():
     return int(sql("SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'kafgres_cdc'"))
 
+def test_a_mapping_added_after_the_transaction_wrote_is_saved_with_a_warning():
+    out = psql("BEGIN; INSERT INTO src_orders VALUES (1,1,1,'x','x'); "
+               "SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
+               "$$jsonb_build_object('id', new.id)$$, NULL, NULL); COMMIT")
+    assert out.returncode == 0, out.stderr[-500:]
+    assert "WARNING" in out.stderr, out.stderr[-500:]
+    assert sql("SELECT count(*) FROM kafgres_cdc_mappings WHERE mapping_name = 'm1'") == "1"
+
+def test_a_change_committed_while_a_mapping_is_being_added_is_captured():
+    adding = subprocess.Popen(
+        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
+         "BEGIN; SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
+         "$$jsonb_build_object('id', new.id)$$, 'new.id::text', NULL); "
+         "SELECT pg_sleep(4); COMMIT"],
+        cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(1.5)
+        sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
+        assert drain() == 0, "drained under a slot whose mapping has not committed"
+    finally:
+        adding.wait(timeout=30)
+    assert drain() == 1
+    assert len(consume("src-events")) == 1
+
 def test_a_mapping_to_a_missing_topic_leaves_no_slot():
     out = psql("SELECT kafgres_add_mapping('m1', 'public.src_orders', 'no-such-topic', "
                "$$jsonb_build_object('id', new.id)$$, NULL, NULL)")

@@ -57,8 +57,10 @@ fn kafgres_add_mapping(
 
     // The slot must exist before the mapping commits, and before this transaction writes.
     if !slot_exists() {
+        // Not an error: the worker creates the slot once the mapping commits, and changes
+        // before then are not captured.
         if let Err(e) = create_slot() {
-            error!("kafgres: {e}; call kafgres_add_mapping() before this transaction writes, or in a transaction of its own");
+            warning!("kafgres: {e}; the mapping is saved, but changes before its slot exists are not captured");
         }
     }
 
@@ -950,6 +952,17 @@ fn drain(max_changes: i32, mode: Mode) -> Result<Drained, String> {
 fn drain_locked(max_changes: i32, mode: Mode, lock: &DrainLock) -> Result<Drained, String> {
     let opened = step(mode, || {
         if !lock.take()? {
+            return Ok(None);
+        }
+        // A mapping being added holds this lock exclusively until it commits; draining before
+        // then would pass the slot over changes that mapping is about to want.
+        let free = read_one::<bool>(
+            "SELECT pg_try_advisory_xact_lock_shared($1)",
+            &[SLOT_CREATE_LOCK_KEY.into()],
+        )?
+        .unwrap_or(false);
+        if !free {
+            lock.release()?;
             return Ok(None);
         }
         if !slot_exists() {

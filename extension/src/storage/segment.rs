@@ -1443,6 +1443,72 @@ impl SegmentStore {
 }
 
 impl SegmentStore {
+    /// The base of the first batch ending at or after `from` and starting below `ceiling`.
+    /// A compacted log is sparse, so it can be far past `from`; markers in between are moot.
+    fn next_batch_base(
+        topic: TopicId,
+        partition: i32,
+        from: i64,
+        ceiling: i64,
+        bases_on_disk: &[i64],
+    ) -> StoreResult<Option<i64>> {
+        let mut bases = bases_on_disk.to_vec();
+        bases.sort_unstable();
+        Self::with_slot(topic, partition, |st, hints| {
+            for (bi, base) in bases.iter().enumerate() {
+                if bases.get(bi + 1).is_some_and(|next_base| *next_base <= from) {
+                    continue;
+                }
+                let path = data_path(&segment_path(topic, partition, *base, "log"));
+                let Ok(vfd) = Vfd::open(&path, false) else {
+                    continue; // reclaimed while we looked
+                };
+                let data_end = if *base == st.active_base {
+                    st.active_bytes
+                } else {
+                    vfd.size()?
+                };
+                let mut pos = hints
+                    .get(base)
+                    .and_then(|entries| entries.iter().rev().find(|(b, _)| *b <= from).map(|(_, p)| *p))
+                    .unwrap_or(0);
+                let mut header = [0u8; records::RECORD_BATCH_OVERHEAD];
+                while pos + header.len() as u64 <= data_end {
+                    if vfd.read_at(&mut header, pos)? != header.len() {
+                        break;
+                    }
+                    let length = i32::from_be_bytes(
+                        header[records::LENGTH_OFFSET..records::LENGTH_OFFSET + 4]
+                            .try_into()
+                            .expect("4 bytes"),
+                    );
+                    let total = records::LENGTH_OFFSET as u64 + 4 + length.max(0) as u64;
+                    if length <= 0 || pos + total > data_end {
+                        break;
+                    }
+                    let batch_base = i64::from_be_bytes(
+                        header[records::BASE_OFFSET_OFFSET..records::BASE_OFFSET_OFFSET + 8]
+                            .try_into()
+                            .expect("8 bytes"),
+                    );
+                    let last_delta = i32::from_be_bytes(
+                        header[records::LAST_OFFSET_DELTA_OFFSET..records::LAST_OFFSET_DELTA_OFFSET + 4]
+                            .try_into()
+                            .expect("4 bytes"),
+                    );
+                    if batch_base >= ceiling {
+                        return Ok(None);
+                    }
+                    if batch_base + last_delta as i64 >= from {
+                        return Ok(Some(batch_base));
+                    }
+                    pos += total;
+                }
+            }
+            Ok(None)
+        })
+    }
+
     fn segment_bases(topic: TopicId, partition: i32) -> StoreResult<Vec<i64>> {
         let dir = partition_dir(topic, partition);
         let entries = match std::fs::read_dir(data_path(&dir)) {
@@ -2155,11 +2221,20 @@ impl LogStore for SegmentStore {
                     }
                     Ok(())
                 })?;
-                // Nothing below the lowered ceiling (a compacted log is sparse): resume from it.
+                // Nothing below the lowered ceiling (a compacted log is sparse): resume at the
+                // next batch, not the next window of markers, which may all be stale.
                 if out.is_empty() && limit < ceiling {
-                    offset = limit;
-                    next = limit;
-                    continue;
+                    match Self::next_batch_base(topic, partition, limit, ceiling, &bases_on_disk)? {
+                        Some(base) => {
+                            offset = base;
+                            next = base;
+                            continue;
+                        }
+                        None => {
+                            next = ceiling;
+                            break;
+                        }
+                    }
                 }
                 break;
             }

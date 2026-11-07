@@ -325,33 +325,68 @@ pub fn forget_past(topic_id: u32, partition: i32, end: i64) -> Result<(), spi::E
     )
 }
 
-/// Offsets below the newest recorded batch that recovery rescans: a producer's row commits
-/// after its batch, so a lost row can sit below another producer's committed one.
+/// Offsets below the log end that recovery rescans. A crash loses only what was appended but
+/// not yet committed, which is the log's tail; a row commits after its batch, so a lost row
+/// can sit below another producer's committed one.
 const REBUILD_LOOKBACK: i64 = 50_000;
 
-static WINDOW_REBUILT: std::sync::Mutex<Option<std::collections::HashSet<(u32, i32)>>> =
-    std::sync::Mutex::new(None);
+type Partitions = std::collections::HashSet<(u32, i32)>;
+
+static WINDOW_REBUILT: std::sync::Mutex<Option<Partitions>> = std::sync::Mutex::new(None);
+
+thread_local! {
+    /// Rebuilt in the current transaction, not yet committed.
+    static REBUILT_PENDING: std::cell::RefCell<Option<Partitions>> = const { std::cell::RefCell::new(None) };
+}
 
 /// Before the first idempotent produce to a partition after this process starts, rebuild its
 /// window from the log (segment engine only; the table engine commits a batch and its row
-/// together). A failure leaves the partition unmarked, so the next produce tries again.
+/// together). The partition counts as rebuilt only once the transaction holding the rows
+/// commits; a rollback, or a failure, leaves it for the next produce to try again.
 pub fn ensure_window(topic_id: u32, partition: i32) -> Result<(), String> {
+    use pgrx::{PgSubXactCallbackEvent, PgXactCallbackEvent};
+
     if crate::storage_engine_guc() != "segment" {
         return Ok(());
     }
-    let done = |s: &Option<std::collections::HashSet<(u32, i32)>>| {
-        s.as_ref().is_some_and(|s| s.contains(&(topic_id, partition)))
-    };
-    if done(&WINDOW_REBUILT.lock().unwrap_or_else(|e| e.into_inner())) {
+    let key = (topic_id, partition);
+    if WINDOW_REBUILT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.contains(&key))
+        || REBUILT_PENDING.with(|p| p.borrow().as_ref().is_some_and(|s| s.contains(&key)))
+    {
         return Ok(());
     }
     let store = crate::storage::open();
     rebuild_window(&*store, topic_id, partition)?;
-    WINDOW_REBUILT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(Default::default)
-        .insert((topic_id, partition));
+
+    let first = REBUILT_PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let first = p.is_none();
+        p.get_or_insert_with(Default::default).insert(key);
+        first
+    });
+    if first {
+        pgrx::register_xact_callback(PgXactCallbackEvent::Commit, || {
+            let done = REBUILT_PENDING.with(|p| p.borrow_mut().take());
+            if let Some(done) = done {
+                WINDOW_REBUILT
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert_with(Default::default)
+                    .extend(done);
+            }
+        });
+        pgrx::register_xact_callback(PgXactCallbackEvent::Abort, || {
+            REBUILT_PENDING.with(|p| p.borrow_mut().take());
+        });
+        // A rolled-back subtransaction may hold the rows: forget, and rebuild again.
+        pgrx::register_subxact_callback(PgSubXactCallbackEvent::AbortSub, |_, _| {
+            REBUILT_PENDING.with(|p| p.borrow_mut().take());
+        });
+    }
     Ok(())
 }
 
@@ -371,16 +406,7 @@ pub fn rebuild_window(
     let log_start = store
         .log_start_offset(topic_id, partition)
         .map_err(|e| e.to_string())?;
-    let newest_recorded: Option<i64> = crate::plan::get_one::<i64>(
-        "SELECT (SELECT max(base_offset) FROM kafgres_producer_batches
-                  WHERE topic_id = $1::oid AND partition = $2)",
-        &[(topic_id as i32).into(), partition.into()],
-    )
-    .map_err(|e| e.to_string())?;
-    let mut at = newest_recorded
-        .unwrap_or(end)
-        .saturating_sub(REBUILD_LOOKBACK)
-        .max(log_start);
+    let mut at = end.saturating_sub(REBUILD_LOOKBACK).max(log_start);
 
     // Per producer: (epoch, last_seq) of its newest row, `None` with no window here.
     let mut newest: HashMap<i64, Option<(i16, i32)>> = HashMap::new();

@@ -171,13 +171,24 @@ pub fn protocols_compatible(
     group_instance_id: Option<&str>,
     protocols: &[String],
 ) -> Result<bool, spi::Error> {
+    // Only the protocol names: a member's metadata and assignment can be large.
+    let others: Vec<Vec<String>> = Spi::connect(|client| {
+        let rows = client.select(
+            "SELECT protocols FROM kafgres_group_members
+              WHERE group_id = $1 AND member_id <> $2
+                AND ($3::text IS NULL OR group_instance_id IS DISTINCT FROM $3)",
+            None,
+            &[group_id.into(), member_id.into(), group_instance_id.into()],
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.get::<Vec<String>>(1)?.unwrap_or_default());
+        }
+        Ok::<_, spi::Error>(out)
+    })?;
     let mut common: Vec<String> = protocols.to_vec();
-    let others = members(group_id)?.into_iter().filter(|m| {
-        m.member_id != member_id
-            && !(group_instance_id.is_some() && m.group_instance_id.as_deref() == group_instance_id)
-    });
-    for m in others {
-        common.retain(|p| m.protocols.contains(p));
+    for theirs in &others {
+        common.retain(|p| theirs.contains(p));
     }
     Ok(!common.is_empty())
 }

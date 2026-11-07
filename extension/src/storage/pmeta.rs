@@ -212,7 +212,8 @@ pub fn advance_log_start(topic: TopicId, partition: i32, offset: i64) -> StoreRe
         &[(topic as i32).into(), partition.into(), offset.into()],
     )
     .map_err(spi_err)?;
-    // Batches wholly below the log start are unreadable.
+    // Batches wholly below the log start are unreadable. The `base_offset` bound is implied by
+    // `last_offset` but lets the planner use the primary key's range instead of scanning.
     Spi::run_with_args(
         "DELETE FROM kafgres_markers
           WHERE topic_id = $1::oid AND partition = $2
@@ -307,31 +308,43 @@ pub fn marker_state(topic: TopicId, partition: i32, base: i64, xid: i64) -> Stor
     .map_err(spi_err)
 }
 
-/// Whether every xid8 so far fits the producer id's xid bits; read once per process, since
-/// crossing 2^40 takes years and a restart picks it up.
+/// Whether every xid8 so far fits the producer id's xid bits. "No" is permanent; "yes" is
+/// rechecked every few minutes, since the counter can cross 2^40 while a process runs.
 fn xid_epoch_is_zero() -> StoreResult<bool> {
-    use std::sync::atomic::{AtomicI8, Ordering};
-    static ZERO: AtomicI8 = AtomicI8::new(-1);
-    match ZERO.load(Ordering::Relaxed) {
-        -1 => {
-            // `client.select`: `get_one` would assign this read an xid.
-            let zero = Spi::connect(|client| {
-                client
-                    .select(
-                        "SELECT (pg_snapshot_xmax(pg_current_snapshot())::text::bigint >> 40) = 0",
-                        Some(1),
-                        &[],
-                    )?
-                    .first()
-                    .get_one::<bool>()
-            })
-            .map_err(spi_err)?
-            .unwrap_or(true);
-            ZERO.store(zero as i8, Ordering::Relaxed);
-            Ok(zero)
-        }
-        v => Ok(v == 1),
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    const RECHECK_SECS: i64 = 300;
+    static CROSSED: AtomicBool = AtomicBool::new(false);
+    static ZERO_UNTIL: AtomicI64 = AtomicI64::new(0);
+
+    if CROSSED.load(Ordering::Relaxed) {
+        return Ok(false);
     }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if now < ZERO_UNTIL.load(Ordering::Relaxed) {
+        return Ok(true);
+    }
+    // `client.select`: `get_one` would assign this read an xid.
+    let zero = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT (pg_snapshot_xmax(pg_current_snapshot())::text::bigint >> 40) = 0",
+                Some(1),
+                &[],
+            )?
+            .first()
+            .get_one::<bool>()
+    })
+    .map_err(spi_err)?
+    .unwrap_or(true);
+    if zero {
+        ZERO_UNTIL.store(now + RECHECK_SECS, Ordering::Relaxed);
+    } else {
+        CROSSED.store(true, Ordering::Relaxed);
+    }
+    Ok(zero)
 }
 
 /// Whether an aborted Kafka transaction of `producer_id` covers `offset`.

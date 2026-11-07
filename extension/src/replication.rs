@@ -307,21 +307,24 @@ pub fn fetch_from(
         FetchResponse::decode,
     )?;
 
+    // Against the last stable offset, not the high watermark: the follower copies only what
+    // has committed, so an open transaction is not lag. A partition the leader did not
+    // answer, or answered with an error, leaves the reading incomplete.
     let mut lag = 0i64;
     let mut complete = true;
-    for topic in &response.responses {
-        for part in &topic.partitions {
-            if part.error_code != 0 {
-                complete = false;
-                continue;
+    for (_, name, partition, from, _) in want {
+        let part = response
+            .responses
+            .iter()
+            .filter(|t| t.topic == *name)
+            .flat_map(|t| t.partitions.iter())
+            .find(|p| p.partition_index == *partition);
+        match part {
+            Some(p) if p.error_code == 0 => {
+                let stable = if p.last_stable_offset >= 0 { p.last_stable_offset } else { p.high_watermark };
+                lag += (stable - *from).max(0);
             }
-            let from = want
-                .iter()
-                .find(|(_, n, p, _, _)| *n == topic.topic && *p == part.partition_index)
-                .map(|w| w.3);
-            if let Some(from) = from {
-                lag += (part.high_watermark - from).max(0);
-            }
+            _ => complete = false,
         }
     }
     if complete {
