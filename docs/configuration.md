@@ -39,6 +39,15 @@ restart does.
 | `kafgres.replicate_from` | reload | empty | `host:port` of the leader to pull log from on a standby; empty disables it. The follower reads it when it starts: a reload can clear it, but setting it on a standby that started without it takes an instance restart, and changing the address takes a restart of the follower worker. |
 | `kafgres.allow_transactional_produce` | reload | on | Enable `kafgres_produce()`, the transactional SQL produce path. |
 
+**Backups on the segment engine.** The segment engine's log lives in files, so
+`pg_basebackup` can seed a replica but is not a backup: retention deletes rolled segments
+that an archive would still need. Set `kafgres.segment_archive_command` to a shell command
+that takes `%p` and `%f`, like Postgres's `archive_command`. Retention does not reclaim a
+segment until the command has archived it. As with WAL archiving, a failing command stops
+reclamation and the disk fills, so monitor `kafgres_archive_status()`. The table engine
+does not need this, because its log is in ordinary tables that `pg_basebackup` already
+covers.
+
 ## Retention and compaction
 
 | Setting | Reload | Default | Description |

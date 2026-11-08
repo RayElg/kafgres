@@ -1,11 +1,11 @@
 # kafgres
 
-A PostgreSQL extension that embeds a Kafka broker. Unmodified Kafka clients (librdkafka,
-the Java client, Sarama, kafka-python, `kcat`, the `kafka-*.sh` tooling) connect to
-Postgres on port 9092 and cannot tell the difference. Topics, partitions, offsets,
-consumer groups, and the log itself live in the database.
+kafgres is a PostgreSQL extension that runs a Kafka broker inside Postgres. Kafka clients
+(librdkafka, the Java client, Sarama, kafka-python, `kcat`, the `kafka-*.sh` tools)
+connect to Postgres on port 9092 as they would to any broker.
 
-The goal is transactional coupling between the database and the event stream:
+This makes it possible to write to a table and publish an event in one transaction, and
+to connect to the database using regular Kafka clients:
 
 ```sql
 BEGIN;
@@ -15,157 +15,83 @@ BEGIN;
 COMMIT;
 ```
 
-Both commit or neither does. There is no outbox table, no Debezium, no Connect cluster,
-and no dual-write inconsistency window. See [docs/producing.md](docs/producing.md) for
-the produce paths and when to use each.
+Either both happen or neither does, so there is no outbox table, relay or dual-write
+window. [docs/producing.md](docs/producing.md) describes the produce paths and when to
+use each.
 
-## Status
+## Quick start
 
-The following all work today:
+### Docker
 
-- Unmodified clients produce, consume, and rebalance: librdkafka and `kcat`, the Java
-  client and its console tools, Sarama, and kafka-python.
-- A default-config Java `KafkaProducer` with idempotence on (the default since Kafka
-  3.0) works with no overrides.
-- Admin APIs: `kafka-topics.sh`, `kafka-configs.sh`, `kafka-consumer-groups.sh`,
-  `kafka-acls.sh`, transactions, share groups, and the KIP-848 consumer protocol.
-- Retention reclaims disk, and `cleanup.policy=compact` topics are compacted on both
-  storage engines.
-- Clients authenticate with SCRAM-SHA-256 against Postgres roles or an mTLS certificate,
-  with ACLs in a SQL-managed table.
-- Consumers truncate rather than read divergent data when an async replica is promoted,
-  verified against a real physical standby.
-- The conformance suite drives five real clients (Java, librdkafka, Sarama, franz-go,
-  kafka-python) through some 180 scenarios against kafgres and a reference Kafka
-  and diffs the observable results; it runs in CI on every pull request, and every intended
-  difference is catalogued in [docs/conformance.md](docs/conformance.md).
-- The segment engine (the default) passes the same conformance suite, survives `kill -9`
-  with every acknowledged record intact, and replicates its log to a standby out of
-  band. By default every acknowledged record also survives a host crash. On an i9-13900
-  with power-loss-protected NVMe it produced about 2.4x the table engine's throughput
-  with both durability settings relaxed. The strict defaults cost 3 to 25%: 806 MB/s
-  relaxed against 605 MB/s strict for 1 KiB records from 4 producers (the full table is
-  in [docs/configuration.md](docs/configuration.md)).
-- `kafgres_produce()` commits atomically with a business write.
-- CDC: a table's changes reach a topic through a logical decoding output plugin shipped
-  with the extension, with the mapping written in SQL. See
-  [docs/producing.md](docs/producing.md).
+Each [release](https://github.com/RayElg/kafgres/releases/latest) includes a prebuilt
+image for PostgreSQL 13 to 18, on amd64 and arm64. The image has the extension
+installed, `wal_level = logical` set, and `CREATE EXTENSION kafgres` run on first start.
 
-**If you run the segment engine, set `kafgres.segment_archive_command`.** The segment
-engine's log lives in files, so `pg_basebackup` seeds a replica but is not a backup:
-retention unlinks rolled segments that an archive would still want. The setting takes a
-shell command with `%p`/`%f`, exactly as Postgres's own `archive_command` does, and
-retention refuses to reclaim a segment the archive has not taken. As with WAL archiving,
-a failing command stops reclamation and the disk grows, so watch
-`kafgres_archive_status()`. The table engine needs none of this; its log is in Postgres
-tables and `pg_basebackup` already covers it.
-
-## Try it
-
-`docker compose up -d` starts a Postgres preloaded with `kafgres` and creates the
-extension on first start (`CREATE EXTENSION kafgres` runs from the image's init
-scripts). On a cluster you administer yourself, add `kafgres` to
-`shared_preload_libraries` and run `CREATE EXTENSION kafgres;`.
-
-`demo/kcat-demo.sh` then points `kcat` at it and runs the commands you would run
-against any Kafka broker. It needs the broker up; with no local `kcat` it builds the
-small test-client image on first use:
-
-```
-docker compose up -d
-bash demo/kcat-demo.sh
+```bash
+curl -LO https://github.com/RayElg/kafgres/releases/latest/download/kafgres-postgres-pg16-amd64-image.tar.gz
+docker load -i kafgres-postgres-pg16-amd64-image.tar.gz
+docker run -d --name kafgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 -p 9092:9092 kafgres-postgres:amd64
 ```
 
-```
-kafgres: a Kafka broker inside PostgreSQL
+The loaded image is tagged with its architecture. On ARM hosts, use `arm64` in both the
+file name and the tag. Use `pg13` to `pg18` in the file name for other Postgres versions.
 
-There is no broker process. Port 9092 is served by a Postgres background worker:
+### Pigsty packages
 
-$ psql -tAc "SELECT 'PostgreSQL ' || current_setting('server_version')"
-  PostgreSQL 16.14 (Debian 16.14-1.pgdg12+1)
+[Pigsty](https://pigsty.io) packages kafgres for PostgreSQL 14 to 18 on Debian, Ubuntu
+and EL 8 to 10 ([package list](https://ext.pgsty.com/e/kafgres)). Use this to add kafgres
+to a Postgres you already run.
 
-$ psql -tAc "SELECT backend_type FROM pg_stat_activity
-                   WHERE backend_type = 'kafgres_broker'"
-  kafgres_broker
-
-Topics are created in SQL, because a topic is a row:
-
-$ psql -tAc "SELECT kafgres_create_topic('payments', 3)"
-  121
-
-Everything from here is plain kcat, pointed at 127.0.0.1:9092.
-
-$ kcat -b 127.0.0.1:9092 -L -t payments
-  Metadata for payments (from broker 1: 127.0.0.1:9092/1):
-   1 brokers:
-    broker 1 at 127.0.0.1:9092 (controller)
-   1 topics:
-    topic "payments" with 3 partitions:
-      partition 0, leader 1, replicas: 1, isrs: 1
-      partition 1, leader 1, replicas: 1, isrs: 1
-      partition 2, leader 1, replicas: 1, isrs: 1
-
-Produce three keyed records. The client hashes the key to a partition, so this
-also checks that the broker serves the partition the client chose:
-
-$ printf 'erin:{"amt":120}\nken:{"amt":80}\nalice:{"amt":210}\n' \
-    | kcat -b 127.0.0.1:9092 -t payments -K: -P
-
-Read them back with partition, offset and key:
-
-$ kcat -b 127.0.0.1:9092 -t payments -C -e -q -o beginning -f '%p:%o  %k -> %s\n'
-  0:0  erin -> {"amt":120}
-  1:0  ken -> {"amt":80}
-  2:0  alice -> {"amt":210}
-
-Consumer groups work. The second run starts from the committed offset and
-finds nothing left:
-
-$ kcat -b 127.0.0.1:9092 -G payments-demo payments -e -q -o beginning -c 3 -f '%p:%o  %k -> %s\n'
-  1:0  ken -> {"amt":80}
-  0:0  erin -> {"amt":120}
-  2:0  alice -> {"amt":210}
-
-$ kcat -b 127.0.0.1:9092 -G payments-demo payments -e -q -f 'unexpected: %p:%o\n'
-  (no output)
-
-The log is part of the same database as the application tables that produced
-them — here are its offsets, straight from SQL:
-
-$ psql -c "SELECT partition, COALESCE(high_watermark, 0) AS log_end_offset,
-                log_start_offset FROM kafgres_partition_offsets('payments')"
-   partition | log_end_offset | log_start_offset
-  -----------+----------------+------------------
-           0 |              1 |                0
-           1 |              1 |                0
-           2 |              1 |                0
+```bash
+curl -fsSL https://repo.pigsty.io/pig | bash   # installs the pig CLI
+pig repo add pgsql -u                          # adds the Pigsty and PGDG apt/yum repos
+pig ext install kafgres -v 16                  # -v is the PostgreSQL major version
 ```
 
-The script uses a local `kcat` if you have one and the test client image otherwise.
-Nothing in it is kafgres-aware: every `kcat` line is one you would run against a real
-broker.
+The package installs files only. Add the following to `postgresql.conf`, restart
+Postgres, and create the extension:
 
-## Upgrading
+```
+shared_preload_libraries = 'kafgres'
+wal_level = logical                    # needed for CDC mappings; optional otherwise
+kafgres.advertised_host = '<host that Kafka clients can reach>'
+```
 
-Install the new build, restart Postgres, then run `ALTER EXTENSION kafgres UPDATE;` in
-the database the broker uses. The broker serves across the restart before the update
-runs; the update changes who may call the administrative functions (see
-[docs/producing.md](docs/producing.md#who-may-produce)) and pins `kafgres_produce()`'s
-search path.
+```sql
+CREATE EXTENSION kafgres;
+```
 
-From 0.2.0, the first start on the segment engine removes the log's old-format
-`.timeindex` files. Nothing is lost: timestamp lookups scan the segments written before
-the upgrade instead, and segments written after it are indexed.
+On Debian, installing the Postgres package creates a cluster of its own, on port 5433 if
+5432 is taken. `pg_lsclusters` shows which port it uses. If you use `pig` to install
+Postgres itself, or run the full Pigsty distribution, list `kafgres` among the cluster's
+extensions instead.
 
-From 0.3.0, transaction markers written before 0.3.1 carry no `EndTransactionMarker`
-value, which Sarama fails to decode. They stay until retention removes their segments.
-A Sarama consumer can start past the last such marker, or the topic can be recreated.
+### Extension tarball
 
-## CDC without Debezium
+Each release also has a tarball per Postgres major and architecture, containing the
+shared library and extension files, for installing into any Postgres you manage yourself.
+The steps are in the release notes.
 
-A table's changes reach a topic without Kafka Connect, a second JVM, or a network hop.
-The mapping is SQL, not a template, so it can join, filter with a real predicate, and
-build `jsonb` that is typed by construction:
+### 5 second post-install demo
+
+```bash
+psql -h 127.0.0.1 -U postgres -tAc "SELECT kafgres_create_topic('hello', 1)"
+echo 'first message' | kcat -b 127.0.0.1:9092 -t hello -P
+kcat -b 127.0.0.1:9092 -t hello -C -e -q
+```
+
+This needs `psql` and [`kcat`](https://github.com/edenhill/kcat) on the host. With the
+Docker image, `docker exec kafgres psql -U postgres -tAc "…"` replaces the `psql` line.
+The last command prints `first message`. [`demo/kcat-demo.sh`](demo/kcat-demo.sh) goes
+further: it creates a topic, produces keyed records, reads them back, uses a consumer
+group, and queries the log's offsets from SQL. It uses a local `kcat` if there is one and
+otherwise builds a small client image.
+
+## CDC
+
+A table's changes can be published to a topic without Kafka Connect or Debezium. A
+mapping is written in SQL, so it can join other tables, filter with a predicate, and build
+`jsonb`:
 
 ```sql
 CREATE TABLE customers (id int PRIMARY KEY, name text, tier text);
@@ -191,8 +117,8 @@ SELECT kafgres_add_mapping(
     filter_expr => $$ new.status = 'placed' $$);
 ```
 
-A background worker drains a logical replication slot fed by kafgres's own output plugin,
-renders each mapping, and produces:
+A background worker reads a logical replication slot using kafgres's own output plugin,
+renders each mapping and produces the result:
 
 ```
 $ psql -c "INSERT INTO orders VALUES (10, 1, 99.50, 'placed')"
@@ -200,140 +126,104 @@ $ kcat -b 127.0.0.1:9092 -t order-events -C -e -q -o beginning -f '%k -> %s\n'
   10 -> {"op": "I", "total": 99.50, "customer": {"tier": "gold"}, "order_id": 10}
 ```
 
-`old` is in scope too, and comes out of the WAL rather than a re-read, so on a table with
-`REPLICA IDENTITY FULL` the before-image is exact as of the change. See
-[docs/producing.md](docs/producing.md) for the full mapping interface.
+`old` is also available in expressions. It comes from the WAL, so on a table with
+`REPLICA IDENTITY FULL` it is the exact before-image. [docs/producing.md](docs/producing.md)
+describes the full mapping interface.
 
-One caveat: an enrichment subquery runs when the change is rendered, so it reads current
-state rather than the state the transaction saw. That is the same trade a Debezium SMT
-lookup or a downstream stream-join makes. When an event must reflect exactly what the
-transaction saw, use `kafgres_produce()`, which runs inside the transaction.
+An enrichment subquery runs when the change is rendered, so it sees current data, not the
+data the original transaction saw. Debezium lookups and downstream stream joins behave the
+same way. If an event must reflect exactly what the transaction saw, use
+`kafgres_produce()`, which runs inside the transaction.
 
-## Parity demo
+## What works
 
-`demo/parity-demo.sh` runs the same commands against kafgres and against a real
-`apache/kafka` broker and diffs the output. It needs both images and nothing else:
+- **Clients.** Produce, consume and rebalance work with librdkafka and `kcat`, the Java
+  client and its console tools, Sarama, franz-go and kafka-python. A Java
+  `KafkaProducer` with default settings, including idempotence, needs no overrides.
+- **Admin.** `kafka-topics.sh`, `kafka-configs.sh`, `kafka-consumer-groups.sh` and
+  `kafka-acls.sh` work, as do transactions, share groups and the KIP-848 consumer
+  protocol.
+- **Retention and compaction.** Retention reclaims disk, and `cleanup.policy=compact`
+  topics are compacted.
+- **Authentication.** Clients can authenticate with SCRAM-SHA-256 against Postgres roles
+  or with an mTLS certificate. ACLs are stored in a table managed with SQL.
+- **Failover.** When an asynchronous replica is promoted, consumers are truncated to the
+  new log end instead of reading data that diverged. This is tested against a physical
+  standby.
+- **Transactional produce.** `kafgres_produce()` commits atomically with the surrounding
+  transaction.
 
-```
+### Conformance
+
+The conformance suite runs five clients (Java, librdkafka, Sarama, franz-go and
+kafka-python) through about 180 scenarios against both kafgres and a reference Kafka
+broker, and compares what each client observes. It runs in CI on every pull request.
+Every intended difference is listed in [docs/conformance.md](docs/conformance.md).
+
+`demo/parity-demo.sh` is a short version: it runs the same commands against kafgres and
+an `apache/kafka` container and diffs the output. It needs both images:
+
+```bash
 docker compose build && docker build -t kafgres-clients tests/clients
 bash demo/parity-demo.sh
 ```
 
-```
-kafgres parity demo
-Left:  kafgres: a Kafka broker inside PostgreSQL, on 127.0.0.1:9092
-Right: apache/kafka: a reference Kafka broker, on 127.0.0.1:9292
-Every check runs the identical command against both and diffs the output.
+## Upgrading
 
-Admin tooling (the Java client, unmodified)
-  ✓ kafka-topics.sh --describe                     identical
-  ✓ kafka-topics.sh --list                         identical
-  ✓ kafka-configs.sh --describe                    identical
-  ✓ kafka-get-offsets.sh                           identical
+Install the new build, restart Postgres, then run `ALTER EXTENSION kafgres UPDATE;` in the
+database the broker uses. The broker keeps serving after the restart, before the update
+runs.
 
-Produce and consume (librdkafka / kcat)
-  ✓ kcat -P then -C, 6 keyed records over 3 partitions identical
-  ✓ kcat -L metadata                               identical
-
-Independent clients (no shared code with librdkafka or Java)
-  ✓ Sarama (Go) - produce, consume, offsets        identical
-  ✓ Sarama (Go) - consumer group, commit           identical
-  ✓ kafka-python - produce, consume, offsets       identical
-  ✓ kafka-python - consumer group, commit          identical
-  ✓ unknown topic returns the same error code      identical
-
-Consumer groups
-  ✓ kafka-consumer-groups.sh --describe (lag, offsets) identical
-  ✓ kafka-consumer-groups.sh --list                identical
-
-The difference
-Everything above matched. This does not:
-
-  $ psql -c "SELECT partition, COALESCE(high_watermark, 0) AS log_end_offset,
-                log_start_offset FROM kafgres_partition_offsets('parity-demo')"
-   partition | log_end_offset | log_start_offset
-  -----------+----------------+------------------
-           0 |              2 |                0
-           1 |              1 |                0
-           2 |              3 |                0
-
-13/13 checks identical  ✓
-```
-
-A check that fails prints the diff and the script exits non-zero. Two differences are
-normalized away, both catalogued in [docs/conformance.md](docs/conformance.md):
-`min.insync.replicas`, which the broker does not report because it does not honour it,
-and the ELR columns, which the tool renders as `N/A` against kafgres because it falls
-back to `Metadata`. Anything else that differs is treated as a bug, and the script shows
-it rather than absorbing it.
-
-The demo is a summary; `tests/conformance/` is the gate, with the five clients run through
-about 180 scenarios against both brokers in CI on every pull request.
+- **From 0.3.0:** transaction markers written before 0.3.1 have no
+  `EndTransactionMarker` value, which Sarama cannot decode. They stay until
+  retention removes their segments. A Sarama consumer can start after the last such
+  marker, or the topic can be recreated.
+- **From 0.2.0:** the update also changes who may call the administrative functions (see
+  [docs/producing.md](docs/producing.md#who-may-produce)) and fixes
+  `kafgres_produce()`'s search path. On the segment engine, the first start removes the
+  log's old-format `.timeindex` files. Timestamp lookups then scan the segments written
+  before the upgrade, and segments written afterwards are indexed.
 
 ## Documentation
 
 | Doc | Contents |
 |-----|----------|
-| [docs/architecture.md](docs/architecture.md) | The design: one broker per instance, how durability maps onto Postgres, both storage engines, transactional produce, segment replication. |
+| [docs/architecture.md](docs/architecture.md) | Design: one broker per instance, durability in Postgres terms, both storage engines, transactional produce, segment replication. |
 | [docs/producing.md](docs/producing.md) | The three produce paths, CDC mappings, and how to choose between them. |
-| [docs/conformance.md](docs/conformance.md) | The client matrix, how the suite runs, and the catalogue of client-visible differences from Kafka. |
-| [docs/configuration.md](docs/configuration.md) | Every `kafgres.*` setting: scope, default, and what it controls. |
+| [docs/conformance.md](docs/conformance.md) | Client matrix, how the suite runs, and the known differences from Kafka. |
+| [docs/configuration.md](docs/configuration.md) | Every `kafgres.*` setting: scope, default and meaning. |
 
-
-## Prior art
-
-The Kafka protocol has been reimplemented several times over non-Kafka logs: Redpanda
-(C++), WarpStream (S3), AutoMQ (S3-backed fork), Kafka-on-Pulsar. kafgres differs by
-using Postgres as the log and by producing inside the same transaction as the
-application write.
-
-## Layout
-
-```
-codec/          kafgres-codec, the wire protocol. No pgrx, no Postgres, unit-testable alone.
-  schemas/      Kafka message schemas, vendored at a pinned tag (codec/VENDORING.md)
-  implemented.toml   which APIs are served, and at which versions
-  src/generated/     emitted by codec-gen and checked in; do not edit
-codec-gen/      the generator. `cargo run -p kafgres-codec-gen`
-extension/      the pgrx extension. Its own workspace on purpose.
-docs/           architecture.md, producing.md, conformance.md, configuration.md
-```
-
-## Build
+## Building from source
 
 ```bash
-cargo test                    # codec + generator. No Postgres needed.
-docker compose build          # links the extension; cargo check does not
+cargo test                    # codec and generator; no Postgres needed
+docker compose build          # builds and links the extension
 docker compose up -d
 
 docker build -t kafgres-clients tests/clients
-pip install -r requirements.txt   # pytest + kafka-python for the test suites
-pytest tests/integration/         # real clients against a running broker
+pip install -r requirements.txt
+pytest tests/integration/     # real clients against a running broker
 ```
 
-Try it:
+Use `docker compose build` rather than `cargo check`: `cargo check` skips the pgrx link
+step and passes on code that cannot load. The image builds against PostgreSQL 16 by
+default. Set `PG_MAJOR` (13 to 18) to build another major, as in
+`PG_MAJOR=18 docker compose build`. CI builds and tests every major from 13 to 18.
 
-```sql
-SELECT kafgres_create_topic('orders', 3);
+Repository layout:
+
 ```
-
-```console
-$ kcat -b localhost:9092 -L
- 1 brokers:
-  broker 1 at localhost:9092 (controller)
-  topic "orders" with 3 partitions:
-    partition 0, leader 1, replicas: 1, isrs: 1
+codec/          kafgres-codec, the wire protocol; no pgrx or Postgres dependency
+  schemas/      Kafka message schemas, vendored at a pinned tag (codec/VENDORING.md)
+  implemented.toml   which APIs are served, and at which versions
+  src/generated/     generated by codec-gen and checked in; do not edit
+codec-gen/      the generator: `cargo run -p kafgres-codec-gen`
+extension/      the pgrx extension (its own workspace)
+docs/           documentation
 ```
-
-`cargo check` does not exercise the pgrx/Postgres link step and passes on code that
-cannot load. Use `docker compose build`.
-
-The image builds against PostgreSQL 16 by default; set `PG_MAJOR` (13 through 18) to
-build against another major, as in `PG_MAJOR=18 docker compose build`. CI builds and
-tests every major from 13 to 18.
 
 ## License
 
-Released under the Elastic License 2.0; see [LICENSE](LICENSE). The Kafka message
-schemas vendored under `codec/schemas/` are Apache License 2.0, upstream Apache Kafka;
-see `codec/VENDORING.md`.
+kafgres is released under the Elastic License 2.0; see [LICENSE](LICENSE). The Kafka
+message schemas vendored under `codec/schemas/` are Apache License 2.0, from upstream
+Apache Kafka; see `codec/VENDORING.md`.

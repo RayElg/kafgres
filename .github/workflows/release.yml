@@ -264,8 +264,11 @@ jobs:
           ```bash
           docker load -i kafgres-postgres-pg16-amd64-image.tar.gz
           docker run -e POSTGRES_PASSWORD=postgres \
-            -p 5432:5432 -p 9092:9092 kafgres-postgres
+            -p 5432:5432 -p 9092:9092 kafgres-postgres:amd64
           ```
+
+          The image is tagged with its architecture; use `arm64` in the file name and
+          the tag on ARM hosts.
 
           The image ships the configuration above and creates the extension on
           first start.
