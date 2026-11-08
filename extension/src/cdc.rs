@@ -65,11 +65,13 @@ fn kafgres_add_mapping(
     // transaction. Otherwise the worker creates it once the mapping commits; not an error,
     // but changes before the slot is ready are not captured.
     if !slot_exists() {
-        let late = if !running_transactions_finish(std::time::Duration::from_secs(1)) {
-            Some("a running transaction would hold the slot's creation".to_string())
-        } else {
-            create_slot().err()
-        };
+        let late = slot_preconditions().err().or_else(|| {
+            if !running_transactions_finish(std::time::Duration::from_secs(1)) {
+                Some("a running transaction would hold the slot's creation".to_string())
+            } else {
+                create_slot().err()
+            }
+        });
         if let Some(why) = late {
             warning!(
                 "kafgres: {why}; the mapping is saved, but changes before its slot is ready are \
@@ -345,6 +347,17 @@ fn slot_preconditions() -> Result<(), String> {
         );
     }
 
+    if let Some(max) = read_one::<i32>(
+        "SELECT CASE WHEN max <= (SELECT count(*) FROM pg_replication_slots) THEN max END
+           FROM (SELECT (SELECT setting::int FROM pg_settings
+                          WHERE name = 'max_replication_slots') AS max) s",
+        &[],
+    )? {
+        return Err(format!(
+            "cannot create the CDC slot: all {max} replication slots (max_replication_slots) are in use"
+        ));
+    }
+
     if read_one::<i64>("SELECT pg_current_xact_id_if_assigned()::text::bigint", &[])?.is_some() {
         return Err(
             "cannot create the CDC slot: this transaction has already been assigned an xid"
@@ -393,7 +406,7 @@ fn enabled_mappings_exist() -> bool {
     .unwrap_or(false)
 }
 
-/// Drop the slot once no enabled mapping has wanted it for `grace` (zero keeps it), since an
+/// Drop the slot once no mapping has wanted it for `grace` (zero keeps it), since an
 /// unwanted slot pins WAL. The wait spares a mapping still being added. `unused_since` is
 /// the worker's, kept between calls.
 pub fn drop_unused_slot(
@@ -406,9 +419,10 @@ pub fn drop_unused_slot(
     // Taken before reading the mappings, so any committed since are seen.
     let adding = !read_one::<bool>(&format!("SELECT pg_try_advisory_xact_lock({SLOT_KEEP_LOCK_KEY})"), &[])?
         .unwrap_or(false);
+    // A disabled mapping still wants it: disabling is a pause, and the slot keeps its changes.
     let wanted = adding
         || with_latest_snapshot(|| {
-            read_one::<bool>("SELECT EXISTS(SELECT 1 FROM kafgres_cdc_mappings WHERE enabled)", &[])
+            read_one::<bool>("SELECT EXISTS(SELECT 1 FROM kafgres_cdc_mappings)", &[])
         })?
         .unwrap_or(true);
     if wanted || !slot_exists() {
@@ -419,10 +433,19 @@ pub fn drop_unused_slot(
     if since.elapsed() < grace {
         return Ok(false);
     }
+    // Dropping a slot another session is reading raises; try again on a later pass.
+    let active = read_one::<bool>(
+        "SELECT (SELECT active FROM pg_replication_slots WHERE slot_name = $1)",
+        &[SLOT.into()],
+    )?
+    .unwrap_or(false);
+    if active {
+        return Ok(false);
+    }
     Spi::run_with_args("SELECT pg_drop_replication_slot($1)", &[SLOT.into()])
         .map_err(|e| format!("could not drop the unused CDC slot: {e}"))?;
     *unused_since = None;
-    log!("kafgres: dropped logical replication slot {SLOT:?}; no enabled mapping has wanted it for {} s",
+    log!("kafgres: dropped logical replication slot {SLOT:?}; no mapping has wanted it for {} s",
          grace.as_secs());
     Ok(true)
 }

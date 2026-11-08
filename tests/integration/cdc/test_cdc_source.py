@@ -225,7 +225,38 @@ def test_the_worker_does_not_drop_the_slot_under_a_mapping_being_added():
         sql("SELECT pg_reload_conf()")
         time.sleep(2)
 
-def test_the_worker_drops_a_slot_no_enabled_mapping_wants():
+def test_a_mapping_is_saved_with_a_warning_when_every_slot_is_taken():
+    free = int(sql("SELECT current_setting('max_replication_slots')::int "
+                   "- (SELECT count(*) FROM pg_replication_slots)"))
+    fillers = [f"filler_{i}" for i in range(free)]
+    try:
+        for name in fillers:
+            sql(f"SELECT pg_create_physical_replication_slot('{name}')")
+        out = psql("SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
+                   "$$jsonb_build_object('id', new.id)$$, NULL, NULL)")
+        assert out.returncode == 0, out.stderr[-500:]
+        assert "max_replication_slots" in out.stderr, out.stderr[-500:]
+        assert sql("SELECT count(*) FROM kafgres_cdc_mappings WHERE mapping_name = 'm1'") == "1"
+    finally:
+        for name in fillers:
+            sql(f"SELECT pg_drop_replication_slot('{name}')")
+
+def test_the_worker_keeps_the_slot_for_a_disabled_mapping():
+    set_guc("kafgres.cdc_unused_slot_ms", "1500")
+    set_guc("kafgres.cdc_interval_ms", "500")
+    try:
+        time.sleep(2)
+        add_mapping("jsonb_build_object('id', new.id)")
+        sql("UPDATE kafgres_cdc_mappings SET enabled = false")
+        time.sleep(4)
+        assert slot_count() == 1, "the slot went while a disabled mapping still wanted it"
+    finally:
+        set_guc("kafgres.cdc_interval_ms", "0")
+        sql("ALTER SYSTEM RESET kafgres.cdc_unused_slot_ms")
+        sql("SELECT pg_reload_conf()")
+        time.sleep(2)
+
+def test_the_worker_drops_a_slot_no_mapping_wants():
     set_guc("kafgres.cdc_unused_slot_ms", "1500")
     set_guc("kafgres.cdc_interval_ms", "500")
     try:

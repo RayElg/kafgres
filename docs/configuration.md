@@ -51,7 +51,7 @@ restart does.
 | Setting | Reload | Default | Description |
 |---|---|---|---|
 | `kafgres.cdc_interval_ms` | reload | `1000` | How often the CDC worker drains the logical replication slot; `0` disables draining. |
-| `kafgres.cdc_unused_slot_ms` | reload | `600000` | How long the CDC slot outlives its last enabled mapping before the worker drops it; `0` keeps it. Needs the worker draining (`cdc_interval_ms` above `0`). |
+| `kafgres.cdc_unused_slot_ms` | reload | `600000` | How long the CDC slot outlives its last mapping before the worker drops it; `0` keeps it. Needs the worker draining (`cdc_interval_ms` above `0`). |
 | `kafgres.cdc_batch_size` | reload | `10000` | Changes peeked from the CDC slot per drain. |
 | `kafgres.cdc_snapshot_batch_rows` | reload | `1000` | Source rows read per CDC snapshot batch; each batch is one transaction. |
 | `kafgres.cdc_chunk_bytes` | reload | `16 MiB` | Decoded change bytes the CDC drain buffers across all mappings; past it, the largest buffer renders. A larger transaction renders in several chunks, each in its own transaction, in commit order. |
