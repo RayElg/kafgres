@@ -325,10 +325,61 @@ pub fn forget_past(topic_id: u32, partition: i32, end: i64) -> Result<(), spi::E
     )
 }
 
-/// Offsets below the log end that recovery rescans. A crash loses only what was appended but
-/// not yet committed, which is the log's tail; a row commits after its batch, so a lost row
-/// can sit below another producer's committed one.
-const REBUILD_LOOKBACK: i64 = 50_000;
+/// How far below the log end a rebuild rescans, as (slack in ms before the newest batch's
+/// timestamp, fewest offsets, most offsets). A crash loses only what was appended but not yet
+/// committed, which is the log's tail; a row commits after its batch, so a lost row can sit
+/// below another producer's committed one. Strict commits lose only requests in flight; with
+/// `relaxed_produce_commit` the rows since the last WAL flush go too.
+fn rebuild_lookback() -> (i64, i64, i64) {
+    if !crate::relaxed_produce_commit() {
+        return (1_000, 1_000, 50_000);
+    }
+    let wal_delay_ms = crate::plan::get_one::<i64>(
+        "SELECT (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_writer_delay')",
+        &[],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(200);
+    ((3 * wal_delay_ms).max(5_000), 5_000, 2_000_000)
+}
+
+/// Where a rebuild starts: the offset `slack` before the log tail's timestamp, within the
+/// bounds. Client timestamps can be stale or ahead, so the bounds decide when they mislead.
+fn rebuild_start(
+    store: &dyn crate::storage::LogStore,
+    topic_id: u32,
+    partition: i32,
+    end: i64,
+) -> Result<i64, String> {
+    use kafgres_codec::records::RecordBatch;
+
+    let (slack_ms, fewest, most) = rebuild_lookback();
+    let nearest = end.saturating_sub(fewest);
+    let farthest = end.saturating_sub(most);
+    let tail = store
+        .read(topic_id, partition, end - 1, 1 << 20, crate::storage::IsolationLevel::ReadUncommitted)
+        .map_err(|e| e.to_string())?;
+    // The first batch of the slice, which holds `end - 1`; later appends may follow it.
+    let first_len = tail
+        .bytes
+        .get(kafgres_codec::records::LENGTH_OFFSET..kafgres_codec::records::LENGTH_OFFSET + 4)
+        .map(|b| i32::from_be_bytes(b.try_into().expect("4 bytes")).max(0) as usize)
+        .map(|len| kafgres_codec::records::LENGTH_OFFSET + 4 + len);
+    let Some(tail_ts) = first_len
+        .and_then(|n| tail.bytes.get(..n))
+        .and_then(|b| RecordBatch::new(kafgres_codec::bytes::Bytes::copy_from_slice(b)).ok())
+        .map(|b| b.max_timestamp())
+        .filter(|&t| t > slack_ms)
+    else {
+        return Ok(farthest);
+    };
+    let from = store
+        .offset_for_timestamp(topic_id, partition, tail_ts - slack_ms)
+        .map_err(|e| e.to_string())?
+        .map_or(nearest, |(offset, _)| offset);
+    Ok(from.clamp(farthest, nearest))
+}
 
 type Partitions = std::collections::HashSet<(u32, i32)>;
 
@@ -430,7 +481,11 @@ pub fn rebuild_window(
     let log_start = store
         .log_start_offset(topic_id, partition)
         .map_err(|e| e.to_string())?;
-    let mut at = end.saturating_sub(REBUILD_LOOKBACK).max(log_start);
+    let mut at = if end > log_start {
+        rebuild_start(store, topic_id, partition, end)?.max(log_start)
+    } else {
+        log_start
+    };
 
     // Per producer: (epoch, last_seq) of its newest row, `None` with no window here.
     let mut newest: HashMap<i64, Option<(i16, i32)>> = HashMap::new();
