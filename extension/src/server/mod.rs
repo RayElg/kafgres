@@ -1368,6 +1368,9 @@ fn raise_leader_epochs() -> bool {
             static PROCESS_BOOT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
             let mut boot = PROCESS_BOOT.load(Ordering::Relaxed);
             if boot == 0 {
+                // Flushed at commit even with asynchronous commit, or a crash could hand the
+                // next start this number along with the xids it reissues.
+                pgrx::Spi::run("SET LOCAL synchronous_commit = on")?;
                 boot = pgrx::Spi::get_one("SELECT nextval('kafgres_boot_seq')")?.unwrap_or(0);
                 PROCESS_BOOT.store(boot, Ordering::Relaxed);
             }

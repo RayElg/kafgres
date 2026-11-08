@@ -370,7 +370,14 @@ fn rebuild_start(
         .and_then(|n| tail.bytes.get(..n))
         .and_then(|b| RecordBatch::new(kafgres_codec::bytes::Bytes::copy_from_slice(b)).ok())
         .map(|b| b.max_timestamp())
-        .filter(|&t| t > slack_ms)
+        // One ahead by more than the slack would find little or nothing after it, the
+        // narrowest start.
+        .filter(|&t| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(i64::MAX, |d| d.as_millis() as i64);
+            t > slack_ms && t <= now.saturating_add(slack_ms)
+        })
     else {
         return Ok(farthest);
     };

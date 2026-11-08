@@ -540,7 +540,7 @@ pub extern "C-unwind" fn _PG_init() {
     );
     GucRegistry::define_int_guc(
         c"kafgres.cdc_unused_slot_ms",
-        c"How long the CDC slot outlives its last enabled mapping before the worker drops it; 0 keeps it",
+        c"How long the CDC slot outlives its last mapping before the worker drops it; 0 keeps it",
         c"",
         &CDC_UNUSED_SLOT_MS,
         0,
@@ -1111,6 +1111,8 @@ pub unsafe extern "C-unwind" fn kafgres_follower_worker_main(_arg: pg_sys::Datum
             Ok(_) => delay = Duration::from_millis(50),
             Err(e) => {
                 log!("kafgres: follower: {e}");
+                // A reading from before the failure would show a lag that may have grown since.
+                replication::clear_lag();
                 follower.disconnect();
                 delay = Duration::from_millis(500);
             }
