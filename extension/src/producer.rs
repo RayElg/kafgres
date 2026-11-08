@@ -332,6 +332,18 @@ const REBUILD_LOOKBACK: i64 = 50_000;
 
 type Partitions = std::collections::HashSet<(u32, i32)>;
 
+static STARTUP_END: std::sync::Mutex<Option<std::collections::HashMap<(u32, i32), i64>>> =
+    std::sync::Mutex::new(None);
+
+/// The log end when this process started, where a window rebuild looks back from.
+pub fn note_startup_end(topic_id: u32, partition: i32, end: i64) {
+    STARTUP_END
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert((topic_id, partition), end);
+}
+
 static WINDOW_REBUILT: std::sync::Mutex<Option<Partitions>> = std::sync::Mutex::new(None);
 
 thread_local! {
@@ -360,7 +372,9 @@ pub fn ensure_window(topic_id: u32, partition: i32) -> Result<(), String> {
         return Ok(());
     }
     let store = crate::storage::open();
-    rebuild_window(&*store, topic_id, partition)?;
+    rebuild_window(&*store, topic_id, partition).map_err(|e| {
+        format!("could not rebuild the idempotence window for topic {topic_id} partition {partition}: {e}")
+    })?;
 
     let first = REBUILT_PENDING.with(|p| {
         let mut p = p.borrow_mut();
@@ -400,9 +414,19 @@ pub fn rebuild_window(
     use kafgres_codec::records::{RecordBatch, LENGTH_OFFSET};
     use std::collections::HashMap;
 
+    // Only what the log held at startup can have lost a row; later appends were recorded.
     let end = store
         .high_watermark(topic_id, partition)
         .map_err(|e| e.to_string())?;
+    let end = match STARTUP_END
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&(topic_id, partition)))
+    {
+        Some(&at_start) => at_start.min(end),
+        None => end,
+    };
     let log_start = store
         .log_start_offset(topic_id, partition)
         .map_err(|e| e.to_string())?;

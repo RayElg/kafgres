@@ -1407,6 +1407,7 @@ fn raise_leader_epochs() -> bool {
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
                 crate::producer::forget_past(topic_id, partition, end)
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                crate::producer::note_startup_end(topic_id, partition, end);
             }
             Ok((highest, raised, boot))
         })
