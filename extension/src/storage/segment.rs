@@ -882,22 +882,6 @@ impl Drop for Rewrite {
 
 static PLANS: Mutex<Option<HashMap<(TopicId, i32), CleanPlan>>> = Mutex::new(None);
 
-/// Markers of batches compaction removed whose deletion failed, retried on the partition's next pass.
-static UNFORGOTTEN: Mutex<Option<HashMap<(TopicId, i32), Vec<i64>>>> = Mutex::new(None);
-
-/// Drop the markers of `bases` and of any earlier failure; keep them for a retry if that fails.
-fn forget_markers_or_retry(topic: TopicId, partition: i32, mut bases: Vec<i64>) {
-    let mut pending = UNFORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
-    let pending = pending.get_or_insert_with(HashMap::new);
-    if let Some(earlier) = pending.remove(&(topic, partition)) {
-        bases.extend(earlier);
-    }
-    if let Err(e) = pmeta::forget_markers(topic, partition, &bases) {
-        pgrx::log!("kafgres: could not drop the commit markers compaction removed, will retry: {e}");
-        pending.insert((topic, partition), bases);
-    }
-}
-
 enum Cleaned {
     Unchanged,
     /// Records removed, and the new layout generation.
@@ -1058,7 +1042,9 @@ impl SegmentStore {
         Ok(Some(
             match Self::swap_segment(topic, partition, &rw.info, rw.written == 0, generation)? {
                 Some(generation) => {
-                    forget_markers_or_retry(topic, partition, std::mem::take(&mut rw.dropped));
+                    if let Err(e) = pmeta::forget_markers(topic, partition, &rw.dropped) {
+                        pgrx::log!("kafgres: could not drop the commit markers compaction removed: {e}");
+                    }
                     Cleaned::Swapped(rw.removed, generation)
                 }
                 None => Cleaned::Abandoned,
@@ -1149,14 +1135,6 @@ impl SegmentStore {
     /// One bounded pass of this partition's plan, starting one if warranted. Nothing at or
     /// above `stable_end` (the LSO) is mapped. Returns records removed.
     fn compact_pass(topic: TopicId, partition: i32, stable_end: i64) -> StoreResult<u64> {
-        let retry = UNFORGOTTEN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_some_and(|p| p.contains_key(&(topic, partition)));
-        if retry {
-            forget_markers_or_retry(topic, partition, Vec::new());
-        }
         let limits = crate::config::compaction_limits(topic);
         let now = now_millis();
         let lag_cutoff = now - limits.min_compaction_lag_ms;
