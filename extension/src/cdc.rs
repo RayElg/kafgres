@@ -315,8 +315,9 @@ fn slot_preconditions() -> Result<(), String> {
         ));
     }
 
+    // `pg_settings`, not `current_setting`, which raises for a role that may not read it.
     if let Some(libs) = read_one::<String>(
-        "SELECT current_setting('output_plugin_libraries', true)",
+        "SELECT (SELECT setting FROM pg_settings WHERE name = 'output_plugin_libraries')",
         &[],
     )? {
         if !libs.split(',').any(|l| l.trim() == "kafgres") {
@@ -324,6 +325,18 @@ fn slot_preconditions() -> Result<(), String> {
                 "CDC needs 'kafgres' in output_plugin_libraries, which is {libs:?}"
             ));
         }
+    }
+
+    if !read_one::<bool>(
+        "SELECT (SELECT rolsuper OR rolreplication FROM pg_roles WHERE rolname = current_user)",
+        &[],
+    )?
+    .unwrap_or(false)
+    {
+        return Err(
+            "cannot create the CDC slot: this role needs the REPLICATION attribute or superuser"
+                .to_string(),
+        );
     }
 
     if read_one::<i64>("SELECT pg_current_xact_id_if_assigned()::text::bigint", &[])?.is_some() {

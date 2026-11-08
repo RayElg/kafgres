@@ -88,8 +88,21 @@ creation and deletion, ACLs, CDC mappings and slots, retention, archiving, resto
 checks, replication), so each needs an explicit `GRANT EXECUTE`. The exceptions are
 `kafgres_produce()` itself and the read-only reports: `kafgres_version()`,
 `kafgres_kafka_version()`, `kafgres_partition_offsets()`, `kafgres_archive_status()`,
-`kafgres_cdc_status()`, `kafgres_cdc_snapshots()` and `kafgres_share_state()`. On an
-install upgraded from 0.2.0 this takes effect at `ALTER EXTENSION kafgres UPDATE`.
+`kafgres_cdc_status()`, `kafgres_cdc_snapshots()`, `kafgres_share_state()` and
+`kafgres_follower_lag()`. On an install upgraded from 0.2.0 this takes effect at
+`ALTER EXTENSION kafgres UPDATE`.
+
+`kafgres_add_mapping` also creates the CDC slot, which Postgres allows only to a superuser
+or a role with the `REPLICATION` attribute. A role with `EXECUTE` on the function but
+neither still saves its mapping, with a warning, and the CDC worker creates the slot (see
+[CDC mappings](#cdc-mappings)). Use `ALTER ROLE ... REPLICATION` for a role that should
+create it. `kafgres_slot_ready()` and `kafgres_cdc_create_slot()` are administrative like
+the rest.
+
+```sql
+GRANT EXECUTE ON FUNCTION kafgres_add_mapping(text, text, text, text, text, text) TO cdc_admin;
+ALTER ROLE cdc_admin REPLICATION;   -- optional: lets kafgres_add_mapping create the slot itself
+```
 
 ### Engines
 
@@ -108,7 +121,8 @@ changes committed after the call returns are captured. A slot sees only WAL writ
 exists, so call it before the transaction has written anything, or in a transaction of its
 own. Creating a slot waits for every transaction that holds an xid to finish, so with one
 running the call does not wait. If the slot cannot be created (such a transaction is running,
-the transaction has already written, or `wal_level` is not `logical`) the mapping is saved
+the transaction has already written, the role lacks `REPLICATION` and is not a superuser
+([Who may produce](#who-may-produce)), or `wal_level` is not `logical`) the mapping is saved
 with a warning and the worker creates the slot later; changes before then are not captured.
 `kafgres_slot_ready()` waits until the slot is ready and returns `slot ready`, or
 `slot not ready` if its `timeout_ms` (120 s by default) passes first; a transaction left open

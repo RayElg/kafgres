@@ -190,6 +190,25 @@ def test_the_worker_drops_a_slot_no_enabled_mapping_wants():
         sql("SELECT pg_reload_conf()")
         time.sleep(2)
 
+def test_a_role_without_replication_saves_a_mapping_with_a_warning():
+    sql("DROP ROLE IF EXISTS mapper")
+    sql("CREATE ROLE mapper")
+    try:
+        sql("GRANT EXECUTE ON FUNCTION kafgres_add_mapping(text,text,text,text,text,text) TO mapper")
+        sql("GRANT SELECT ON kafgres_topics, src_orders TO mapper")
+        sql("GRANT SELECT, INSERT, UPDATE ON kafgres_cdc_mappings TO mapper")
+        out = psql("SET ROLE mapper; SELECT kafgres_add_mapping('m1', 'public.src_orders', "
+                   "'src-events', $$jsonb_build_object('id', new.id)$$, NULL, NULL)")
+        assert out.returncode == 0, out.stderr[-500:]
+        assert "REPLICATION" in out.stderr, out.stderr[-500:]
+        assert sql("SELECT count(*) FROM kafgres_cdc_mappings WHERE mapping_name = 'm1'") == "1"
+        assert slot_count() == 0
+    finally:
+        sql("DELETE FROM kafgres_cdc_mappings")
+        sql("REVOKE ALL ON kafgres_topics, src_orders, kafgres_cdc_mappings FROM mapper")
+        sql("REVOKE ALL ON FUNCTION kafgres_add_mapping(text,text,text,text,text,text) FROM mapper")
+        sql("DROP ROLE mapper")
+
 def test_a_mapping_to_a_missing_topic_leaves_no_slot():
     out = psql("SELECT kafgres_add_mapping('m1', 'public.src_orders', 'no-such-topic', "
                "$$jsonb_build_object('id', new.id)$$, NULL, NULL)")
