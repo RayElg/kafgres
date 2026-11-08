@@ -235,7 +235,7 @@ def main():
         assert sql("SELECT count(*) FROM kafgres_follower_lag()") == "0"
         assert sql("SELECT has_function_privilege('public', 'kafgres_slot_ready(int)', "
                    "'EXECUTE')") == "f", "the update left kafgres_slot_ready() public"
-        assert sql("SELECT kafgres_slot_ready(0)") == "f"
+        assert sql("SELECT kafgres_slot_ready(0)") == "slot not ready"
         restart()
         after = snapshot(args.engine)
         for topic in ("up-plain", "up-sql"):

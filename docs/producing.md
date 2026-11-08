@@ -110,10 +110,13 @@ own. Creating a slot waits for every transaction that holds an xid to finish, so
 running the call does not wait. If the slot cannot be created (such a transaction is running,
 the transaction has already written, or `wal_level` is not `logical`) the mapping is saved
 with a warning and the worker creates the slot later; changes before then are not captured.
-`kafgres_slot_ready()` waits until the slot is ready (up to its `timeout_ms`, 60 s by
-default) and returns whether it is; `kafgres_cdc_create_slot()` creates it and waits. A slot with no mapping holds WAL until one is added
-or `kafgres_cdc_drop_slot()` removes it, so drop it if the mapping is abandoned after a
-rolled-back call.
+`kafgres_slot_ready()` waits until the slot is ready and returns `slot ready`, or
+`slot not ready` if its `timeout_ms` (120 s by default) passes first; a transaction left open
+that long keeps the slot from being ready, and the answer says so rather than guessing.
+`kafgres_cdc_create_slot()` creates the slot and waits. A slot nothing wants holds WAL, so
+the worker drops it once no enabled mapping has existed for `kafgres.cdc_unused_slot_ms`
+(10 minutes by default; `0` keeps it), for instance after a rolled-back `kafgres_add_mapping`
+or the last `kafgres_remove_mapping`. `kafgres_cdc_drop_slot()` drops it at once.
 
 The examples assume a `public.orders (id int, customer_id int, total numeric, status
 text)` table and a `customers (id int, name text, tier text)` lookup table.

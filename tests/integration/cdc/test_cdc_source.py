@@ -162,13 +162,33 @@ def test_a_mapping_does_not_wait_for_a_running_transaction_to_create_the_slot():
         assert "WARNING" in out.stderr, out.stderr[-500:]
         assert "kafgres_slot_ready" in out.stderr, "the warning does not say how to wait for it"
         assert sql("SELECT count(*) FROM kafgres_cdc_mappings WHERE mapping_name = 'm1'") == "1"
-        assert sql("SELECT kafgres_slot_ready(0)") == "f"
+        assert sql("SELECT kafgres_slot_ready(0)") == "slot not ready"
     finally:
         holder.wait(timeout=30)
     start_slot()
-    assert sql("SELECT kafgres_slot_ready(1000)") == "t"
+    assert sql("SELECT kafgres_slot_ready(1000)") == "slot ready"
     sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
     assert drain() == 1
+
+def test_the_worker_drops_a_slot_no_enabled_mapping_wants():
+    set_guc("kafgres.cdc_unused_slot_ms", "1500")
+    set_guc("kafgres.cdc_interval_ms", "500")
+    try:
+        time.sleep(2)
+        add_mapping("jsonb_build_object('id', new.id)")
+        assert slot_count() == 1
+        time.sleep(4)
+        assert slot_count() == 1, "the slot went while a mapping wanted it"
+        sql("SELECT kafgres_remove_mapping('m1')")
+        deadline = time.time() + 20
+        while slot_count() and time.time() < deadline:
+            time.sleep(0.5)
+        assert slot_count() == 0, "the slot outlived its last mapping"
+    finally:
+        set_guc("kafgres.cdc_interval_ms", "0")
+        sql("ALTER SYSTEM RESET kafgres.cdc_unused_slot_ms")
+        sql("SELECT pg_reload_conf()")
+        time.sleep(2)
 
 def test_a_mapping_to_a_missing_topic_leaves_no_slot():
     out = psql("SELECT kafgres_add_mapping('m1', 'public.src_orders', 'no-such-topic', "

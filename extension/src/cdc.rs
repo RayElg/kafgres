@@ -358,6 +358,37 @@ fn enabled_mappings_exist() -> bool {
     .unwrap_or(false)
 }
 
+/// Drop the slot once no enabled mapping has wanted it for `grace` (zero keeps it), since an
+/// unwanted slot pins WAL. The wait spares a mapping still being added. `unused_since` is
+/// the worker's, kept between calls.
+pub fn drop_unused_slot(
+    unused_since: &mut Option<std::time::Instant>,
+    grace: std::time::Duration,
+) -> Result<bool, String> {
+    if grace.is_zero() {
+        return Ok(false);
+    }
+    let wanted = read_one::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM kafgres_cdc_mappings WHERE enabled)",
+        &[],
+    )?
+    .unwrap_or(true);
+    if wanted || !slot_exists() {
+        *unused_since = None;
+        return Ok(false);
+    }
+    let since = *unused_since.get_or_insert_with(std::time::Instant::now);
+    if since.elapsed() < grace {
+        return Ok(false);
+    }
+    Spi::run_with_args("SELECT pg_drop_replication_slot($1)", &[SLOT.into()])
+        .map_err(|e| format!("could not drop the unused CDC slot: {e}"))?;
+    *unused_since = None;
+    log!("kafgres: dropped logical replication slot {SLOT:?}; no enabled mapping has wanted it for {} s",
+         grace.as_secs());
+    Ok(true)
+}
+
 pub fn ensure_slot() -> Result<bool, String> {
     if slot_exists() {
         return Ok(true);
@@ -1540,11 +1571,11 @@ fn kafgres_cdc_create_slot() -> bool {
     }
 }
 
-/// Wait until the slot is ready to capture, `false` if `timeout_ms` passes first. The slot
-/// is created by `kafgres_add_mapping`, or by the worker once the transactions it waits on
-/// finish. Creates nothing itself.
+/// Wait until the slot is ready to capture: "slot ready", or "slot not ready" once
+/// `timeout_ms` passes. The slot is created by `kafgres_add_mapping`, or by the worker once
+/// the transactions it waits on finish. Creates nothing itself.
 #[pg_extern]
-fn kafgres_slot_ready(timeout_ms: default!(i32, 60000)) -> bool {
+fn kafgres_slot_ready(timeout_ms: default!(i32, 120000)) -> &'static str {
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
     loop {
@@ -1556,10 +1587,10 @@ fn kafgres_slot_ready(timeout_ms: default!(i32, 60000)) -> bool {
         .unwrap_or_else(|e| error!("kafgres: {e}"))
         .unwrap_or(false);
         if ready {
-            return true;
+            return "slot ready";
         }
         if std::time::Instant::now() >= deadline {
-            return false;
+            return "slot not ready";
         }
         pgrx::check_for_interrupts!();
         std::thread::sleep(std::time::Duration::from_millis(100));
