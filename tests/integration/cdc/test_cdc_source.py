@@ -170,6 +170,61 @@ def test_a_mapping_does_not_wait_for_a_running_transaction_to_create_the_slot():
     sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
     assert drain() == 1
 
+def test_a_mapping_creates_the_slot_among_short_transactions():
+    busy = subprocess.Popen(
+        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
+         "DO $$ BEGIN FOR i IN 1..120 LOOP PERFORM pg_current_xact_id(); "
+         "PERFORM pg_sleep(0.05); COMMIT; END LOOP; END $$"],
+        cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(1)
+        out = psql("SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
+                   "$$jsonb_build_object('id', new.id)$$, 'new.id::text', NULL)")
+        assert out.returncode == 0, out.stderr[-500:]
+        assert "WARNING" not in out.stderr, out.stderr[-500:]
+        assert sql("SELECT kafgres_slot_ready(0)") == "slot ready"
+    finally:
+        busy.wait(timeout=30)
+    sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
+    assert drain() == 1
+
+def test_slot_ready_answers_at_once_in_a_transaction_that_wrote():
+    t0 = time.monotonic()
+    out = psql("BEGIN; INSERT INTO src_orders VALUES (1,1,1,'x','x'); "
+               "SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
+               "$$jsonb_build_object('id', new.id)$$, NULL, NULL); "
+               "SELECT kafgres_slot_ready(); COMMIT")
+    assert out.returncode == 0, out.stderr[-500:]
+    assert time.monotonic() - t0 < 5, "kafgres_slot_ready waited on its own transaction"
+    assert "slot not ready" in out.stdout
+    assert "after it commits" in out.stderr, out.stderr[-500:]
+
+def test_the_worker_does_not_drop_the_slot_under_a_mapping_being_added():
+    set_guc("kafgres.cdc_unused_slot_ms", "1500")
+    set_guc("kafgres.cdc_interval_ms", "500")
+    try:
+        time.sleep(2)
+        add_mapping("jsonb_build_object('id', new.id)")
+        sql("SELECT kafgres_remove_mapping('m1')")
+        adding = subprocess.Popen(
+            ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
+             "BEGIN; SELECT kafgres_add_mapping('m2', 'public.src_orders', 'src-events', "
+             "$$jsonb_build_object('id', new.id)$$, 'new.id::text', NULL); "
+             "SELECT pg_sleep(5); COMMIT"],
+            cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(4)
+            assert slot_count() == 1, "the slot went while a mapping was being added"
+        finally:
+            adding.wait(timeout=30)
+        time.sleep(3)
+        assert slot_count() == 1, "the slot went after the mapping committed"
+    finally:
+        set_guc("kafgres.cdc_interval_ms", "0")
+        sql("ALTER SYSTEM RESET kafgres.cdc_unused_slot_ms")
+        sql("SELECT pg_reload_conf()")
+        time.sleep(2)
+
 def test_the_worker_drops_a_slot_no_enabled_mapping_wants():
     set_guc("kafgres.cdc_unused_slot_ms", "1500")
     set_guc("kafgres.cdc_interval_ms", "500")

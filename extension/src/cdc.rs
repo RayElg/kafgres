@@ -9,6 +9,9 @@ pub const SLOT: &str = "kafgres_cdc";
 const SLOT_CREATE_LOCK_KEY: i64 = 0x7047_4B41_0000_0002u64 as i64;
 /// Held for a whole drain: two drains peek the same changes and fight over the slot advance.
 const DRAIN_LOCK_KEY: i64 = 0x7047_4B41_0000_0003u64 as i64;
+/// Held shared by `kafgres_add_mapping` until its transaction ends, so the worker does not drop
+/// the slot under a mapping it cannot see yet.
+const SLOT_KEEP_LOCK_KEY: i64 = 0x7047_4B41_0000_0007u64 as i64;
 
 /// Net of batch framing and varints, so a record at the limit still forms a within-limit batch.
 const MAX_RECORD_BYTES: usize =
@@ -55,11 +58,14 @@ fn kafgres_add_mapping(
 
     render_check(source_table, value_expr, key_expr, filter_expr);
 
-    // Created here, before this transaction writes, only when that cannot wait on another
+    read_one::<String>(&format!("SELECT pg_advisory_xact_lock_shared({SLOT_KEEP_LOCK_KEY})::text"), &[])
+        .unwrap_or_else(|e| error!("kafgres: {e}"));
+
+    // Created here, before this transaction writes, unless that would wait on a long
     // transaction. Otherwise the worker creates it once the mapping commits; not an error,
     // but changes before the slot is ready are not captured.
     if !slot_exists() {
-        let late = if transactions_with_xids_running() {
+        let late = if !running_transactions_finish(std::time::Duration::from_secs(1)) {
             Some("a running transaction would hold the slot's creation".to_string())
         } else {
             create_slot().err()
@@ -348,17 +354,33 @@ fn slot_preconditions() -> Result<(), String> {
     Ok(())
 }
 
-/// Slot creation waits for these to finish. Reads the latest snapshot and assigns no xid.
-fn transactions_with_xids_running() -> bool {
-    with_latest_snapshot(|| {
-        read_one::<bool>(
-            "SELECT EXISTS(SELECT 1 FROM pg_snapshot_xip(pg_current_snapshot()))",
-            &[],
+/// Slot creation waits for the transactions holding an xid. If the ones running now finish
+/// within `within`, those it waits on are likely as short. Assigns no xid.
+fn running_transactions_finish(within: std::time::Duration) -> bool {
+    let Ok(Some(running)) =
+        with_latest_snapshot(|| read_one::<String>("SELECT pg_current_snapshot()::text", &[]))
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let finished = read_one::<bool>(
+            "SELECT NOT EXISTS(SELECT 1 FROM pg_snapshot_xip($1::pg_snapshot) x
+                                WHERE pg_xact_status(x) = 'in progress')",
+            &[running.as_str().into()],
         )
-    })
-    .ok()
-    .flatten()
-    .unwrap_or(true)
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        if finished {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        pgrx::check_for_interrupts!();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 fn enabled_mappings_exist() -> bool {
@@ -381,11 +403,14 @@ pub fn drop_unused_slot(
     if grace.is_zero() {
         return Ok(false);
     }
-    let wanted = read_one::<bool>(
-        "SELECT EXISTS(SELECT 1 FROM kafgres_cdc_mappings WHERE enabled)",
-        &[],
-    )?
-    .unwrap_or(true);
+    // Taken before reading the mappings, so any committed since are seen.
+    let adding = !read_one::<bool>(&format!("SELECT pg_try_advisory_xact_lock({SLOT_KEEP_LOCK_KEY})"), &[])?
+        .unwrap_or(false);
+    let wanted = adding
+        || with_latest_snapshot(|| {
+            read_one::<bool>("SELECT EXISTS(SELECT 1 FROM kafgres_cdc_mappings WHERE enabled)", &[])
+        })?
+        .unwrap_or(true);
     if wanted || !slot_exists() {
         *unused_since = None;
         return Ok(false);
@@ -1589,6 +1614,10 @@ fn kafgres_cdc_create_slot() -> bool {
 /// the transactions it waits on finish. Creates nothing itself.
 #[pg_extern]
 fn kafgres_slot_ready(timeout_ms: default!(i32, 120000)) -> &'static str {
+    // The slot waits for this transaction, and its mapping is not visible to the worker yet.
+    let wrote = read_one::<i64>("SELECT pg_current_xact_id_if_assigned()::text::bigint", &[])
+        .unwrap_or_else(|e| error!("kafgres: {e}"))
+        .is_some();
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
     loop {
@@ -1601,6 +1630,13 @@ fn kafgres_slot_ready(timeout_ms: default!(i32, 120000)) -> &'static str {
         .unwrap_or(false);
         if ready {
             return "slot ready";
+        }
+        if wrote {
+            warning!(
+                "kafgres: the slot cannot be ready before this transaction ends, since it has \
+                 written; call kafgres_slot_ready() after it commits"
+            );
+            return "slot not ready";
         }
         if std::time::Instant::now() >= deadline {
             return "slot not ready";
