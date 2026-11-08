@@ -512,7 +512,8 @@ pub fn rebuild_window(
             pos += total;
             let Ok(batch) = RecordBatch::new(bytes) else { continue };
             let (pid, epoch, first) = (batch.producer_id(), batch.producer_epoch(), batch.base_sequence());
-            if pid < 0 || epoch < 0 || first < 0 || batch.is_control() || batch.base_offset() < at {
+            // A batch straddling the start is read whole and kept: it may be the newest one.
+            if pid < 0 || epoch < 0 || first < 0 || batch.is_control() {
                 continue;
             }
             let last = increment_sequence(first, batch.last_offset_delta());
