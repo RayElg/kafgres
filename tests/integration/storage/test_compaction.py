@@ -619,3 +619,28 @@ def test_batches_larger_than_segment_bytes_still_compact(byte_arm_topic):
     assert len(got) < 2000, f"{len(got)} of 2000 records readable: nothing was compacted"
     latest = {k: int(o) for o, k in got}
     assert len(latest) == 50, f"a key was lost: {len(latest)} keys"
+
+@pytest.mark.skipif(engine() != "segment", reason="kafgres_produce() is segment engine only")
+def test_retention_forgets_a_large_marker_backlog_over_several_passes(topic):
+    """Markers below the log start are deleted a bounded number per pass, so a backlog
+    cannot outlast the statement timeout and keep the log start from moving."""
+    sql("ALTER SYSTEM SET kafgres.segment_bytes = 1048576")
+    sql("SELECT pg_reload_conf()")
+    time.sleep(0.5)
+    sql(f"SELECT count(kafgres_produce('{topic}', 'k', i::text)) FROM generate_series(1, 45000) i")
+    below = (f"""SELECT count(*) FROM kafgres_markers m
+                  JOIN kafgres_topics t ON t.topic_id = m.topic_id
+                  JOIN kafgres_partitions p ON p.topic_id = m.topic_id AND p.partition = m.partition
+                 WHERE t.name = '{topic}' AND m.last_offset < p.log_start_offset""")
+    log_start = f"""SELECT p.log_start_offset FROM kafgres_partitions p
+                      JOIN kafgres_topics t USING (topic_id) WHERE t.name = '{topic}'"""
+    assert kafka_tool("kafka-configs.sh", "--entity-type", "topics", "--entity-name", topic,
+                      "--alter", "--add-config", "retention.ms=1").returncode == 0
+    time.sleep(2)
+    compact()
+    moved = int(sql(log_start))
+    assert moved > 20_000, f"retention moved the log start only to {moved}"
+    assert int(sql(below)) == moved - 20_000, "the first pass did not forget a bounded number"
+    for _ in range(moved // 20_000):
+        compact()
+    assert int(sql(below)) == 0, "later passes did not forget the rest"

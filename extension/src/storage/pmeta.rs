@@ -204,6 +204,8 @@ pub fn partitions(topic: TopicId) -> StoreResult<Vec<i32>> {
     .map_err(spi_err)
 }
 
+const MARKERS_FORGOTTEN_PER_PASS: i64 = 20_000;
+
 /// Move `log_start_offset` forward. Never backward — a consumer that has been told an
 pub fn advance_log_start(topic: TopicId, partition: i32, offset: i64) -> StoreResult<()> {
     Spi::run_with_args(
@@ -214,11 +216,16 @@ pub fn advance_log_start(topic: TopicId, partition: i32, offset: i64) -> StoreRe
     .map_err(spi_err)?;
     // Batches wholly below the log start are unreadable. The `base_offset` bound is implied by
     // `last_offset` but lets the planner use the primary key's range instead of scanning.
+    // Bounded, so a backlog cannot outlast the statement timeout; every retention pass calls
+    // this, and the rest goes on later passes.
     Spi::run_with_args(
         "DELETE FROM kafgres_markers
-          WHERE topic_id = $1::oid AND partition = $2
-            AND base_offset < $3 AND last_offset < $3",
-        &[(topic as i32).into(), partition.into(), offset.into()],
+          WHERE topic_id = $1::oid AND partition = $2 AND last_offset < $3
+            AND base_offset < LEAST($3, (SELECT base_offset FROM kafgres_markers
+                                          WHERE topic_id = $1::oid AND partition = $2
+                                            AND base_offset < $3
+                                          ORDER BY base_offset OFFSET $4 LIMIT 1))",
+        &[(topic as i32).into(), partition.into(), offset.into(), MARKERS_FORGOTTEN_PER_PASS.into()],
     )
     .map_err(spi_err)?;
     // The abort index describes offsets; when they go its entries are dead, and this is
@@ -497,13 +504,14 @@ pub fn forget_aborted_below(topic: TopicId, partition: i32, offset: i64) -> Stor
 
 /// Markers of batches compaction removed.
 pub fn forget_markers(topic: TopicId, partition: i32, bases: &[i64]) -> StoreResult<()> {
-    if bases.is_empty() {
-        return Ok(());
+    // In pieces, so no one statement nears the statement timeout.
+    for chunk in bases.chunks(10_000) {
+        Spi::run_with_args(
+            "DELETE FROM kafgres_markers
+              WHERE topic_id = $1::oid AND partition = $2 AND base_offset = ANY($3)",
+            &[(topic as i32).into(), partition.into(), chunk.to_vec().into()],
+        )
+        .map_err(spi_err)?;
     }
-    Spi::run_with_args(
-        "DELETE FROM kafgres_markers
-          WHERE topic_id = $1::oid AND partition = $2 AND base_offset = ANY($3)",
-        &[(topic as i32).into(), partition.into(), bases.to_vec().into()],
-    )
-    .map_err(spi_err)
+    Ok(())
 }
