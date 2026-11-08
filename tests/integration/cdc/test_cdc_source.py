@@ -147,6 +147,29 @@ def test_a_drain_is_not_held_up_by_a_mapping_transaction_left_open():
     sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
     assert drain() == 1, "a change after the mapping committed was not captured"
 
+def test_a_mapping_does_not_wait_for_a_running_transaction_to_create_the_slot():
+    holder = subprocess.Popen(
+        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
+         "BEGIN; SELECT pg_current_xact_id(); SELECT pg_sleep(8); COMMIT"],
+        cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(1.5)
+        t0 = time.monotonic()
+        out = psql("SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
+                   "$$jsonb_build_object('id', new.id)$$, 'new.id::text', NULL)")
+        assert out.returncode == 0, out.stderr[-500:]
+        assert time.monotonic() - t0 < 4, "the mapping waited for the open transaction"
+        assert "WARNING" in out.stderr, out.stderr[-500:]
+        assert "kafgres_slot_ready" in out.stderr, "the warning does not say how to wait for it"
+        assert sql("SELECT count(*) FROM kafgres_cdc_mappings WHERE mapping_name = 'm1'") == "1"
+        assert sql("SELECT kafgres_slot_ready(0)") == "f"
+    finally:
+        holder.wait(timeout=30)
+    start_slot()
+    assert sql("SELECT kafgres_slot_ready(1000)") == "t"
+    sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
+    assert drain() == 1
+
 def test_a_mapping_to_a_missing_topic_leaves_no_slot():
     out = psql("SELECT kafgres_add_mapping('m1', 'public.src_orders', 'no-such-topic', "
                "$$jsonb_build_object('id', new.id)$$, NULL, NULL)")

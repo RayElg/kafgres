@@ -106,9 +106,12 @@ A mapping copies changes from a table to a topic through the WAL. You register i
 `kafgres_add_mapping` creates the logical replication slot if it does not exist yet, so
 changes committed after the call returns are captured. A slot sees only WAL written after it
 exists, so call it before the transaction has written anything, or in a transaction of its
-own. If the slot cannot be created (the transaction has already written, or `wal_level` is
-not `logical`) the mapping is saved with a warning and the worker creates the slot later;
-changes before then are not captured. A slot with no mapping holds WAL until one is added
+own. Creating a slot waits for every transaction that holds an xid to finish, so with one
+running the call does not wait. If the slot cannot be created (such a transaction is running,
+the transaction has already written, or `wal_level` is not `logical`) the mapping is saved
+with a warning and the worker creates the slot later; changes before then are not captured.
+`kafgres_slot_ready()` waits until the slot is ready (up to its `timeout_ms`, 60 s by
+default) and returns whether it is; `kafgres_cdc_create_slot()` creates it and waits. A slot with no mapping holds WAL until one is added
 or `kafgres_cdc_drop_slot()` removes it, so drop it if the mapping is abandoned after a
 rolled-back call.
 
@@ -131,6 +134,7 @@ SELECT kafgres_add_mapping(
     key_expr    => $$ new.id::text $$,
     filter_expr => $$ new.status = 'placed' AND old.status IS DISTINCT FROM 'placed' $$
 );
+-- SELECT kafgres_slot_ready();  -- optional: blocks until the CDC slot is ready after the first mapping is added
 ```
 
 A background worker drains a logical replication slot fed by kafgres's own output
@@ -280,6 +284,7 @@ SELECT kafgres_add_mapping('txns', 'kafgres.transaction', 'my-transactions',
                        'event_count', event_count,
                        'data_collections', data_collections)$$,
   $$xid::text$$, NULL);
+-- SELECT kafgres_slot_ready();  -- optional: blocks until the CDC slot is ready after the first mapping is added
 ```
 
 `xid` on each change lets a consumer group the changes of one commit; the summary tells

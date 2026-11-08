@@ -189,6 +189,7 @@ SELECT kafgres_add_mapping(
                                        FROM customers c WHERE c.id = new.customer_id)) $$,
     key_expr    => $$ new.id::text $$,
     filter_expr => $$ new.status = 'placed' $$);
+-- SELECT kafgres_slot_ready();  -- optional: blocks until the CDC slot is ready after the first mapping is added
 ```
 
 A background worker drains a logical replication slot fed by kafgres's own output plugin,

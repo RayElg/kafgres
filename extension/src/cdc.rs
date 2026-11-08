@@ -55,12 +55,20 @@ fn kafgres_add_mapping(
 
     render_check(source_table, value_expr, key_expr, filter_expr);
 
-    // The slot must exist before the mapping commits, and before this transaction writes.
+    // Created here, before this transaction writes, only when that cannot wait on another
+    // transaction. Otherwise the worker creates it once the mapping commits; not an error,
+    // but changes before the slot is ready are not captured.
     if !slot_exists() {
-        // Not an error: the worker creates the slot once the mapping commits, and changes
-        // before then are not captured.
-        if let Err(e) = create_slot() {
-            warning!("kafgres: {e}; the mapping is saved, but changes before its slot exists are not captured");
+        let late = if transactions_with_xids_running() {
+            Some("a running transaction would hold the slot's creation".to_string())
+        } else {
+            create_slot().err()
+        };
+        if let Some(why) = late {
+            warning!(
+                "kafgres: {why}; the mapping is saved, but changes before its slot is ready are \
+                 not captured (kafgres_slot_ready() waits for it)"
+            );
         }
     }
 
@@ -325,6 +333,19 @@ fn slot_preconditions() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Slot creation waits for these to finish. Reads the latest snapshot and assigns no xid.
+fn transactions_with_xids_running() -> bool {
+    with_latest_snapshot(|| {
+        read_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_snapshot_xip(pg_current_snapshot()))",
+            &[],
+        )
+    })
+    .ok()
+    .flatten()
+    .unwrap_or(true)
 }
 
 fn enabled_mappings_exist() -> bool {
@@ -1516,6 +1537,32 @@ fn kafgres_cdc_create_slot() -> bool {
     match ensure_slot() {
         Ok(created) => created,
         Err(e) => error!("kafgres: {e}"),
+    }
+}
+
+/// Wait until the slot is ready to capture, `false` if `timeout_ms` passes first. The slot
+/// is created by `kafgres_add_mapping`, or by the worker once the transactions it waits on
+/// finish. Creates nothing itself.
+#[pg_extern]
+fn kafgres_slot_ready(timeout_ms: default!(i32, 60000)) -> bool {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    loop {
+        let ready = read_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots
+                            WHERE slot_name = $1 AND confirmed_flush_lsn IS NOT NULL)",
+            &[SLOT.into()],
+        )
+        .unwrap_or_else(|e| error!("kafgres: {e}"))
+        .unwrap_or(false);
+        if ready {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        pgrx::check_for_interrupts!();
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
