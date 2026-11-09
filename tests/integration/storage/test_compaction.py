@@ -644,3 +644,34 @@ def test_retention_forgets_a_large_marker_backlog_over_several_passes(topic):
     for _ in range(moved // 20_000):
         compact()
     assert int(sql(below)) == 0, "later passes did not forget the rest"
+
+@pytest.mark.skipif(engine() != "segment", reason="kafgres_produce() is segment engine only")
+def test_markers_below_a_delete_records_go_on_a_topic_kept_forever(topic):
+    """With no time or size limit retention reclaims nothing itself, but DeleteRecords still
+    moves the log start, and later passes forget the markers left below it."""
+    import json
+    import tempfile
+
+    assert kafka_tool("kafka-configs.sh", "--entity-type", "topics", "--entity-name", topic,
+                      "--alter", "--add-config", "retention.ms=-1").returncode == 0
+    sql(f"SELECT count(kafgres_produce('{topic}', 'k', i::text)) FROM generate_series(1, 25000) i")
+    spec = {"partitions": [{"topic": topic, "partition": 0, "offset": 24000}], "version": 1}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "offsets.json")
+        with open(path, "w") as f:
+            json.dump(spec, f)
+        os.chmod(d, 0o755)
+        os.chmod(path, 0o644)
+        out = subprocess.run(
+            ["docker", "run", "--rm", "--network", "host", "-v", f"{d}:/w", KAFKA,
+             "/opt/kafka/bin/kafka-delete-records.sh", "--bootstrap-server", BROKER,
+             "--offset-json-file", "/w/offsets.json"],
+            capture_output=True, text=True, timeout=300,
+        )
+    assert out.returncode == 0, out.stderr
+    below = f"""SELECT count(*) FROM kafgres_markers m
+                  JOIN kafgres_topics t ON t.topic_id = m.topic_id
+                 WHERE t.name = '{topic}' AND m.last_offset < 24000"""
+    assert int(sql(below)) == 4000, "DeleteRecords did not forget a bounded number"
+    compact()
+    assert int(sql(below)) == 0, "a retention pass did not forget the rest"

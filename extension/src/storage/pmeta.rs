@@ -214,10 +214,16 @@ pub fn advance_log_start(topic: TopicId, partition: i32, offset: i64) -> StoreRe
         &[(topic as i32).into(), partition.into(), offset.into()],
     )
     .map_err(spi_err)?;
-    // Batches wholly below the log start are unreadable. The `base_offset` bound is implied by
-    // `last_offset` but lets the planner use the primary key's range instead of scanning.
-    // Bounded, so a backlog cannot outlast the statement timeout; every retention pass calls
-    // this, and the rest goes on later passes.
+    forget_markers_below(topic, partition, offset)?;
+    // The abort index describes offsets; when they go its entries are dead, and this is
+    forget_aborted_below(topic, partition, offset)
+}
+
+/// Batches wholly below the log start are unreadable. Bounded, so a backlog cannot outlast
+/// the statement timeout; every retention pass calls this, and the rest goes on later
+/// passes. The `base_offset` bound is implied by `last_offset` but lets the planner use the
+/// primary key's range instead of scanning.
+pub fn forget_markers_below(topic: TopicId, partition: i32, offset: i64) -> StoreResult<()> {
     Spi::run_with_args(
         "DELETE FROM kafgres_markers
           WHERE topic_id = $1::oid AND partition = $2 AND last_offset < $3
@@ -227,9 +233,7 @@ pub fn advance_log_start(topic: TopicId, partition: i32, offset: i64) -> StoreRe
                                           ORDER BY base_offset OFFSET $4 LIMIT 1))",
         &[(topic as i32).into(), partition.into(), offset.into(), MARKERS_FORGOTTEN_PER_PASS.into()],
     )
-    .map_err(spi_err)?;
-    // The abort index describes offsets; when they go its entries are dead, and this is
-    forget_aborted_below(topic, partition, offset)
+    .map_err(spi_err)
 }
 
 /// Cap on markers loaded per Fetch. Without it a `read_committed` consumer far behind the
