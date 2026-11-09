@@ -657,6 +657,32 @@ def test_retention_forgets_a_large_marker_backlog_over_several_passes(topic, no_
     assert int(sql(below)) == 0, "later passes did not forget the rest"
 
 @pytest.mark.skipif(engine() != "segment", reason="kafgres_produce() is segment engine only")
+def test_a_committed_read_passes_a_long_run_of_markers_left_by_compaction(topic, no_background_sweep):
+    """Markers whose batches compaction removed, more than one read looks at, as a lost
+    cleanup leaves them: a read_committed consumer still reaches the records after them."""
+    sql("ALTER SYSTEM SET kafgres.segment_offsets = 8000")
+    sql("ALTER SYSTEM SET kafgres.segment_bytes = 1048576")
+    sql("SELECT pg_reload_conf()")
+    time.sleep(0.5)
+    make_compacted(topic)
+    sql(f"SELECT count(kafgres_produce('{topic}', 'k', i::text)) FROM generate_series(1, 70000) i")
+    sql(f"SELECT count(kafgres_produce('{topic}', 'z' || i, i::text)) FROM generate_series(1, 9000) i")
+    ours = f"m.topic_id = (SELECT topic_id FROM kafgres_topics WHERE name = '{topic}')"
+    sql(f"DROP TABLE IF EXISTS saved_markers; "
+        f"CREATE TABLE saved_markers AS SELECT * FROM kafgres_markers m WHERE {ours}")
+    try:
+        for _ in range(3):
+            compact()
+        restored = int(sql("WITH r AS (INSERT INTO kafgres_markers SELECT * FROM saved_markers "
+                           "ON CONFLICT DO NOTHING RETURNING 1) SELECT count(*) FROM r"))
+        assert restored > 65_536, f"compaction removed only {restored} batches"
+        got = read_back(topic)
+        assert "k" in {line.split()[1] for line in got}, "the newest k was not read"
+        assert len({line.split()[1] for line in got if line.split()[1].startswith("z")}) == 9000
+    finally:
+        sql("DROP TABLE IF EXISTS saved_markers")
+
+@pytest.mark.skipif(engine() != "segment", reason="kafgres_produce() is segment engine only")
 @pytest.mark.parametrize("config", ["retention.ms=-1", "cleanup.policy=compact"])
 def test_markers_below_a_delete_records_go_on_a_topic_kept_forever(topic, no_background_sweep, config):
     """With no time or size limit retention reclaims nothing itself, but DeleteRecords still

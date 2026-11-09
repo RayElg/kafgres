@@ -309,7 +309,8 @@ pub fn fetch_from(
 
     // Against the last stable offset, not the high watermark: the follower copies only what
     // has committed, so an open transaction is not lag. A partition the leader did not
-    // answer, or answered with an error, leaves the reading incomplete.
+    // answer, answered with an error, or left without offsets once its response budget ran
+    // out, leaves the reading incomplete.
     let mut lag = 0i64;
     let mut complete = true;
     for (_, name, partition, from, _) in want {
@@ -320,7 +321,7 @@ pub fn fetch_from(
             .flat_map(|t| t.partitions.iter())
             .find(|p| p.partition_index == *partition);
         match part {
-            Some(p) if p.error_code == 0 => {
+            Some(p) if p.error_code == 0 && p.high_watermark >= 0 => {
                 let stable = if p.last_stable_offset >= 0 { p.last_stable_offset } else { p.high_watermark };
                 lag += (stable - *from).max(0);
             }

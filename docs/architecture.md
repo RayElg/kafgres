@@ -38,9 +38,10 @@ primary drops the markers whose records never arrived, with a logged warning, so
 survive without its event. Synchronous replication does not close this.
 `kafgres_follower_lag()` on a standby reports how many records the follower was behind at
 its last Fetch, which `pg_stat_replication` does not cover. It returns no row while the
-follower cannot reach the leader, so alert on a missing row as well as on a high one. The
-table engine keeps the
-bytes in the WAL and has no such gap.
+follower cannot reach the leader, or while it is too far behind for one Fetch to cover
+every partition, so alert on a missing row as well as on a high one. A follower that stops
+or hangs keeps its last reading, so alert too when `observed_at_ms` grows old. The table
+engine keeps the bytes in the WAL and has no such gap.
 
 ## Primary-only operation
 

@@ -153,10 +153,13 @@ pub fn member(group_id: &str, member_id: &str) -> Result<Option<Member>, spi::Er
 #[allow(clippy::too_many_arguments)]
 pub fn protocol_type_conflicts(group_id: &str, protocol_type: &str) -> Result<bool, spi::Error> {
     let conflicts: bool = Spi::get_one_with_args(
+        // A consumer or share group by this id conflicts too, as its heartbeats refuse ours.
         "SELECT COALESCE(
                   (SELECT protocol_type IS NOT NULL AND protocol_type <> '' AND protocol_type <> $2
                      FROM kafgres_groups WHERE group_id = $1),
-                  false)",
+                  false)
+             OR EXISTS(SELECT 1 FROM kafgres_consumer_groups WHERE group_id = $1)
+             OR EXISTS(SELECT 1 FROM kafgres_share_groups WHERE group_id = $1)",
         &[group_id.into(), protocol_type.into()],
     )?
     .unwrap_or(false);
