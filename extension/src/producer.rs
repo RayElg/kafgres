@@ -476,18 +476,14 @@ pub fn rebuild_window(
     let end = store
         .high_watermark(topic_id, partition)
         .map_err(|e| e.to_string())?;
-    let end = match STARTUP_END
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .and_then(|m| m.get(&(topic_id, partition)))
-    {
-        Some(&at_start) => at_start.min(end),
-        None => end,
-    };
     let log_start = store
         .log_start_offset(topic_id, partition)
         .map_err(|e| e.to_string())?;
+    // A partition missing from a recorded startup was created since, so it lost nothing.
+    let end = match STARTUP_END.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        Some(m) => m.get(&(topic_id, partition)).map_or(log_start, |&at_start| at_start.min(end)),
+        None => end,
+    };
     let mut at = if end > log_start {
         rebuild_start(store, topic_id, partition, end)?.max(log_start)
     } else {
