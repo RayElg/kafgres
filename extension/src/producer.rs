@@ -325,6 +325,244 @@ pub fn forget_past(topic_id: u32, partition: i32, end: i64) -> Result<(), spi::E
     )
 }
 
+/// How far below the log end a rebuild rescans, as (slack in ms before the newest batch's
+/// timestamp, fewest offsets, most offsets). A crash loses only what was appended but not yet
+/// committed, which is the log's tail; a row commits after its batch, so a lost row can sit
+/// below another producer's committed one. Strict commits lose only requests in flight; with
+/// `relaxed_produce_commit` the rows since the last WAL flush go too.
+fn rebuild_lookback() -> (i64, i64, i64) {
+    if !crate::relaxed_produce_commit() {
+        return (1_000, 1_000, 50_000);
+    }
+    let wal_delay_ms = crate::plan::get_one::<i64>(
+        "SELECT (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_writer_delay')",
+        &[],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(200);
+    ((3 * wal_delay_ms).max(5_000), 5_000, 2_000_000)
+}
+
+/// Where a rebuild starts: the offset `slack` before the log tail's timestamp, within the
+/// bounds. Client timestamps can be stale or ahead, so the bounds decide when they mislead.
+fn rebuild_start(
+    store: &dyn crate::storage::LogStore,
+    topic_id: u32,
+    partition: i32,
+    end: i64,
+) -> Result<i64, String> {
+    use kafgres_codec::records::RecordBatch;
+
+    let (slack_ms, fewest, most) = rebuild_lookback();
+    let nearest = end.saturating_sub(fewest);
+    let farthest = end.saturating_sub(most);
+    let tail = store
+        .read(topic_id, partition, end - 1, 1 << 20, crate::storage::IsolationLevel::ReadUncommitted)
+        .map_err(|e| e.to_string())?;
+    // The first batch of the slice, which holds `end - 1`; later appends may follow it.
+    let first_len = tail
+        .bytes
+        .get(kafgres_codec::records::LENGTH_OFFSET..kafgres_codec::records::LENGTH_OFFSET + 4)
+        .map(|b| i32::from_be_bytes(b.try_into().expect("4 bytes")).max(0) as usize)
+        .map(|len| kafgres_codec::records::LENGTH_OFFSET + 4 + len);
+    let Some(tail_ts) = first_len
+        .and_then(|n| tail.bytes.get(..n))
+        .and_then(|b| RecordBatch::new(kafgres_codec::bytes::Bytes::copy_from_slice(b)).ok())
+        .map(|b| b.max_timestamp())
+        // One ahead by more than the slack would find little or nothing after it, the
+        // narrowest start.
+        .filter(|&t| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(i64::MAX, |d| d.as_millis() as i64);
+            t > slack_ms && t <= now.saturating_add(slack_ms)
+        })
+    else {
+        return Ok(farthest);
+    };
+    let from = store
+        .offset_for_timestamp(topic_id, partition, tail_ts - slack_ms)
+        .map_err(|e| e.to_string())?
+        .map_or(nearest, |(offset, _)| offset);
+    Ok(from.clamp(farthest, nearest))
+}
+
+type Partitions = std::collections::HashSet<(u32, i32)>;
+
+static STARTUP_END: std::sync::Mutex<Option<std::collections::HashMap<(u32, i32), i64>>> =
+    std::sync::Mutex::new(None);
+
+/// The log end when this process started, where a window rebuild looks back from.
+pub fn note_startup_end(topic_id: u32, partition: i32, end: i64) {
+    STARTUP_END
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert((topic_id, partition), end);
+}
+
+static WINDOW_REBUILT: std::sync::Mutex<Option<Partitions>> = std::sync::Mutex::new(None);
+
+thread_local! {
+    /// Rebuilt in the current transaction, not yet committed.
+    static REBUILT_PENDING: std::cell::RefCell<Option<Partitions>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Before the first idempotent produce to a partition after this process starts, rebuild its
+/// window from the log (segment engine only; the table engine commits a batch and its row
+/// together). The partition counts as rebuilt only once the transaction holding the rows
+/// commits; a rollback, or a failure, leaves it for the next produce to try again.
+pub fn ensure_window(topic_id: u32, partition: i32) -> Result<(), String> {
+    use pgrx::{PgSubXactCallbackEvent, PgXactCallbackEvent};
+
+    if crate::storage_engine_guc() != "segment" {
+        return Ok(());
+    }
+    let key = (topic_id, partition);
+    if WINDOW_REBUILT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.contains(&key))
+        || REBUILT_PENDING.with(|p| p.borrow().as_ref().is_some_and(|s| s.contains(&key)))
+    {
+        return Ok(());
+    }
+    let store = crate::storage::open();
+    rebuild_window(&*store, topic_id, partition).map_err(|e| {
+        format!("could not rebuild the idempotence window for topic {topic_id} partition {partition}: {e}")
+    })?;
+
+    let first = REBUILT_PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let first = p.is_none();
+        p.get_or_insert_with(Default::default).insert(key);
+        first
+    });
+    if first {
+        pgrx::register_xact_callback(PgXactCallbackEvent::Commit, || {
+            let done = REBUILT_PENDING.with(|p| p.borrow_mut().take());
+            if let Some(done) = done {
+                WINDOW_REBUILT
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert_with(Default::default)
+                    .extend(done);
+            }
+        });
+        pgrx::register_xact_callback(PgXactCallbackEvent::Abort, || {
+            REBUILT_PENDING.with(|p| p.borrow_mut().take());
+        });
+        // A rolled-back subtransaction may hold the rows: forget, and rebuild again.
+        pgrx::register_subxact_callback(PgSubXactCallbackEvent::AbortSub, |_, _| {
+            REBUILT_PENDING.with(|p| p.borrow_mut().take());
+        });
+    }
+    Ok(())
+}
+
+/// Re-create window rows for batches the log holds and the window lacks, so a retry after a
+/// crash between the append and the row's commit is not appended twice.
+pub fn rebuild_window(
+    store: &dyn crate::storage::LogStore,
+    topic_id: u32,
+    partition: i32,
+) -> Result<u64, String> {
+    use kafgres_codec::records::{RecordBatch, LENGTH_OFFSET};
+    use std::collections::HashMap;
+
+    // Only what the log held at startup can have lost a row; later appends were recorded.
+    let end = store
+        .high_watermark(topic_id, partition)
+        .map_err(|e| e.to_string())?;
+    let log_start = store
+        .log_start_offset(topic_id, partition)
+        .map_err(|e| e.to_string())?;
+    // A partition missing from a recorded startup was created since, so it lost nothing.
+    let end = match STARTUP_END.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        Some(m) => m.get(&(topic_id, partition)).map_or(log_start, |&at_start| at_start.min(end)),
+        None => end,
+    };
+    let mut at = if end > log_start {
+        rebuild_start(store, topic_id, partition, end)?.max(log_start)
+    } else {
+        log_start
+    };
+
+    // Per producer: (epoch, last_seq) of its newest row, `None` with no window here.
+    let mut newest: HashMap<i64, Option<(i16, i32)>> = HashMap::new();
+    let mut rebuilt = 0u64;
+    while at < end {
+        let slice = store
+            .read(topic_id, partition, at, 4 << 20, crate::storage::IsolationLevel::ReadUncommitted)
+            .map_err(|e| e.to_string())?;
+        if slice.bytes.is_empty() {
+            break;
+        }
+        let mut pos = 0usize;
+        while pos + LENGTH_OFFSET + 4 <= slice.bytes.len() {
+            let len = i32::from_be_bytes(
+                slice.bytes[pos + LENGTH_OFFSET..pos + LENGTH_OFFSET + 4]
+                    .try_into()
+                    .expect("4 bytes"),
+            );
+            let total = LENGTH_OFFSET + 4 + len.max(0) as usize;
+            if len <= 0 || pos + total > slice.bytes.len() {
+                break;
+            }
+            let bytes = kafgres_codec::bytes::Bytes::copy_from_slice(&slice.bytes[pos..pos + total]);
+            pos += total;
+            let Ok(batch) = RecordBatch::new(bytes) else { continue };
+            let (pid, epoch, first) = (batch.producer_id(), batch.producer_epoch(), batch.base_sequence());
+            // A batch straddling the start is read whole and kept: it may be the newest one.
+            if pid < 0 || epoch < 0 || first < 0 || batch.is_control() {
+                continue;
+            }
+            let last = increment_sequence(first, batch.last_offset_delta());
+            let state = match newest.get(&pid) {
+                Some(s) => *s,
+                None => {
+                    let known = crate::plan::get_one::<bool>(
+                        "SELECT (SELECT true FROM kafgres_producers WHERE producer_id = $1)",
+                        &[pid.into()],
+                    )
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false);
+                    let s = if !known {
+                        // Expired or never registered.
+                        Some((i16::MAX, i32::MIN))
+                    } else {
+                        window(pid, topic_id, partition)
+                            .map_err(|e| e.to_string())?
+                            .0
+                            .last()
+                            .map(|r| (r.epoch, r.last_seq))
+                    };
+                    newest.insert(pid, s);
+                    s
+                }
+            };
+            let missing = match state {
+                None => true,
+                Some((e, l)) => epoch > e || (epoch == e && in_sequence(l, first)),
+            };
+            if !missing {
+                continue;
+            }
+            record(pid, epoch, topic_id, partition, first, last, batch.base_offset())
+                .map_err(|e| e.to_string())?;
+            newest.insert(pid, Some((epoch, last)));
+            rebuilt += 1;
+        }
+        if pos == 0 {
+            break;
+        }
+        at = slice.next_offset.max(at + 1);
+    }
+    Ok(rebuilt)
+}
+
 /// Stamp the offset a `base_offset = -1` reservation was appended at.
 pub fn stamp(
     producer_id: i64,

@@ -204,6 +204,8 @@ pub fn partitions(topic: TopicId) -> StoreResult<Vec<i32>> {
     .map_err(spi_err)
 }
 
+const MARKERS_FORGOTTEN_PER_PASS: i64 = 20_000;
+
 /// Move `log_start_offset` forward. Never backward — a consumer that has been told an
 pub fn advance_log_start(topic: TopicId, partition: i32, offset: i64) -> StoreResult<()> {
     Spi::run_with_args(
@@ -214,6 +216,23 @@ pub fn advance_log_start(topic: TopicId, partition: i32, offset: i64) -> StoreRe
     .map_err(spi_err)?;
     // The abort index describes offsets; when they go its entries are dead, and this is
     forget_aborted_below(topic, partition, offset)
+}
+
+/// Batches wholly below the log start are unreadable. Every retention pass calls this, a
+/// bounded number at a time, so a large backlog (one an upgrade leaves, say) goes over
+/// several passes instead of stalling the broker in one. The `base_offset` bound is implied
+/// by `last_offset` but lets the planner use the primary key's range instead of scanning.
+pub fn forget_markers_below(topic: TopicId, partition: i32, offset: i64) -> StoreResult<()> {
+    Spi::run_with_args(
+        "DELETE FROM kafgres_markers
+          WHERE topic_id = $1::oid AND partition = $2 AND last_offset < $3
+            AND base_offset < LEAST($3, (SELECT base_offset FROM kafgres_markers
+                                          WHERE topic_id = $1::oid AND partition = $2
+                                            AND base_offset < $3
+                                          ORDER BY base_offset OFFSET $4 LIMIT 1))",
+        &[(topic as i32).into(), partition.into(), offset.into(), MARKERS_FORGOTTEN_PER_PASS.into()],
+    )
+    .map_err(spi_err)
 }
 
 /// Cap on markers loaded per Fetch. Without it a `read_committed` consumer far behind the
@@ -267,15 +286,26 @@ pub fn committed_markers(
 }
 
 /// Whether a `kafgres_produce()` batch's marker exists, and whether its writer has finished,
-/// in one statement so both see one snapshot.
+/// in one statement so both see one snapshot. `xid` is the low bits of the writer's xid8; the
+/// writer is the xid8 with those bits nearest the snapshot's horizon.
 pub fn marker_state(topic: TopicId, partition: i32, base: i64, xid: i64) -> StoreResult<(bool, bool)> {
+    // Below 2^40 the id holds the whole xid8, so the plain lookup is exact and cheaper.
+    let writer = if xid_epoch_is_zero()? {
+        "$4::bigint"
+    } else {
+        "(SELECT CASE WHEN d < (1::bigint << 39) THEN x - d ELSE x + (1::bigint << 40) - d END
+            FROM (SELECT x, (x - $4::bigint) & ((1::bigint << 40) - 1) AS d
+                    FROM (SELECT pg_snapshot_xmax(pg_current_snapshot())::text::bigint AS x) a) b)"
+    };
     Spi::connect(|client| {
         let row = client
             .select(
-                "SELECT EXISTS (SELECT 1 FROM kafgres_markers
-                                 WHERE topic_id = $1::oid AND partition = $2
-                                   AND base_offset = $3),
-                        pg_visible_in_snapshot($4::text::xid8, pg_current_snapshot())",
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM kafgres_markers
+                                     WHERE topic_id = $1::oid AND partition = $2
+                                       AND base_offset = $3),
+                            pg_visible_in_snapshot(({writer})::text::xid8, pg_current_snapshot())"
+                ),
                 Some(1),
                 &[(topic as i32).into(), partition.into(), base.into(), xid.into()],
             )?
@@ -286,6 +316,45 @@ pub fn marker_state(topic: TopicId, partition: i32, base: i64, xid: i64) -> Stor
         ))
     })
     .map_err(spi_err)
+}
+
+/// Whether every xid8 so far fits the producer id's xid bits. "No" is permanent; "yes" is
+/// rechecked every few minutes, since the counter can cross 2^40 while a process runs.
+fn xid_epoch_is_zero() -> StoreResult<bool> {
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    const RECHECK_SECS: i64 = 300;
+    static CROSSED: AtomicBool = AtomicBool::new(false);
+    static ZERO_UNTIL: AtomicI64 = AtomicI64::new(0);
+
+    if CROSSED.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if now < ZERO_UNTIL.load(Ordering::Relaxed) {
+        return Ok(true);
+    }
+    // `client.select`: `get_one` would assign this read an xid.
+    let zero = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT (pg_snapshot_xmax(pg_current_snapshot())::text::bigint >> 40) = 0",
+                Some(1),
+                &[],
+            )?
+            .first()
+            .get_one::<bool>()
+    })
+    .map_err(spi_err)?
+    .unwrap_or(true);
+    if zero {
+        ZERO_UNTIL.store(now + RECHECK_SECS, Ordering::Relaxed);
+    } else {
+        CROSSED.store(true, Ordering::Relaxed);
+    }
+    Ok(zero)
 }
 
 /// Whether an aborted Kafka transaction of `producer_id` covers `offset`.
@@ -432,6 +501,16 @@ pub fn forget_aborted_below(topic: TopicId, partition: i32, offset: i64) -> Stor
         "DELETE FROM kafgres_txn_aborted
           WHERE topic_id = $1::oid AND partition = $2 AND last_offset < $3",
         &[(topic as i32).into(), partition.into(), offset.into()],
+    )
+    .map_err(spi_err)
+}
+
+/// Markers of batches compaction removed.
+pub fn forget_markers(topic: TopicId, partition: i32, bases: &[i64]) -> StoreResult<()> {
+    Spi::run_with_args(
+        "DELETE FROM kafgres_markers
+          WHERE topic_id = $1::oid AND partition = $2 AND base_offset = ANY($3)",
+        &[(topic as i32).into(), partition.into(), bases.to_vec().into()],
     )
     .map_err(spi_err)
 }

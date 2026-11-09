@@ -153,14 +153,47 @@ pub fn member(group_id: &str, member_id: &str) -> Result<Option<Member>, spi::Er
 #[allow(clippy::too_many_arguments)]
 pub fn protocol_type_conflicts(group_id: &str, protocol_type: &str) -> Result<bool, spi::Error> {
     let conflicts: bool = Spi::get_one_with_args(
+        // A consumer or share group by this id conflicts too, as its heartbeats refuse ours.
         "SELECT COALESCE(
                   (SELECT protocol_type IS NOT NULL AND protocol_type <> '' AND protocol_type <> $2
                      FROM kafgres_groups WHERE group_id = $1),
-                  false)",
+                  false)
+             OR EXISTS(SELECT 1 FROM kafgres_consumer_groups WHERE group_id = $1)
+             OR EXISTS(SELECT 1 FROM kafgres_share_groups WHERE group_id = $1)",
         &[group_id.into(), protocol_type.into()],
     )?
     .unwrap_or(false);
     Ok(conflicts)
+}
+
+/// Whether `protocols` shares a name with every other member's. A static member's earlier
+/// registration is the one this join replaces, so it is left out.
+pub fn protocols_compatible(
+    group_id: &str,
+    member_id: &str,
+    group_instance_id: Option<&str>,
+    protocols: &[String],
+) -> Result<bool, spi::Error> {
+    // Only the protocol names: a member's metadata and assignment can be large.
+    let others: Vec<Vec<String>> = Spi::connect(|client| {
+        let rows = client.select(
+            "SELECT protocols FROM kafgres_group_members
+              WHERE group_id = $1 AND member_id <> $2
+                AND ($3::text IS NULL OR group_instance_id IS DISTINCT FROM $3)",
+            None,
+            &[group_id.into(), member_id.into(), group_instance_id.into()],
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.get::<Vec<String>>(1)?.unwrap_or_default());
+        }
+        Ok::<_, spi::Error>(out)
+    })?;
+    let mut common: Vec<String> = protocols.to_vec();
+    for theirs in &others {
+        common.retain(|p| theirs.contains(p));
+    }
+    Ok(!common.is_empty())
 }
 
 pub fn join(

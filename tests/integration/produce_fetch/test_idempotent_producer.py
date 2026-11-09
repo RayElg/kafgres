@@ -802,3 +802,44 @@ def test_a_restart_forgets_window_rows_past_the_recovered_log(topic):
             pass
         time.sleep(2)
     raise AssertionError("a window row past the log end survived the restart")
+
+@pytest.mark.skipif(sql("SHOW kafgres.storage_engine") != "segment",
+                    reason="the segment engine rebuilds its window from the log")
+@pytest.mark.parametrize("records", [2, 1500])
+def test_a_batch_whose_window_row_was_lost_is_not_appended_twice(topic, conn, records):
+    """A crash can keep a batch in the log and lose its window row. After the restart the
+    first idempotent produce rebuilds the row from the log, so the client's retry is
+    answered as a duplicate even when other writes have landed in between. 1500 records
+    is more than the rebuild's nearest start looks back, so the scan starts inside it."""
+    from conftest import BROKER_HOST, BROKER_PORT, Connection
+    import socket
+
+    producer_id = init_producer_id(conn, 1)
+    batch = record_batch([b"a"] + [b"b"] * (records - 1), producer_id=producer_id,
+                         producer_epoch=0, base_sequence=0)
+    _, err, first = send_produce(conn, topic, batch, 2)
+    assert err == 0
+    sql(f"DELETE FROM kafgres_producer_batches WHERE producer_id = {producer_id}")
+    # Newer than the batch, so the rebuild's start by timestamp lands past it.
+    for i in range(3):
+        sql(f"SELECT kafgres_produce('{topic}', 'k', 'sql{i}')")
+
+    subprocess.run(["docker", "compose", "restart", "postgres"], check=True, timeout=300,
+                   capture_output=True)
+    deadline = time.time() + 120
+    while True:
+        try:
+            sql("SELECT 1")
+            fresh = Connection(socket.create_connection((BROKER_HOST, BROKER_PORT), timeout=10))
+            break
+        except (RuntimeError, OSError):
+            assert time.time() < deadline, "the broker did not come back"
+            time.sleep(2)
+    try:
+        _, err, again = send_produce(fresh, topic, batch, 3)
+    finally:
+        fresh.sock.close()
+    assert err == 0, f"the retry failed with {err}"
+    assert again == first, f"the retry was appended at {again}, not answered with {first}"
+    back = kcat("-t", topic, "-C", "-o", "beginning", "-e", "-f", "%s\n")
+    assert back.stdout.split().count("a") == 1, f"the batch was stored twice: {back.stdout.split()}"

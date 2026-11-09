@@ -120,9 +120,11 @@ def offset_for_time(topic, partition, when_ms):
 
 
 def timestamps(topic, partition):
+    """(offset, timestamp) for every record."""
     out = kcat("-C", "-t", f"{topic}", "-p", str(partition), "-o", "beginning", "-e", "-q",
-               "-f", "%T\n")
-    return [int(t) for t in out.stdout.split() if t.strip().isdigit()]
+               "-f", "%o %T\n")
+    return [tuple(map(int, line.split())) for line in out.stdout.splitlines()
+            if len(line.split()) == 2]
 
 
 def seed(engine):
@@ -161,8 +163,10 @@ def seed(engine):
 def snapshot(engine):
     topics = ["up-plain", "up-compact"] + (["up-sql"] if engine == "segment" else [])
     ts = timestamps("up-plain", 0)
-    probe = ts[len(ts) // 2]
+    probe = ts[len(ts) // 2][1]
     return {
+        # The first record at or after the probe, which is Kafka's answer.
+        "exact": next(o for o, t in ts if t >= probe),
         "records": {t: read_topic(t) for t in topics},
         "uncommitted": read_topic("up-sql", "read_uncommitted") if engine == "segment" else [],
         "groups": sql("""SELECT string_agg(partition || ':' || committed_offset, ','
@@ -173,16 +177,25 @@ def snapshot(engine):
     }
 
 
+def latest(rows):
+    """Each key's last record: all that compaction keeps, whenever the broker's own pass runs."""
+    return {k: (o, v) for _, o, k, v in rows}
+
+
 def compare(before, after, when):
     for topic, rows in before["records"].items():
         got = after["records"][topic]
+        if topic == "up-compact":
+            assert latest(got) == latest(rows), f"{when}: {topic} changed a key's last record"
+            continue
         assert got == rows, f"{when}: {topic} changed: {len(rows)} records before, {len(got)} after"
     assert after["uncommitted"] == before["uncommitted"], f"{when}: read_uncommitted view changed"
     assert after["groups"] == before["groups"], (
         f"{when}: group offsets {before['groups']} became {after['groups']}")
-    assert after["lookup"] == before["lookup"], (
-        f"{when}: offsetsForTimes({before['probe']}) was {before['lookup']}, "
-        f"now {after['lookup']}")
+    # Against the exact answer: the old image may answer with the start of the batch.
+    assert after["lookup"] == before["exact"], (
+        f"{when}: offsetsForTimes({before['probe']}) is {after['lookup']}, "
+        f"not {before['exact']}")
 
 
 def epoch():
@@ -230,6 +243,12 @@ def main():
         assert new_version != args.old, f"still {new_version}"
         assert sql("SELECT has_function_privilege('public', 'kafgres_drop_topic(text)', "
                    "'EXECUTE')") == "f", "the update left the admin functions public"
+        assert sql("SELECT count(*) FROM pg_proc WHERE proname = 'kafgres_follower_lag'") == "1", \
+            "the update did not add kafgres_follower_lag()"
+        assert sql("SELECT count(*) FROM kafgres_follower_lag()") == "0"
+        assert sql("SELECT has_function_privilege('public', 'kafgres_slot_ready(int)', "
+                   "'EXECUTE')") == "f", "the update left kafgres_slot_ready() public"
+        assert sql("SELECT kafgres_slot_ready(0)") == "slot not ready"
         restart()
         after = snapshot(args.engine)
         for topic in ("up-plain", "up-sql"):
@@ -237,16 +256,18 @@ def main():
                 missing = set(before["records"][topic]) - set(after["records"][topic])
                 assert not missing, f"{topic} lost {len(missing)} records after the update"
         assert after["groups"] == before["groups"]
-        assert after["lookup"] == before["lookup"]
+        assert after["lookup"] == before["exact"]
 
         step("compacting what 0.2.0 wrote")
         sql("SELECT kafgres_enforce_retention()")
         compacted = read_topic("up-compact")
-        latest = {k: o for _, o, k, _ in compacted}
-        assert len(latest) == 50, f"a key was lost to compaction: {len(latest)} keys"
-        assert all(o >= 1500 for o in latest.values()), "a superseded value outlived its key's last"
-        assert len(compacted) < len(before["records"]["up-compact"]), "nothing was compacted"
-        print(f"   up-compact: {len(before['records']['up-compact'])} -> {len(compacted)} records")
+        kept = latest(compacted)
+        assert len(kept) == 50, f"a key was lost to compaction: {len(kept)} keys"
+        assert all(o >= 1500 for o, _ in kept.values()), "a superseded value outlived its key's last"
+        assert kept == latest(before["records"]["up-compact"]), "compaction changed a key's last record"
+        # Against what was written, as the broker's own pass may have run before the snapshot.
+        assert len(compacted) < 2000, "nothing was compacted"
+        print(f"   up-compact: 2000 -> {len(compacted)} records")
 
         bad = [l for l in logs().splitlines()
                if ("PANIC" in l or "FATAL" in l or "ERROR" in l) and "kafgres" in l]

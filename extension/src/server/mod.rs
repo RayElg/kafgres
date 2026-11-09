@@ -246,6 +246,14 @@ impl Server {
 pub static EPOCHS_RAISED: pgrx::PgAtomic<AtomicBool> =
     unsafe { pgrx::PgAtomic::new(c"kafgres_epochs_raised") };
 
+/// This server start's number, from `kafgres_boot_seq`; valid once `EPOCHS_RAISED` is set.
+pub static BOOT_ID: pgrx::PgAtomic<std::sync::atomic::AtomicI64> =
+    unsafe { pgrx::PgAtomic::new(c"kafgres_boot_id") };
+
+pub fn sql_boot() -> i64 {
+    BOOT_ID.get().load(Ordering::Acquire)
+}
+
 /// Wait up to 30 s for the broker to raise the leader epochs, then raise an ERROR.
 pub fn wait_for_epochs() {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1356,6 +1364,17 @@ fn exclusive_holders() -> String {
 fn raise_leader_epochs() -> bool {
     let result = BackgroundWorker::transaction(|| {
         crate::dbtx::guarded(|| {
+            // Once per process: a retried raise must not spend another number.
+            static PROCESS_BOOT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            let mut boot = PROCESS_BOOT.load(Ordering::Relaxed);
+            // Flushed at commit even with asynchronous commit, or a crash could hand the next
+            // start this number along with the xids it reissues. Every attempt: a failed one
+            // took the number but flushed nothing.
+            pgrx::Spi::run("SET LOCAL synchronous_commit = on")?;
+            if boot == 0 {
+                boot = pgrx::Spi::get_one("SELECT nextval('kafgres_boot_seq')")?.unwrap_or(0);
+                PROCESS_BOOT.store(boot, Ordering::Relaxed);
+            }
             // The timeline increments on `pg_promote`.
             let wal_timeline: i32 = pgrx::Spi::get_one(
                 "SELECT (('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int)",
@@ -1392,18 +1411,22 @@ fn raise_leader_epochs() -> bool {
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
                 crate::producer::forget_past(topic_id, partition, end)
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                crate::producer::note_startup_end(topic_id, partition, end);
             }
-            Ok((highest, raised))
+            Ok((highest, raised, boot))
         })
     });
 
     match result {
-        Ok((epoch, 0)) => {
+        Ok((epoch, 0, boot)) => {
+            // Published once committed: a raise that rolls back never exposes its number.
+            BOOT_ID.get().store(boot, Ordering::Release);
             log!("kafgres: leader epoch {epoch} already current for every partition");
             EPOCHS_RAISED.get().store(true, Ordering::Release);
             true
         }
-        Ok((epoch, n)) => {
+        Ok((epoch, n, boot)) => {
+            BOOT_ID.get().store(boot, Ordering::Release);
             log!("kafgres: took a new leader epoch (up to {epoch}) for {n} partition(s)");
             EPOCHS_RAISED.get().store(true, Ordering::Release);
             true

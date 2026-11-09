@@ -37,6 +37,7 @@ mod init170;
 mod init180;
 mod init190;
 mod init200;
+mod init210;
 pub mod quota;
 pub mod meta;
 pub mod plan;
@@ -704,8 +705,12 @@ pub extern "C-unwind" fn _PG_init() {
     // Registered unconditionally rather than only when `storage_engine=segment`: shared
     crate::storage::segment::init_shmem();
     {
-        use crate::server::EPOCHS_RAISED;
+        use crate::replication::{LAG_AT_MS, LAG_RECORDS};
+        use crate::server::{BOOT_ID, EPOCHS_RAISED};
         pgrx::pg_shmem_init!(EPOCHS_RAISED);
+        pgrx::pg_shmem_init!(BOOT_ID);
+        pgrx::pg_shmem_init!(LAG_RECORDS);
+        pgrx::pg_shmem_init!(LAG_AT_MS);
     }
 
     // The broker starts at `RecoveryFinished` so a standby never serves partitions; the
@@ -935,6 +940,7 @@ pub(crate) fn ensure_tables_exist() {
     init180::init_180();
     init190::init_190();
     init200::init_200();
+    init210::init_210();
 }
 
 pgrx::extension_sql!(
@@ -955,6 +961,7 @@ BEGIN
            AND d.deptype = 'e'
            AND p.proname NOT IN ('kafgres_produce', 'kafgres_version', 'kafgres_kafka_version',
                                  'kafgres_partition_offsets', 'kafgres_archive_status',
+                                 'kafgres_follower_lag',
                                  'kafgres_cdc_status', 'kafgres_cdc_snapshots',
                                  'kafgres_share_state')
     LOOP
@@ -1055,12 +1062,14 @@ pub unsafe extern "C-unwind" fn kafgres_follower_worker_main(_arg: pg_sys::Datum
             reload_config();
             if replicate_from().is_none() {
                 log!("kafgres: follower stopping — replicate_from was cleared");
+                replication::clear_lag();
                 return;
             }
         }
         // Stop before the broker starts serving: never two writers on one partition.
         if !pg_sys::RecoveryInProgress() {
             log!("kafgres: follower stopping — this node was promoted, the broker takes over");
+            replication::clear_lag();
             return;
         }
 
@@ -1081,6 +1090,8 @@ pub unsafe extern "C-unwind" fn kafgres_follower_worker_main(_arg: pg_sys::Datum
             Ok(_) => delay = Duration::from_millis(50),
             Err(e) => {
                 log!("kafgres: follower: {e}");
+                // A reading from before the failure would show a lag that may have grown since.
+                replication::clear_lag();
                 follower.disconnect();
                 delay = Duration::from_millis(500);
             }

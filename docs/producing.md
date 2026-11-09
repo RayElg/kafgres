@@ -50,11 +50,15 @@ computed from committed markers. Three properties of that mechanism are worth kn
   client that re-requests the same offset forever looks like a hung consumer.
 - Each transaction produces under its own producer id, taken from the transaction's xid.
   Kafka clients drop everything from a producer id at or after an aborted first offset,
-  so a shared producer id would let one rollback discard later committed records. For
-  the same reason, when a savepoint that produced is rolled back, the rest of the
-  transaction produces under a new producer id derived from the same xid. A transaction
-  that rolls back more than about four million such savepoints gets an error from
-  further calls.
+  so a shared producer id would let one rollback discard later committed records. The id
+  also carries a flag that keeps it apart from the ids Kafka clients are assigned, and the
+  number of the server start that produced it, so a transaction id that Postgres hands out
+  again after a crash does not share an id with the batch an earlier, lost transaction
+  left in the log. For the same reason, when a savepoint that produced is rolled back, the
+  rest of the transaction produces under a new producer id derived from the same xid. A
+  transaction that rolls back more than 1023 such savepoints (for example a loop of
+  `EXCEPTION` blocks that produce and fail) gets an error from further calls. Commit in
+  smaller batches instead of rolling back that many times in one transaction.
 - The last stable offset is the first offset of the oldest transaction still in flight on
   the partition, so `read_committed` consumers never see records that may yet commit or
   abort. A commit becomes visible once every transaction that produced to the partition
@@ -84,8 +88,25 @@ creation and deletion, ACLs, CDC mappings and slots, retention, archiving, resto
 checks, replication), so each needs an explicit `GRANT EXECUTE`. The exceptions are
 `kafgres_produce()` itself and the read-only reports: `kafgres_version()`,
 `kafgres_kafka_version()`, `kafgres_partition_offsets()`, `kafgres_archive_status()`,
-`kafgres_cdc_status()`, `kafgres_cdc_snapshots()` and `kafgres_share_state()`. On an
-install upgraded from 0.2.0 this takes effect at `ALTER EXTENSION kafgres UPDATE`.
+`kafgres_cdc_status()`, `kafgres_cdc_snapshots()`, `kafgres_share_state()` and
+`kafgres_follower_lag()`. On an install upgraded from 0.2.0 this takes effect at
+`ALTER EXTENSION kafgres UPDATE`.
+
+`kafgres_add_mapping` runs with the caller's privileges: it reads `kafgres_topics` and the
+source table, and writes `kafgres_cdc_mappings`, so a role needs those grants as well as
+`EXECUTE`. It also creates the CDC slot, which Postgres allows only to a superuser or a role
+with the `REPLICATION` attribute. A role without that still saves its mapping, with a
+warning, and the CDC worker creates the slot (see [CDC mappings](#cdc-mappings)). Use
+`ALTER ROLE ... REPLICATION` for a role that should create it. `kafgres_slot_ready()` and
+`kafgres_cdc_create_slot()` are administrative like the rest.
+
+```sql
+GRANT EXECUTE ON FUNCTION kafgres_add_mapping(text, text, text, text, text, text) TO cdc_admin;
+GRANT SELECT ON kafgres_topics TO cdc_admin;
+GRANT SELECT, INSERT, UPDATE ON kafgres_cdc_mappings TO cdc_admin;
+GRANT SELECT ON public.orders TO cdc_admin;   -- each source table it maps
+ALTER ROLE cdc_admin REPLICATION;   -- optional: lets kafgres_add_mapping create the slot itself
+```
 
 ### Engines
 
@@ -98,7 +119,29 @@ caller holds no lock that other producers need.
 
 ## CDC mappings
 
-A mapping copies changes from a table to a topic through the WAL. You register it once:
+A mapping copies changes from a table to a topic through the WAL. You register it once.
+`kafgres_add_mapping` creates the logical replication slot if it does not exist yet.
+Capture starts when the mapping commits: changes committed after that are captured, and
+changes other sessions commit while the adding transaction is still open are not, so keep
+that transaction short. A slot sees only WAL written after it exists, so call it before the
+transaction has written anything, or in a transaction of its own. Creating a slot waits for
+every transaction that holds an xid to finish, so the call gives the ones running a second
+to finish and usually does not wait on any that take longer (one that takes an xid while the
+slot is being built can still hold the call). If the slot cannot be created (such a
+transaction is running, the transaction has already written, the role lacks `REPLICATION`
+and is not a superuser ([Who may produce](#who-may-produce)), or `wal_level` is not
+`logical`), the mapping is saved with a warning and the worker creates the slot later;
+changes before then are not captured. If every slot `max_replication_slots` allows is in
+use, the call fails and the mapping is not saved. `kafgres_slot_ready()` waits until the slot is ready and returns `slot ready`, or
+`slot not ready` if its `timeout_ms` (120 s by default) passes first; a transaction left open
+that long keeps the slot from being ready, and the answer says so rather than guessing. In
+the transaction that added the mapping it answers at once: `slot ready` if the slot is
+already ready, and otherwise `slot not ready`, since the slot cannot be ready before that
+transaction ends; then call it again after the commit. Either way, capture still starts at
+the commit. `kafgres_cdc_create_slot()` creates the slot and waits, if an enabled, committed
+mapping wants one; with none it creates nothing and returns false. The slot stays after the
+last `kafgres_remove_mapping`, or a rolled-back `kafgres_add_mapping`; the worker keeps
+advancing it, so it holds no WAL while the worker drains. `kafgres_cdc_drop_slot()` drops it.
 
 The examples assume a `public.orders (id int, customer_id int, total numeric, status
 text)` table and a `customers (id int, name text, tier text)` lookup table.
@@ -119,6 +162,7 @@ SELECT kafgres_add_mapping(
     key_expr    => $$ new.id::text $$,
     filter_expr => $$ new.status = 'placed' AND old.status IS DISTINCT FROM 'placed' $$
 );
+-- SELECT kafgres_slot_ready();  -- optional: blocks until the CDC slot is ready after the first mapping is added
 ```
 
 A background worker drains a logical replication slot fed by kafgres's own output
@@ -268,6 +312,7 @@ SELECT kafgres_add_mapping('txns', 'kafgres.transaction', 'my-transactions',
                        'event_count', event_count,
                        'data_collections', data_collections)$$,
   $$xid::text$$, NULL);
+-- SELECT kafgres_slot_ready();  -- optional: blocks until the CDC slot is ready after the first mapping is added
 ```
 
 `xid` on each change lets a consumer group the changes of one commit; the summary tells

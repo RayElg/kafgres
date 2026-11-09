@@ -111,6 +111,132 @@ def start_slot():
 def values(rows):
     return [json.loads(v) for _, _, v in rows]
 
+def test_a_change_right_after_add_mapping_is_captured():
+    add_mapping("jsonb_build_object('id', new.id)")
+    sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
+    assert drain() == 1
+    assert len(consume("src-events")) == 1
+
+def slot_count():
+    return int(sql("SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'kafgres_cdc'"))
+
+def test_a_mapping_added_after_the_transaction_wrote_is_saved_with_a_warning():
+    out = psql("BEGIN; INSERT INTO src_orders VALUES (1,1,1,'x','x'); "
+               "SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
+               "$$jsonb_build_object('id', new.id)$$, NULL, NULL); COMMIT")
+    assert out.returncode == 0, out.stderr[-500:]
+    assert "WARNING" in out.stderr, out.stderr[-500:]
+    assert sql("SELECT count(*) FROM kafgres_cdc_mappings WHERE mapping_name = 'm1'") == "1"
+
+def test_a_drain_is_not_held_up_by_a_mapping_transaction_left_open():
+    add_mapping("jsonb_build_object('id', new.id)", name="m0", source="public.src_customers")
+    adding = subprocess.Popen(
+        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
+         "BEGIN; SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
+         "$$jsonb_build_object('id', new.id)$$, 'new.id::text', NULL); "
+         "SELECT pg_sleep(5); COMMIT"],
+        cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(1.5)
+        sql("INSERT INTO src_customers VALUES (3,'bronze')")
+        t0 = time.monotonic()
+        assert drain() == 1
+        assert time.monotonic() - t0 < 3, "the drain waited for the open transaction"
+    finally:
+        adding.wait(timeout=30)
+    sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
+    assert drain() == 1, "a change after the mapping committed was not captured"
+
+def test_a_mapping_does_not_wait_for_a_running_transaction_to_create_the_slot():
+    holder = subprocess.Popen(
+        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
+         "BEGIN; SELECT pg_current_xact_id(); SELECT pg_sleep(8); COMMIT"],
+        cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(1.5)
+        t0 = time.monotonic()
+        out = psql("SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
+                   "$$jsonb_build_object('id', new.id)$$, 'new.id::text', NULL)")
+        assert out.returncode == 0, out.stderr[-500:]
+        assert time.monotonic() - t0 < 4, "the mapping waited for the open transaction"
+        assert "WARNING" in out.stderr, out.stderr[-500:]
+        assert "kafgres_slot_ready" in out.stderr, "the warning does not say how to wait for it"
+        assert sql("SELECT count(*) FROM kafgres_cdc_mappings WHERE mapping_name = 'm1'") == "1"
+        assert sql("SELECT kafgres_slot_ready(0)") == "slot not ready"
+    finally:
+        holder.wait(timeout=30)
+    start_slot()
+    assert sql("SELECT kafgres_slot_ready(1000)") == "slot ready"
+    sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
+    assert drain() == 1
+
+def test_a_mapping_creates_the_slot_among_short_transactions():
+    busy = subprocess.Popen(
+        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
+         "DO $$ BEGIN FOR i IN 1..120 LOOP PERFORM pg_current_xact_id(); "
+         "PERFORM pg_sleep(0.05); COMMIT; END LOOP; END $$"],
+        cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(1)
+        out = psql("SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
+                   "$$jsonb_build_object('id', new.id)$$, 'new.id::text', NULL)")
+        assert out.returncode == 0, out.stderr[-500:]
+        assert "WARNING" not in out.stderr, out.stderr[-500:]
+        assert sql("SELECT kafgres_slot_ready(0)") == "slot ready"
+    finally:
+        busy.wait(timeout=30)
+    sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
+    assert drain() == 1
+
+def test_slot_ready_answers_at_once_in_a_transaction_that_wrote():
+    t0 = time.monotonic()
+    # Last, as psql before 15 prints only the last result; the transaction rolls back on exit.
+    out = psql("BEGIN; INSERT INTO src_orders VALUES (1,1,1,'x','x'); "
+               "SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
+               "$$jsonb_build_object('id', new.id)$$, NULL, NULL); "
+               "SELECT kafgres_slot_ready()")
+    assert out.returncode == 0, out.stderr[-500:]
+    assert time.monotonic() - t0 < 5, "kafgres_slot_ready waited on its own transaction"
+    assert "slot not ready" in out.stdout
+    assert "after it commits" in out.stderr, out.stderr[-500:]
+
+
+def test_a_slot_no_mapping_wants_still_advances():
+    """Left after the last mapping goes, it holds no WAL while the drain runs."""
+    add_mapping("jsonb_build_object('id', new.id)")
+    sql("SELECT kafgres_remove_mapping('m1')")
+    assert slot_count() == 1
+    lsn = "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'kafgres_cdc'"
+    before = sql(lsn)
+    sql("INSERT INTO src_orders SELECT g, 1, 1, 'x', 'x' FROM generate_series(1, 500) g")
+    assert drain() == 0
+    assert sql(lsn) != before, "the slot did not advance with no mapping"
+
+def test_a_role_without_replication_saves_a_mapping_with_a_warning():
+    sql("DROP ROLE IF EXISTS mapper")
+    sql("CREATE ROLE mapper")
+    try:
+        sql("GRANT EXECUTE ON FUNCTION kafgres_add_mapping(text,text,text,text,text,text) TO mapper")
+        sql("GRANT SELECT ON kafgres_topics, src_orders TO mapper")
+        sql("GRANT SELECT, INSERT, UPDATE ON kafgres_cdc_mappings TO mapper")
+        out = psql("SET ROLE mapper; SELECT kafgres_add_mapping('m1', 'public.src_orders', "
+                   "'src-events', $$jsonb_build_object('id', new.id)$$, NULL, NULL)")
+        assert out.returncode == 0, out.stderr[-500:]
+        assert "REPLICATION" in out.stderr, out.stderr[-500:]
+        assert sql("SELECT count(*) FROM kafgres_cdc_mappings WHERE mapping_name = 'm1'") == "1"
+        assert slot_count() == 0
+    finally:
+        sql("DELETE FROM kafgres_cdc_mappings")
+        sql("REVOKE ALL ON kafgres_topics, src_orders, kafgres_cdc_mappings FROM mapper")
+        sql("REVOKE ALL ON FUNCTION kafgres_add_mapping(text,text,text,text,text,text) FROM mapper")
+        sql("DROP ROLE mapper")
+
+def test_a_mapping_to_a_missing_topic_leaves_no_slot():
+    out = psql("SELECT kafgres_add_mapping('m1', 'public.src_orders', 'no-such-topic', "
+               "$$jsonb_build_object('id', new.id)$$, NULL, NULL)")
+    assert out.returncode != 0
+    assert slot_count() == 0
+
 def test_an_insert_reaches_the_topic_through_the_wal():
     add_mapping("jsonb_build_object('id', new.id, 'status', new.status, 'op', op)")
     start_slot()
