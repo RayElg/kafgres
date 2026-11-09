@@ -64,8 +64,13 @@ pub fn sweep(cursor: u32) -> Result<Batch, spi::Error> {
                 pgrx::log!("kafgres: compaction on topic {topic_id} failed: {e}");
             }
             // Compaction first: retention drops whole segments without looking inside them, discarding records compaction must keep.
-            if policy_kind.map(|p| p.deletes).unwrap_or(false) {
-                let policy = crate::config::retention_policy(*topic_id)?;
+            // Compact-only still runs it with no limits, which only forgets markers below a DeleteRecords.
+            {
+                let policy = if policy_kind.map(|p| p.deletes).unwrap_or(false) {
+                    crate::config::retention_policy(*topic_id)?
+                } else {
+                    crate::storage::RetentionPolicy { retention_ms: None, retention_bytes: None }
+                };
                 match store.enforce_retention(*topic_id, &policy) {
                     Ok(n) => reclaimed += n,
                     Err(e) => {

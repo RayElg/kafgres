@@ -620,10 +620,21 @@ def test_batches_larger_than_segment_bytes_still_compact(byte_arm_topic):
     latest = {k: int(o) for o, k in got}
     assert len(latest) == 50, f"a key was lost: {len(latest)} keys"
 
+@pytest.fixture
+def no_background_sweep():
+    """Only the test's own passes run, so it can count what each one forgets."""
+    sql("ALTER SYSTEM SET kafgres.retention_check_interval_ms = 3600000")
+    sql("SELECT pg_reload_conf()")
+    time.sleep(0.5)
+    yield
+    sql("ALTER SYSTEM RESET kafgres.retention_check_interval_ms")
+    sql("SELECT pg_reload_conf()")
+
 @pytest.mark.skipif(engine() != "segment", reason="kafgres_produce() is segment engine only")
-def test_retention_forgets_a_large_marker_backlog_over_several_passes(topic):
+def test_retention_forgets_a_large_marker_backlog_over_several_passes(topic, no_background_sweep):
     """Markers below the log start are deleted a bounded number per pass, so a backlog
     cannot outlast the statement timeout and keep the log start from moving."""
+    sql("ALTER SYSTEM SET kafgres.segment_offsets = 4000")
     sql("ALTER SYSTEM SET kafgres.segment_bytes = 1048576")
     sql("SELECT pg_reload_conf()")
     time.sleep(0.5)
@@ -646,15 +657,17 @@ def test_retention_forgets_a_large_marker_backlog_over_several_passes(topic):
     assert int(sql(below)) == 0, "later passes did not forget the rest"
 
 @pytest.mark.skipif(engine() != "segment", reason="kafgres_produce() is segment engine only")
-def test_markers_below_a_delete_records_go_on_a_topic_kept_forever(topic):
+@pytest.mark.parametrize("config", ["retention.ms=-1", "cleanup.policy=compact"])
+def test_markers_below_a_delete_records_go_on_a_topic_kept_forever(topic, no_background_sweep, config):
     """With no time or size limit retention reclaims nothing itself, but DeleteRecords still
     moves the log start, and later passes forget the markers left below it."""
     import json
     import tempfile
 
     assert kafka_tool("kafka-configs.sh", "--entity-type", "topics", "--entity-name", topic,
-                      "--alter", "--add-config", "retention.ms=-1").returncode == 0
-    sql(f"SELECT count(kafgres_produce('{topic}', 'k', i::text)) FROM generate_series(1, 25000) i")
+                      "--alter", "--add-config", config).returncode == 0
+    # Distinct keys, so compaction itself forgets none.
+    sql(f"SELECT count(kafgres_produce('{topic}', i::text, i::text)) FROM generate_series(1, 25000) i")
     spec = {"partitions": [{"topic": topic, "partition": 0, "offset": 24000}], "version": 1}
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "offsets.json")

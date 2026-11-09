@@ -170,6 +170,31 @@ def test_a_mapping_does_not_wait_for_a_running_transaction_to_create_the_slot():
     sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
     assert drain() == 1
 
+def test_a_mapping_added_while_the_slot_is_being_built_is_saved_with_a_warning():
+    holder = subprocess.Popen(
+        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
+         "BEGIN; SELECT pg_current_xact_id(); SELECT pg_sleep(8); COMMIT"],
+        cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    builder = None
+    try:
+        time.sleep(1.5)
+        add_mapping("jsonb_build_object('id', new.id)")
+        builder = subprocess.Popen(
+            ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
+             "SELECT kafgres_cdc_create_slot()"],
+            cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1.5)
+        assert sql("SELECT count(*) FROM pg_replication_slots") == "1", "the slot is not being built"
+        out = psql("SELECT kafgres_add_mapping('m2', 'public.src_customers', 'src-events', "
+                   "$$jsonb_build_object('id', new.id)$$, 'new.id::text', NULL)")
+        assert out.returncode == 0, out.stderr[-500:]
+        assert "still being created" in out.stderr, out.stderr[-500:]
+    finally:
+        holder.wait(timeout=30)
+        if builder:
+            builder.wait(timeout=30)
+    assert sql("SELECT kafgres_slot_ready(5000)") == "slot ready"
+
 def test_a_mapping_creates_the_slot_among_short_transactions():
     busy = subprocess.Popen(
         ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",

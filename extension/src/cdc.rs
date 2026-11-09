@@ -64,7 +64,14 @@ fn kafgres_add_mapping(
     // Created here, before this transaction writes, unless that would wait on a long
     // transaction. Otherwise the worker creates it once the mapping commits; not an error,
     // but changes before the slot is ready are not captured.
-    if !slot_exists() {
+    if slot_exists() {
+        if !slot_built() {
+            warning!(
+                "kafgres: the slot is still being created; the mapping is saved, but changes \
+                 before its slot is ready are not captured (kafgres_slot_ready() waits for it)"
+            );
+        }
+    } else {
         let late = slot_preconditions().err().or_else(|| {
             if !running_transactions_finish(std::time::Duration::from_secs(1)) {
                 Some("a running transaction would hold the slot's creation".to_string())
@@ -306,6 +313,18 @@ fn read_one<T: pgrx::datum::FromDatum + pgrx::datum::IntoDatum>(
 fn slot_exists() -> bool {
     read_one::<bool>(
         "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+        &[SLOT.into()],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+/// Exists and has its snapshot, so it captures from here on.
+fn slot_built() -> bool {
+    read_one::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_replication_slots
+                        WHERE slot_name = $1 AND confirmed_flush_lsn IS NOT NULL)",
         &[SLOT.into()],
     )
     .ok()
