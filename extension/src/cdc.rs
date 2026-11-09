@@ -419,7 +419,8 @@ pub fn drop_unused_slot(
     // Taken before reading the mappings, so any committed since are seen.
     let adding = !read_one::<bool>(&format!("SELECT pg_try_advisory_xact_lock({SLOT_KEEP_LOCK_KEY})"), &[])?
         .unwrap_or(false);
-    // A disabled mapping still wants it: disabling is a pause, and the slot keeps its changes.
+    // A disabled mapping keeps it, so re-enabling needs no new slot. The drain does not hold
+    // changes for one, so the slot pins no WAL meanwhile.
     let wanted = adding
         || with_latest_snapshot(|| {
             read_one::<bool>("SELECT EXISTS(SELECT 1 FROM kafgres_cdc_mappings)", &[])

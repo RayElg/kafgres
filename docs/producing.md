@@ -92,15 +92,19 @@ checks, replication), so each needs an explicit `GRANT EXECUTE`. The exceptions 
 `kafgres_follower_lag()`. On an install upgraded from 0.2.0 this takes effect at
 `ALTER EXTENSION kafgres UPDATE`.
 
-`kafgres_add_mapping` also creates the CDC slot, which Postgres allows only to a superuser
-or a role with the `REPLICATION` attribute. A role with `EXECUTE` on the function but
-neither still saves its mapping, with a warning, and the CDC worker creates the slot (see
-[CDC mappings](#cdc-mappings)). Use `ALTER ROLE ... REPLICATION` for a role that should
-create it. `kafgres_slot_ready()` and `kafgres_cdc_create_slot()` are administrative like
-the rest.
+`kafgres_add_mapping` runs with the caller's privileges: it reads `kafgres_topics` and the
+source table, and writes `kafgres_cdc_mappings`, so a role needs those grants as well as
+`EXECUTE`. It also creates the CDC slot, which Postgres allows only to a superuser or a role
+with the `REPLICATION` attribute. A role without that still saves its mapping, with a
+warning, and the CDC worker creates the slot (see [CDC mappings](#cdc-mappings)). Use
+`ALTER ROLE ... REPLICATION` for a role that should create it. `kafgres_slot_ready()` and
+`kafgres_cdc_create_slot()` are administrative like the rest.
 
 ```sql
 GRANT EXECUTE ON FUNCTION kafgres_add_mapping(text, text, text, text, text, text) TO cdc_admin;
+GRANT SELECT ON kafgres_topics TO cdc_admin;
+GRANT SELECT, INSERT, UPDATE ON kafgres_cdc_mappings TO cdc_admin;
+GRANT SELECT ON public.orders TO cdc_admin;   -- each source table it maps
 ALTER ROLE cdc_admin REPLICATION;   -- optional: lets kafgres_add_mapping create the slot itself
 ```
 
@@ -130,8 +134,8 @@ saved with a warning and the worker creates the slot later; changes before then 
 captured. `kafgres_slot_ready()` waits until the slot is ready and returns `slot ready`, or
 `slot not ready` if its `timeout_ms` (120 s by default) passes first; a transaction left open
 that long keeps the slot from being ready, and the answer says so rather than guessing. In
-the transaction that added the mapping it answers at once: `slot ready` if the call created
-the slot, and otherwise `slot not ready`, since the slot cannot be ready before that
+the transaction that added the mapping it answers at once: `slot ready` if the slot
+already exists, and otherwise `slot not ready`, since the slot cannot be ready before that
 transaction ends; then call it again after the commit. Either way, capture still starts at
 the commit. `kafgres_cdc_create_slot()` creates the slot and waits, if an enabled, committed
 mapping wants one; with none it creates nothing and returns false. A slot nothing wants holds WAL, so
