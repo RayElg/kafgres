@@ -215,10 +215,11 @@ def test_a_mapping_creates_the_slot_among_short_transactions():
 
 def test_slot_ready_answers_at_once_in_a_transaction_that_wrote():
     t0 = time.monotonic()
+    # Last, as psql before 15 prints only the last result; the transaction rolls back on exit.
     out = psql("BEGIN; INSERT INTO src_orders VALUES (1,1,1,'x','x'); "
                "SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
                "$$jsonb_build_object('id', new.id)$$, NULL, NULL); "
-               "SELECT kafgres_slot_ready(); COMMIT")
+               "SELECT kafgres_slot_ready()")
     assert out.returncode == 0, out.stderr[-500:]
     assert time.monotonic() - t0 < 5, "kafgres_slot_ready waited on its own transaction"
     assert "slot not ready" in out.stdout
