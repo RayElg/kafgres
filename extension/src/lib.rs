@@ -94,8 +94,6 @@ static AUTO_CREATE_TOPICS: GucSetting<bool> = GucSetting::<bool>::new(true);
 /// `0` stops draining but leaves the worker running: the slot then stops advancing and
 static CDC_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(1000);
 
-static CDC_UNUSED_SLOT_MS: GucSetting<i32> = GucSetting::<i32>::new(600_000);
-
 /// Bounds transactions, not changes: `upto_nchanges` is only consulted at commit
 static CDC_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(10_000);
 static CDC_SNAPSHOT_BATCH_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1_000);
@@ -539,16 +537,6 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
-        c"kafgres.cdc_unused_slot_ms",
-        c"How long the CDC slot outlives its last mapping before the worker drops it; 0 keeps it",
-        c"",
-        &CDC_UNUSED_SLOT_MS,
-        0,
-        86_400_000,
-        GucContext::Sighup,
-        GucFlags::default(),
-    );
-    GucRegistry::define_int_guc(
         c"kafgres.cdc_batch_size",
         c"Changes peeked from the CDC slot per drain",
         c"",
@@ -813,7 +801,6 @@ pub unsafe extern "C-unwind" fn kafgres_cdc_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::connect_worker_to_spi(Some(&db_name), None);
 
     let mut ready = false;
-    let mut unused_since = None;
     let mut interval = cdc_interval();
 
     while BackgroundWorker::wait_latch(Some(if interval.is_zero() {
@@ -845,14 +832,6 @@ pub unsafe extern "C-unwind" fn kafgres_cdc_worker_main(_arg: pg_sys::Datum) {
                 continue;
             }
             log!("kafgres: CDC worker ready");
-        }
-
-        let grace = Duration::from_millis(CDC_UNUSED_SLOT_MS.get() as u64);
-        match BackgroundWorker::transaction(std::panic::AssertUnwindSafe(|| {
-            cdc::drop_unused_slot(&mut unused_since, grace)
-        })) {
-            Ok(_) => {}
-            Err(e) => log!("kafgres: CDC: {e}"),
         }
 
         // Not wrapped in `atomically`: an ephemeral slot is only cleaned up at top-level

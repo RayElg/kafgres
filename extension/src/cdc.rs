@@ -9,9 +9,6 @@ pub const SLOT: &str = "kafgres_cdc";
 const SLOT_CREATE_LOCK_KEY: i64 = 0x7047_4B41_0000_0002u64 as i64;
 /// Held for a whole drain: two drains peek the same changes and fight over the slot advance.
 const DRAIN_LOCK_KEY: i64 = 0x7047_4B41_0000_0003u64 as i64;
-/// Held shared by `kafgres_add_mapping` until its transaction ends, so the worker does not drop
-/// the slot under a mapping it cannot see yet.
-const SLOT_KEEP_LOCK_KEY: i64 = 0x7047_4B41_0000_0007u64 as i64;
 
 /// Net of batch framing and varints, so a record at the limit still forms a within-limit batch.
 const MAX_RECORD_BYTES: usize =
@@ -58,20 +55,10 @@ fn kafgres_add_mapping(
 
     render_check(source_table, value_expr, key_expr, filter_expr);
 
-    read_one::<String>(&format!("SELECT pg_advisory_xact_lock_shared({SLOT_KEEP_LOCK_KEY})::text"), &[])
-        .unwrap_or_else(|e| error!("kafgres: {e}"));
-
     // Created here, before this transaction writes, unless that would wait on a long
     // transaction. Otherwise the worker creates it once the mapping commits; not an error,
     // but changes before the slot is ready are not captured.
-    if slot_exists() {
-        if !slot_built() {
-            warning!(
-                "kafgres: the slot is still being created; the mapping is saved, but changes \
-                 before its slot is ready are not captured (kafgres_slot_ready() waits for it)"
-            );
-        }
-    } else {
+    if !slot_exists() {
         let late = slot_preconditions().err().or_else(|| {
             if !running_transactions_finish(std::time::Duration::from_secs(1)) {
                 Some("a running transaction would hold the slot's creation".to_string())
@@ -366,24 +353,33 @@ fn slot_preconditions() -> Result<(), String> {
         );
     }
 
-    if let Some(max) = read_one::<i32>(
-        "SELECT CASE WHEN max <= (SELECT count(*) FROM pg_replication_slots) THEN max END
-           FROM (SELECT (SELECT setting::int FROM pg_settings
-                          WHERE name = 'max_replication_slots') AS max) s",
-        &[],
-    )? {
-        return Err(format!(
-            "cannot create the CDC slot: all {max} replication slots (max_replication_slots) are in use"
-        ));
-    }
-
-    if read_one::<i64>("SELECT pg_current_xact_id_if_assigned()::text::bigint", &[])?.is_some() {
+    if has_xid()? {
         return Err(
             "cannot create the CDC slot: this transaction has already been assigned an xid"
                 .to_string(),
         );
     }
     Ok(())
+}
+
+/// The current transaction has written, so a slot cannot be created in it or wait on it.
+fn has_xid() -> Result<bool, String> {
+    Ok(read_one::<i64>("SELECT pg_current_xact_id_if_assigned()::text::bigint", &[])?.is_some())
+}
+
+/// Whether `done` turns true within `within`, asking every `every`.
+fn poll(within: std::time::Duration, every: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if done() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        pgrx::check_for_interrupts!();
+        std::thread::sleep(every);
+    }
 }
 
 /// Slot creation waits for the transactions holding an xid. If the ones running now finish
@@ -394,25 +390,16 @@ fn running_transactions_finish(within: std::time::Duration) -> bool {
     else {
         return false;
     };
-    let deadline = std::time::Instant::now() + within;
-    loop {
-        let finished = read_one::<bool>(
+    poll(within, std::time::Duration::from_millis(20), || {
+        read_one::<bool>(
             "SELECT NOT EXISTS(SELECT 1 FROM pg_snapshot_xip($1::pg_snapshot) x
                                 WHERE pg_xact_status(x) = 'in progress')",
             &[running.as_str().into()],
         )
         .ok()
         .flatten()
-        .unwrap_or(false);
-        if finished {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        pgrx::check_for_interrupts!();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+        .unwrap_or(false)
+    })
 }
 
 fn enabled_mappings_exist() -> bool {
@@ -423,51 +410,6 @@ fn enabled_mappings_exist() -> bool {
     .ok()
     .flatten()
     .unwrap_or(false)
-}
-
-/// Drop the slot once no mapping has wanted it for `grace` (zero keeps it), since an
-/// unwanted slot pins WAL. The wait spares a mapping still being added. `unused_since` is
-/// the worker's, kept between calls.
-pub fn drop_unused_slot(
-    unused_since: &mut Option<std::time::Instant>,
-    grace: std::time::Duration,
-) -> Result<bool, String> {
-    if grace.is_zero() {
-        return Ok(false);
-    }
-    // Taken before reading the mappings, so any committed since are seen.
-    let adding = !read_one::<bool>(&format!("SELECT pg_try_advisory_xact_lock({SLOT_KEEP_LOCK_KEY})"), &[])?
-        .unwrap_or(false);
-    // A disabled mapping keeps it, so re-enabling needs no new slot. The drain does not hold
-    // changes for one, so the slot pins no WAL meanwhile.
-    let wanted = adding
-        || with_latest_snapshot(|| {
-            read_one::<bool>("SELECT EXISTS(SELECT 1 FROM kafgres_cdc_mappings)", &[])
-        })?
-        .unwrap_or(true);
-    if wanted || !slot_exists() {
-        *unused_since = None;
-        return Ok(false);
-    }
-    let since = *unused_since.get_or_insert_with(std::time::Instant::now);
-    if since.elapsed() < grace {
-        return Ok(false);
-    }
-    // Dropping a slot another session is reading raises; try again on a later pass.
-    let active = read_one::<bool>(
-        "SELECT (SELECT active FROM pg_replication_slots WHERE slot_name = $1)",
-        &[SLOT.into()],
-    )?
-    .unwrap_or(false);
-    if active {
-        return Ok(false);
-    }
-    Spi::run_with_args("SELECT pg_drop_replication_slot($1)", &[SLOT.into()])
-        .map_err(|e| format!("could not drop the unused CDC slot: {e}"))?;
-    *unused_since = None;
-    log!("kafgres: dropped logical replication slot {SLOT:?}; no mapping has wanted it for {} s",
-         grace.as_secs());
-    Ok(true)
 }
 
 pub fn ensure_slot() -> Result<bool, String> {
@@ -1658,34 +1600,18 @@ fn kafgres_cdc_create_slot() -> bool {
 #[pg_extern]
 fn kafgres_slot_ready(timeout_ms: default!(i32, 120000)) -> &'static str {
     // The slot waits for this transaction, and its mapping is not visible to the worker yet.
-    let wrote = read_one::<i64>("SELECT pg_current_xact_id_if_assigned()::text::bigint", &[])
-        .unwrap_or_else(|e| error!("kafgres: {e}"))
-        .is_some();
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
-    loop {
-        let ready = read_one::<bool>(
-            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots
-                            WHERE slot_name = $1 AND confirmed_flush_lsn IS NOT NULL)",
-            &[SLOT.into()],
-        )
-        .unwrap_or_else(|e| error!("kafgres: {e}"))
-        .unwrap_or(false);
-        if ready {
-            return "slot ready";
-        }
-        if wrote {
-            warning!(
-                "kafgres: the slot cannot be ready before this transaction ends, since it has \
-                 written; call kafgres_slot_ready() after it commits"
-            );
-            return "slot not ready";
-        }
-        if std::time::Instant::now() >= deadline {
-            return "slot not ready";
-        }
-        pgrx::check_for_interrupts!();
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    if has_xid().unwrap_or_else(|e| error!("kafgres: {e}")) && !slot_built() {
+        warning!(
+            "kafgres: the slot cannot be ready before this transaction ends, since it has \
+             written; call kafgres_slot_ready() after it commits"
+        );
+        return "slot not ready";
+    }
+    let within = std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    if poll(within, std::time::Duration::from_millis(100), slot_built) {
+        "slot ready"
+    } else {
+        "slot not ready"
     }
 }
 

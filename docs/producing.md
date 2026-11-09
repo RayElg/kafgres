@@ -129,23 +129,19 @@ every transaction that holds an xid to finish, so the call gives the ones runnin
 to finish and usually does not wait on any that take longer (one that takes an xid while the
 slot is being built can still hold the call). If the slot cannot be created (such a
 transaction is running, the transaction has already written, the role lacks `REPLICATION`
-and is not a superuser ([Who may produce](#who-may-produce)), every slot
-`max_replication_slots` allows is in use, or `wal_level` is not `logical`), or the worker is
-still creating it for an earlier mapping, the mapping is
-saved with a warning and the worker creates the slot later; changes before then are not
-captured. `kafgres_slot_ready()` waits until the slot is ready and returns `slot ready`, or
+and is not a superuser ([Who may produce](#who-may-produce)), or `wal_level` is not
+`logical`), the mapping is saved with a warning and the worker creates the slot later;
+changes before then are not captured. If every slot `max_replication_slots` allows is in
+use, the call fails and the mapping is not saved. `kafgres_slot_ready()` waits until the slot is ready and returns `slot ready`, or
 `slot not ready` if its `timeout_ms` (120 s by default) passes first; a transaction left open
 that long keeps the slot from being ready, and the answer says so rather than guessing. In
 the transaction that added the mapping it answers at once: `slot ready` if the slot is
 already ready, and otherwise `slot not ready`, since the slot cannot be ready before that
 transaction ends; then call it again after the commit. Either way, capture still starts at
 the commit. `kafgres_cdc_create_slot()` creates the slot and waits, if an enabled, committed
-mapping wants one; with none it creates nothing and returns false. A slot nothing wants holds WAL, so
-the worker drops it once no mapping, enabled or disabled, has existed for `kafgres.cdc_unused_slot_ms`
-(10 minutes by default; `0` keeps it), for instance after a rolled-back `kafgres_add_mapping`
-or the last `kafgres_remove_mapping`. It never drops it while a `kafgres_add_mapping` is
-still uncommitted, however long that transaction runs. `kafgres_cdc_drop_slot()` drops it at
-once.
+mapping wants one; with none it creates nothing and returns false. The slot stays after the
+last `kafgres_remove_mapping`, or a rolled-back `kafgres_add_mapping`; the worker keeps
+advancing it, so it holds no WAL while the worker drains. `kafgres_cdc_drop_slot()` drops it.
 
 The examples assume a `public.orders (id int, customer_id int, total numeric, status
 text)` table and a `customers (id int, name text, tier text)` lookup table.

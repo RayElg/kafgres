@@ -632,8 +632,8 @@ def no_background_sweep():
 
 @pytest.mark.skipif(engine() != "segment", reason="kafgres_produce() is segment engine only")
 def test_retention_forgets_a_large_marker_backlog_over_several_passes(topic, no_background_sweep):
-    """Markers below the log start are deleted a bounded number per pass, so a backlog
-    cannot outlast the statement timeout and keep the log start from moving."""
+    """Markers below the log start are deleted a bounded number per pass, so a large
+    backlog goes over several passes instead of stalling the broker in one."""
     sql("ALTER SYSTEM SET kafgres.segment_offsets = 4000")
     sql("ALTER SYSTEM SET kafgres.segment_bytes = 1048576")
     sql("SELECT pg_reload_conf()")
@@ -711,6 +711,7 @@ def test_markers_below_a_delete_records_go_on_a_topic_kept_forever(topic, no_bac
     below = f"""SELECT count(*) FROM kafgres_markers m
                   JOIN kafgres_topics t ON t.topic_id = m.topic_id
                  WHERE t.name = '{topic}' AND m.last_offset < 24000"""
-    assert int(sql(below)) == 4000, "DeleteRecords did not forget a bounded number"
     compact()
-    assert int(sql(below)) == 0, "a retention pass did not forget the rest"
+    assert int(sql(below)) == 4000, "a retention pass did not forget a bounded number"
+    compact()
+    assert int(sql(below)) == 0, "the next pass did not forget the rest"

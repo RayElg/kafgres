@@ -2514,11 +2514,6 @@ impl LogStore for SegmentStore {
         policy: &RetentionPolicy,
     ) -> StoreResult<u64> {
         if policy.retention_ms.is_none() && policy.retention_bytes.is_none() {
-            // DeleteRecords can still move the log start, leaving markers to forget.
-            for partition in pmeta::partitions(topic)? {
-                let start = pmeta::log_start_offset(topic, partition)?;
-                pmeta::forget_markers_below(topic, partition, start)?;
-            }
             return Ok(0);
         }
         let mut dropped = 0;

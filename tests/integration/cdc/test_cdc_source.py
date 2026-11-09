@@ -170,31 +170,6 @@ def test_a_mapping_does_not_wait_for_a_running_transaction_to_create_the_slot():
     sql("INSERT INTO src_orders VALUES (10,1,99.5,'placed','x')")
     assert drain() == 1
 
-def test_a_mapping_added_while_the_slot_is_being_built_is_saved_with_a_warning():
-    holder = subprocess.Popen(
-        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
-         "BEGIN; SELECT pg_current_xact_id(); SELECT pg_sleep(8); COMMIT"],
-        cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    builder = None
-    try:
-        time.sleep(1.5)
-        add_mapping("jsonb_build_object('id', new.id)")
-        builder = subprocess.Popen(
-            ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
-             "SELECT kafgres_cdc_create_slot()"],
-            cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1.5)
-        assert sql("SELECT count(*) FROM pg_replication_slots") == "1", "the slot is not being built"
-        out = psql("SELECT kafgres_add_mapping('m2', 'public.src_customers', 'src-events', "
-                   "$$jsonb_build_object('id', new.id)$$, 'new.id::text', NULL)")
-        assert out.returncode == 0, out.stderr[-500:]
-        assert "still being created" in out.stderr, out.stderr[-500:]
-    finally:
-        holder.wait(timeout=30)
-        if builder:
-            builder.wait(timeout=30)
-    assert sql("SELECT kafgres_slot_ready(5000)") == "slot ready"
-
 def test_a_mapping_creates_the_slot_among_short_transactions():
     busy = subprocess.Popen(
         ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
@@ -225,82 +200,17 @@ def test_slot_ready_answers_at_once_in_a_transaction_that_wrote():
     assert "slot not ready" in out.stdout
     assert "after it commits" in out.stderr, out.stderr[-500:]
 
-def test_the_worker_does_not_drop_the_slot_under_a_mapping_being_added():
-    set_guc("kafgres.cdc_unused_slot_ms", "1500")
-    set_guc("kafgres.cdc_interval_ms", "500")
-    try:
-        time.sleep(2)
-        add_mapping("jsonb_build_object('id', new.id)")
-        sql("SELECT kafgres_remove_mapping('m1')")
-        adding = subprocess.Popen(
-            ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "postgres", "-c",
-             "BEGIN; SELECT kafgres_add_mapping('m2', 'public.src_orders', 'src-events', "
-             "$$jsonb_build_object('id', new.id)$$, 'new.id::text', NULL); "
-             "SELECT pg_sleep(5); COMMIT"],
-            cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            time.sleep(4)
-            assert slot_count() == 1, "the slot went while a mapping was being added"
-        finally:
-            adding.wait(timeout=30)
-        time.sleep(3)
-        assert slot_count() == 1, "the slot went after the mapping committed"
-    finally:
-        set_guc("kafgres.cdc_interval_ms", "0")
-        sql("ALTER SYSTEM RESET kafgres.cdc_unused_slot_ms")
-        sql("SELECT pg_reload_conf()")
-        time.sleep(2)
 
-def test_a_mapping_is_saved_with_a_warning_when_every_slot_is_taken():
-    free = int(sql("SELECT current_setting('max_replication_slots')::int "
-                   "- (SELECT count(*) FROM pg_replication_slots)"))
-    fillers = [f"filler_{i}" for i in range(free)]
-    try:
-        for name in fillers:
-            sql(f"SELECT pg_create_physical_replication_slot('{name}')")
-        out = psql("SELECT kafgres_add_mapping('m1', 'public.src_orders', 'src-events', "
-                   "$$jsonb_build_object('id', new.id)$$, NULL, NULL)")
-        assert out.returncode == 0, out.stderr[-500:]
-        assert "max_replication_slots" in out.stderr, out.stderr[-500:]
-        assert sql("SELECT count(*) FROM kafgres_cdc_mappings WHERE mapping_name = 'm1'") == "1"
-    finally:
-        for name in fillers:
-            sql(f"SELECT pg_drop_replication_slot('{name}')")
-
-def test_the_worker_keeps_the_slot_for_a_disabled_mapping():
-    set_guc("kafgres.cdc_unused_slot_ms", "1500")
-    set_guc("kafgres.cdc_interval_ms", "500")
-    try:
-        time.sleep(2)
-        add_mapping("jsonb_build_object('id', new.id)")
-        sql("UPDATE kafgres_cdc_mappings SET enabled = false")
-        time.sleep(4)
-        assert slot_count() == 1, "the slot went while a disabled mapping still wanted it"
-    finally:
-        set_guc("kafgres.cdc_interval_ms", "0")
-        sql("ALTER SYSTEM RESET kafgres.cdc_unused_slot_ms")
-        sql("SELECT pg_reload_conf()")
-        time.sleep(2)
-
-def test_the_worker_drops_a_slot_no_mapping_wants():
-    set_guc("kafgres.cdc_unused_slot_ms", "1500")
-    set_guc("kafgres.cdc_interval_ms", "500")
-    try:
-        time.sleep(2)
-        add_mapping("jsonb_build_object('id', new.id)")
-        assert slot_count() == 1
-        time.sleep(4)
-        assert slot_count() == 1, "the slot went while a mapping wanted it"
-        sql("SELECT kafgres_remove_mapping('m1')")
-        deadline = time.time() + 20
-        while slot_count() and time.time() < deadline:
-            time.sleep(0.5)
-        assert slot_count() == 0, "the slot outlived its last mapping"
-    finally:
-        set_guc("kafgres.cdc_interval_ms", "0")
-        sql("ALTER SYSTEM RESET kafgres.cdc_unused_slot_ms")
-        sql("SELECT pg_reload_conf()")
-        time.sleep(2)
+def test_a_slot_no_mapping_wants_still_advances():
+    """Left after the last mapping goes, it holds no WAL while the drain runs."""
+    add_mapping("jsonb_build_object('id', new.id)")
+    sql("SELECT kafgres_remove_mapping('m1')")
+    assert slot_count() == 1
+    lsn = "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'kafgres_cdc'"
+    before = sql(lsn)
+    sql("INSERT INTO src_orders SELECT g, 1, 1, 'x', 'x' FROM generate_series(1, 500) g")
+    assert drain() == 0
+    assert sql(lsn) != before, "the slot did not advance with no mapping"
 
 def test_a_role_without_replication_saves_a_mapping_with_a_warning():
     sql("DROP ROLE IF EXISTS mapper")

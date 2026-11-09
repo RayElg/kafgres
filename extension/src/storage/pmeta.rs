@@ -214,15 +214,14 @@ pub fn advance_log_start(topic: TopicId, partition: i32, offset: i64) -> StoreRe
         &[(topic as i32).into(), partition.into(), offset.into()],
     )
     .map_err(spi_err)?;
-    forget_markers_below(topic, partition, offset)?;
     // The abort index describes offsets; when they go its entries are dead, and this is
     forget_aborted_below(topic, partition, offset)
 }
 
-/// Batches wholly below the log start are unreadable. Bounded, so a backlog cannot outlast
-/// the statement timeout; every retention pass calls this, and the rest goes on later
-/// passes. The `base_offset` bound is implied by `last_offset` but lets the planner use the
-/// primary key's range instead of scanning.
+/// Batches wholly below the log start are unreadable. Every retention pass calls this, a
+/// bounded number at a time, so a large backlog (one an upgrade leaves, say) goes over
+/// several passes instead of stalling the broker in one. The `base_offset` bound is implied
+/// by `last_offset` but lets the planner use the primary key's range instead of scanning.
 pub fn forget_markers_below(topic: TopicId, partition: i32, offset: i64) -> StoreResult<()> {
     Spi::run_with_args(
         "DELETE FROM kafgres_markers
@@ -508,14 +507,10 @@ pub fn forget_aborted_below(topic: TopicId, partition: i32, offset: i64) -> Stor
 
 /// Markers of batches compaction removed.
 pub fn forget_markers(topic: TopicId, partition: i32, bases: &[i64]) -> StoreResult<()> {
-    // In pieces, so no one statement nears the statement timeout.
-    for chunk in bases.chunks(10_000) {
-        Spi::run_with_args(
-            "DELETE FROM kafgres_markers
-              WHERE topic_id = $1::oid AND partition = $2 AND base_offset = ANY($3)",
-            &[(topic as i32).into(), partition.into(), chunk.to_vec().into()],
-        )
-        .map_err(spi_err)?;
-    }
-    Ok(())
+    Spi::run_with_args(
+        "DELETE FROM kafgres_markers
+          WHERE topic_id = $1::oid AND partition = $2 AND base_offset = ANY($3)",
+        &[(topic as i32).into(), partition.into(), bases.to_vec().into()],
+    )
+    .map_err(spi_err)
 }
