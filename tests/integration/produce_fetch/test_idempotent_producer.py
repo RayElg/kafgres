@@ -803,26 +803,23 @@ def test_a_restart_forgets_window_rows_past_the_recovered_log(topic):
         time.sleep(2)
     raise AssertionError("a window row past the log end survived the restart")
 
-@pytest.mark.skipif(sql("SHOW kafgres.storage_engine") != "segment",
-                    reason="the segment engine rebuilds its window from the log")
-@pytest.mark.parametrize("records", [2, 1500])
-def test_a_batch_whose_window_row_was_lost_is_not_appended_twice(topic, conn, records):
-    """A crash can keep a batch in the log and lose its window row. After the restart the
-    first idempotent produce rebuilds the row from the log, so the client's retry is
-    answered as a duplicate even when other writes have landed in between. 1500 records
-    is more than the rebuild's nearest start looks back, so the scan starts inside it."""
+SEGMENT_ONLY = pytest.mark.skipif(sql("SHOW kafgres.storage_engine") != "segment",
+                                  reason="the segment engine rebuilds its window from the log")
+
+def lose_window_rows(topic, producer_id):
+    """Leave the partition as a crash between a batch's append and its row's commit does:
+    the batch in the log, its row gone, and the checkpoint still below the batch. The
+    checkpoint is put at -1, a value no checkpoint pass wrote, so that a pass running
+    before the restart leaves it there."""
+    # One psql -c string, so one transaction.
+    sql(f"""DELETE FROM kafgres_producer_batches WHERE producer_id = {producer_id};
+            UPDATE kafgres_partitions SET window_checkpoint = -1
+             WHERE topic_id = (SELECT topic_id FROM kafgres_topics WHERE name = '{topic}')""")
+
+def retry_after_restart(topic, batch):
+    """Restart Postgres, then send `batch` again: (error, base offset)."""
     from conftest import BROKER_HOST, BROKER_PORT, Connection
     import socket
-
-    producer_id = init_producer_id(conn, 1)
-    batch = record_batch([b"a"] + [b"b"] * (records - 1), producer_id=producer_id,
-                         producer_epoch=0, base_sequence=0)
-    _, err, first = send_produce(conn, topic, batch, 2)
-    assert err == 0
-    sql(f"DELETE FROM kafgres_producer_batches WHERE producer_id = {producer_id}")
-    # Newer than the batch, so the rebuild's start by timestamp lands past it.
-    for i in range(3):
-        sql(f"SELECT kafgres_produce('{topic}', 'k', 'sql{i}')")
 
     subprocess.run(["docker", "compose", "restart", "postgres"], check=True, timeout=300,
                    capture_output=True)
@@ -839,7 +836,66 @@ def test_a_batch_whose_window_row_was_lost_is_not_appended_twice(topic, conn, re
         _, err, again = send_produce(fresh, topic, batch, 3)
     finally:
         fresh.sock.close()
+    return err, again
+
+@SEGMENT_ONLY
+@pytest.mark.parametrize("records", [2, 1500])
+def test_a_batch_whose_window_row_was_lost_is_not_appended_twice(topic, conn, records):
+    """A crash can keep a batch in the log and lose its window row. After the restart the
+    first idempotent produce rebuilds the row from the log, so the client's retry is
+    answered as a duplicate even when other writes have landed in between."""
+    producer_id = init_producer_id(conn, 1)
+    batch = record_batch([b"a"] + [b"b"] * (records - 1), producer_id=producer_id,
+                         producer_epoch=0, base_sequence=0)
+    _, err, first = send_produce(conn, topic, batch, 2)
+    assert err == 0
+    lose_window_rows(topic, producer_id)
+    for i in range(3):
+        sql(f"SELECT kafgres_produce('{topic}', 'k', 'sql{i}')")
+
+    err, again = retry_after_restart(topic, batch)
     assert err == 0, f"the retry failed with {err}"
     assert again == first, f"the retry was appended at {again}, not answered with {first}"
     back = kcat("-t", topic, "-C", "-o", "beginning", "-e", "-f", "%s\n")
     assert back.stdout.split().count("a") == 1, f"the batch was stored twice: {back.stdout.split()}"
+
+@SEGMENT_ONLY
+def test_a_lost_window_row_is_rebuilt_however_far_below_the_log_end(topic, conn):
+    """The rebuild starts where the surviving rows and the checkpoint say rows can be
+    missing, not a fixed distance below the log end: 60,000 records after the batch, and
+    its retry is still a duplicate."""
+    producer_id = init_producer_id(conn, 1)
+    batch = record_batch([b"a"], producer_id=producer_id, producer_epoch=0, base_sequence=0)
+    _, err, first = send_produce(conn, topic, batch, 2)
+    assert err == 0
+    lose_window_rows(topic, producer_id)
+    filler = record_batch([b"f"] * 1000)
+    for i in range(60):
+        _, err, _ = send_produce(conn, topic, filler, 10 + i)
+        assert err == 0
+
+    err, again = retry_after_restart(topic, batch)
+    assert err == 0, f"the retry failed with {err}"
+    assert again == first, f"the retry was appended at {again}, not answered with {first}"
+    end = int(sql(f"SELECT max(high_watermark) FROM kafgres_partition_offsets('{topic}')"))
+    assert end == first + 1 + 60_000, f"the batch was stored twice: the log ends at {end}"
+
+@SEGMENT_ONLY
+def test_the_window_checkpoint_follows_the_log(topic, conn):
+    """Once a partition's window is known complete, a pass records the log end as its
+    checkpoint, which is where a rebuild after a crash starts."""
+    def checkpoint():
+        return int(sql(f"""SELECT window_checkpoint FROM kafgres_partitions
+                            WHERE topic_id = (SELECT topic_id FROM kafgres_topics
+                                               WHERE name = '{topic}')"""))
+
+    assert checkpoint() == 0, "a new partition starts with nothing to rebuild"
+    producer_id = init_producer_id(conn, 1)
+    for seq in range(3):
+        batch = record_batch([b"v"], producer_id=producer_id, producer_epoch=0, base_sequence=seq)
+        _, err, _ = send_produce(conn, topic, batch, 2 + seq)
+        assert err == 0
+    deadline = time.time() + 60
+    while checkpoint() != 3:
+        assert time.time() < deadline, f"the checkpoint stayed at {checkpoint()}, not 3"
+        time.sleep(1)

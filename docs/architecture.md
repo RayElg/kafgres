@@ -115,6 +115,19 @@ The cost of transactionality is paid only when it is used: a plain produce never
 Postgres tables (an idempotent one records its sequence window there), while a
 transactional one adds a marker row to the caller's transaction.
 
+On the segment engine a batch reaches the log before the transaction holding its window
+row commits, so a crash can keep the batch and lose the row. After a restart the broker
+rebuilds the missing rows from the log before a partition takes its next idempotent
+produce, so a client's retry of that batch is answered as a duplicate instead of being
+appended again. The rebuild knows where to start. The broker commits one transaction at a
+time and a crash keeps a prefix of the WAL, so every lost row belongs to a batch above
+anything an earlier transaction recorded: the newest window row that survived, and
+`kafgres_partitions.window_checkpoint`, the log end the broker records for each partition
+about every ten seconds. The scan runs from the higher of the two to the log end at
+startup. A partition created before 0.3.3 that has no window row has neither until its
+first checkpoint, and for that one rebuild the start is estimated from the log tail's
+timestamps.
+
 ## Segment log replication
 
 A standby runs a background worker that pulls segments from the primary over a TCP

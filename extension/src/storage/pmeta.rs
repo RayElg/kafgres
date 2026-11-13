@@ -31,8 +31,9 @@ pub fn leader_epoch(topic: TopicId, partition: i32) -> StoreResult<i32> {
 /// The partition's metadata rows, including its own epoch-0 history entry. The entry
 pub fn create_partition(topic: TopicId, partition: i32, epoch: i32) -> StoreResult<()> {
     Spi::run_with_args(
-        "INSERT INTO kafgres_partitions (topic_id, partition, leader_epoch)
-         VALUES ($1::oid, $2, $3)
+        // An empty log has lost no window row, so its checkpoint is known: 0.
+        "INSERT INTO kafgres_partitions (topic_id, partition, leader_epoch, window_checkpoint)
+         VALUES ($1::oid, $2, $3, 0)
          ON CONFLICT (topic_id, partition) DO NOTHING",
         &[(topic as i32).into(), partition.into(), epoch.into()],
     )
