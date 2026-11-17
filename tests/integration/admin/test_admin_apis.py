@@ -345,3 +345,28 @@ def test_the_users_page_never_returns_a_verifier():
         assert "iterations=" in out.stdout, out.stdout
     finally:
         sql("DROP ROLE IF EXISTS leaky")
+
+@segment_only
+def test_a_described_transaction_is_the_live_producers_not_a_stale_rows():
+    """Two rows can share a transactional id (a producer whose abort did not take). The one
+    the producer id is currently mapped to is the transaction; the other must not be picked
+    by heap order, so the stale row is inserted first."""
+    txn = "adm-describe-stale-row"
+    stale, live = 9000000001, 9000000002
+    sql(f"DELETE FROM kafgres_txns WHERE transactional_id = '{txn}'")
+    sql(f"DELETE FROM kafgres_producers WHERE transactional_id = '{txn}'")
+    try:
+        sql(f"INSERT INTO kafgres_producers (producer_id, producer_epoch, transactional_id) "
+            f"VALUES ({live}, 5, '{txn}')")
+        sql(f"INSERT INTO kafgres_txns (producer_id, producer_epoch, transactional_id, state, started_at) "
+            f"VALUES ({stale}, 1, '{txn}', 'ongoing', 1)")
+        sql(f"INSERT INTO kafgres_txns (producer_id, producer_epoch, transactional_id, state, started_at) "
+            f"VALUES ({live}, 5, '{txn}', 'committed', 2)")
+        out = txn_tool("describe", "--transactional-id", txn)
+        assert out.returncode == 0, out.stdout + out.stderr
+        assert str(live) in out.stdout, out.stdout
+        assert str(stale) not in out.stdout, f"described the stale row: {out.stdout}"
+        assert "CompleteCommit" in out.stdout, out.stdout
+    finally:
+        sql(f"DELETE FROM kafgres_txns WHERE transactional_id = '{txn}'")
+        sql(f"DELETE FROM kafgres_producers WHERE transactional_id = '{txn}'")

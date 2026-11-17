@@ -22,6 +22,14 @@ def compose(*args, timeout=180, check=False):
     return out
 
 
+def client_network():
+    """`docker run --network` for a test client: the broker container's own namespace, so
+    `127.0.0.1:9092` and the advertised host reach this stack's broker whatever address
+    the host ports are bound to."""
+    cid = compose("ps", "-q", "postgres", check=True).stdout.strip()
+    return f"container:{cid}"
+
+
 def psql(query, timeout=60):
     """Run `query` in the broker's database; the whole CompletedProcess, errors included."""
     return compose("exec", "-T", "postgres", "psql", "-U", "postgres", "-d", "postgres",

@@ -162,6 +162,9 @@ from, so a reset moves where the next acquire begins.
   than RE2J: ordinary patterns, and leading options such as `(?i)`, behave the same; one
   Postgres cannot compile, such as
   `\p{L}+`, is refused with `INVALID_REGULAR_EXPRESSION` rather than matching nothing.
+  A commit at an older member epoch (KIP-1251) is accepted for any partition the member
+  still holds or has been granted. Kafka also refuses it when the epoch is older than the
+  epoch that partition was assigned at, and kafgres does not store that epoch.
 - **`ListOffsets` serves the full 1 to 11.** v7's `MAX_TIMESTAMP` (KIP-734) returns the
   offset of the record with the greatest timestamp, decoded from the winning batch rather
   than taken from its base offset; the two differ when a producer stamps timestamps out
@@ -187,7 +190,8 @@ from, so a reset moves where the next acquire begins.
   expect. Tools that consume `__consumer_offsets` directly to compute lag read nothing;
   a synthetic topic that lists in Metadata but yields no records was considered and
   rejected, because a tool would conclude the groups have committed nothing rather than
-  that the topic is not consumable.
+  that the topic is not consumable. DescribeTransactions does name it, with the partition
+  Kafka would hash the group to, once a transaction has added a group's offsets.
 
 ### Behavioural differences
 
@@ -256,10 +260,6 @@ matches.
 - **Static membership (KIP-345) is not enforced.** A member joining with a used
   `group.instance.id` does not fence the first; Kafka answers the first `FENCED_INSTANCE_ID`.
   `group-static` (Java, librdkafka, Sarama, franz-go); leave and rejoin matches.
-- **`OffsetCommit` does not validate the member.** kafgres stores a commit with no member
-  id and generation -1 while the group has members (Kafka: `UNKNOWN_MEMBER_ID`), and one
-  from a fenced member or a stale generation (Kafka: `ILLEGAL_GENERATION`). `group-admin`,
-  Java.
 - **Sarama-produced batches are not searchable by time.** Sarama sends max timestamp -1 in
   the batch header. Kafka recomputes it on append; kafgres stores header and CRC verbatim,
   so time lookups miss Sarama's records. `offsets-by-time`, `admin-offsets`, Sarama.

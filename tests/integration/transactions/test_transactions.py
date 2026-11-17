@@ -353,7 +353,8 @@ def test_expiry_fences_the_producer_it_gave_up_on(topic):
                          "WHERE transactional_id = 'kafgres-eos-open'"))
         sql("UPDATE kafgres_txns SET started_at = started_at - timeout_ms - 1000 "
             "WHERE state = 'ongoing'")
-        assert sql("SELECT kafgres_expire_transactions()") == "1"
+        # The broker's own sweep may get there first, so the count is not asserted.
+        sql("SELECT kafgres_expire_transactions()")
 
         after = int(sql("SELECT producer_epoch FROM kafgres_producers "
                         "WHERE transactional_id = 'kafgres-eos-open'"))

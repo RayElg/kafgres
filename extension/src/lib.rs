@@ -37,6 +37,8 @@ mod init150;
 mod init160;
 mod init170;
 mod init180;
+mod init190;
+mod init200;
 pub mod quota;
 pub mod meta;
 pub mod plan;
@@ -96,6 +98,8 @@ static CDC_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(1000);
 /// Bounds transactions, not changes: `upto_nchanges` is only consulted at commit
 static CDC_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(10_000);
 static CDC_SNAPSHOT_BATCH_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1_000);
+/// Well under jsonb's 256 MB cap, which one transaction's changes to a table can exceed.
+static CDC_CHUNK_BYTES: GucSetting<i32> = GucSetting::<i32>::new(16 * 1024 * 1024);
 static SHARE_LOCK_DURATION_MS: GucSetting<i32> = GucSetting::<i32>::new(30_000);
 
 static SEGMENT_ARCHIVE_COMMAND: GucSetting<Option<CString>> =
@@ -173,6 +177,10 @@ fn cdc_batch_size() -> i32 {
 
 pub fn cdc_snapshot_batch_rows() -> i32 {
     CDC_SNAPSHOT_BATCH_ROWS.get().max(1)
+}
+
+pub fn cdc_chunk_bytes() -> usize {
+    CDC_CHUNK_BYTES.get().max(1024) as usize
 }
 
 pub fn share_lock_duration_ms() -> i64 {
@@ -550,6 +558,16 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
+        c"kafgres.cdc_chunk_bytes",
+        c"Decoded change bytes the CDC drain buffers across all mappings; past it, the largest buffer renders",
+        c"",
+        &CDC_CHUNK_BYTES,
+        1024,
+        128 * 1024 * 1024,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
         c"kafgres.share_record_lock_duration_ms",
         c"How long a share-group consumer holds an acquired record before it is offered again",
         c"",
@@ -917,6 +935,8 @@ pub(crate) fn ensure_tables_exist() {
     init160::init_160();
     init170::init_170();
     init180::init_180();
+    init190::init_190();
+    init200::init_200();
 }
 
 pgrx::extension_sql!(
