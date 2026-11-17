@@ -619,3 +619,99 @@ def test_batches_larger_than_segment_bytes_still_compact(byte_arm_topic):
     assert len(got) < 2000, f"{len(got)} of 2000 records readable: nothing was compacted"
     latest = {k: int(o) for o, k in got}
     assert len(latest) == 50, f"a key was lost: {len(latest)} keys"
+
+@pytest.fixture
+def no_background_sweep():
+    """Only the test's own passes run, so it can count what each one forgets."""
+    sql("ALTER SYSTEM SET kafgres.retention_check_interval_ms = 3600000")
+    sql("SELECT pg_reload_conf()")
+    time.sleep(0.5)
+    yield
+    sql("ALTER SYSTEM RESET kafgres.retention_check_interval_ms")
+    sql("SELECT pg_reload_conf()")
+
+@pytest.mark.skipif(engine() != "segment", reason="kafgres_produce() is segment engine only")
+def test_retention_forgets_a_large_marker_backlog_over_several_passes(topic, no_background_sweep):
+    """Markers below the log start are deleted a bounded number per pass, so a large
+    backlog goes over several passes instead of stalling the broker in one."""
+    sql("ALTER SYSTEM SET kafgres.segment_offsets = 4000")
+    sql("ALTER SYSTEM SET kafgres.segment_bytes = 1048576")
+    sql("SELECT pg_reload_conf()")
+    time.sleep(0.5)
+    sql(f"SELECT count(kafgres_produce('{topic}', 'k', i::text)) FROM generate_series(1, 45000) i")
+    below = (f"""SELECT count(*) FROM kafgres_markers m
+                  JOIN kafgres_topics t ON t.topic_id = m.topic_id
+                  JOIN kafgres_partitions p ON p.topic_id = m.topic_id AND p.partition = m.partition
+                 WHERE t.name = '{topic}' AND m.last_offset < p.log_start_offset""")
+    log_start = f"""SELECT p.log_start_offset FROM kafgres_partitions p
+                      JOIN kafgres_topics t USING (topic_id) WHERE t.name = '{topic}'"""
+    assert kafka_tool("kafka-configs.sh", "--entity-type", "topics", "--entity-name", topic,
+                      "--alter", "--add-config", "retention.ms=1").returncode == 0
+    time.sleep(2)
+    compact()
+    moved = int(sql(log_start))
+    assert moved > 20_000, f"retention moved the log start only to {moved}"
+    assert int(sql(below)) == moved - 20_000, "the first pass did not forget a bounded number"
+    for _ in range(moved // 20_000):
+        compact()
+    assert int(sql(below)) == 0, "later passes did not forget the rest"
+
+@pytest.mark.skipif(engine() != "segment", reason="kafgres_produce() is segment engine only")
+def test_a_committed_read_passes_a_long_run_of_markers_left_by_compaction(topic, no_background_sweep):
+    """Markers whose batches compaction removed, more than one read looks at, as a lost
+    cleanup leaves them: a read_committed consumer still reaches the records after them."""
+    sql("ALTER SYSTEM SET kafgres.segment_offsets = 8000")
+    sql("ALTER SYSTEM SET kafgres.segment_bytes = 1048576")
+    sql("SELECT pg_reload_conf()")
+    time.sleep(0.5)
+    make_compacted(topic)
+    sql(f"SELECT count(kafgres_produce('{topic}', 'k', i::text)) FROM generate_series(1, 70000) i")
+    sql(f"SELECT count(kafgres_produce('{topic}', 'z' || i, i::text)) FROM generate_series(1, 9000) i")
+    ours = f"m.topic_id = (SELECT topic_id FROM kafgres_topics WHERE name = '{topic}')"
+    sql(f"DROP TABLE IF EXISTS saved_markers; "
+        f"CREATE TABLE saved_markers AS SELECT * FROM kafgres_markers m WHERE {ours}")
+    try:
+        for _ in range(3):
+            compact()
+        restored = int(sql("WITH r AS (INSERT INTO kafgres_markers SELECT * FROM saved_markers "
+                           "ON CONFLICT DO NOTHING RETURNING 1) SELECT count(*) FROM r"))
+        assert restored > 65_536, f"compaction removed only {restored} batches"
+        got = read_back(topic)
+        assert "k" in {line.split()[1] for line in got}, "the newest k was not read"
+        assert len({line.split()[1] for line in got if line.split()[1].startswith("z")}) == 9000
+    finally:
+        sql("DROP TABLE IF EXISTS saved_markers")
+
+@pytest.mark.skipif(engine() != "segment", reason="kafgres_produce() is segment engine only")
+@pytest.mark.parametrize("config", ["retention.ms=-1", "cleanup.policy=compact"])
+def test_markers_below_a_delete_records_go_on_a_topic_kept_forever(topic, no_background_sweep, config):
+    """With no time or size limit retention reclaims nothing itself, but DeleteRecords still
+    moves the log start, and later passes forget the markers left below it."""
+    import json
+    import tempfile
+
+    assert kafka_tool("kafka-configs.sh", "--entity-type", "topics", "--entity-name", topic,
+                      "--alter", "--add-config", config).returncode == 0
+    # Distinct keys, so compaction itself forgets none.
+    sql(f"SELECT count(kafgres_produce('{topic}', i::text, i::text)) FROM generate_series(1, 25000) i")
+    spec = {"partitions": [{"topic": topic, "partition": 0, "offset": 24000}], "version": 1}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "offsets.json")
+        with open(path, "w") as f:
+            json.dump(spec, f)
+        os.chmod(d, 0o755)
+        os.chmod(path, 0o644)
+        out = subprocess.run(
+            ["docker", "run", "--rm", "--network", "host", "-v", f"{d}:/w", KAFKA,
+             "/opt/kafka/bin/kafka-delete-records.sh", "--bootstrap-server", BROKER,
+             "--offset-json-file", "/w/offsets.json"],
+            capture_output=True, text=True, timeout=300,
+        )
+    assert out.returncode == 0, out.stderr
+    below = f"""SELECT count(*) FROM kafgres_markers m
+                  JOIN kafgres_topics t ON t.topic_id = m.topic_id
+                 WHERE t.name = '{topic}' AND m.last_offset < 24000"""
+    compact()
+    assert int(sql(below)) == 4000, "a retention pass did not forget a bounded number"
+    compact()
+    assert int(sql(below)) == 0, "the next pass did not forget the rest"

@@ -141,3 +141,30 @@ def test_a_classic_group_id_is_refused_rather_than_forked(topic):
     assert "m0" not in out.stdout, (
         f"refused the group but consumed from it anyway: {out.stdout[-400:]}"
     )
+
+def test_a_consumer_group_id_is_refused_to_a_classic_join(topic):
+    """The other way round: a classic member joining a consumer group's id would be given
+    the same partitions, and the group's own members would be told it is gone."""
+    name, grp = topic
+    produce(name, 10)
+    first = subprocess.run(
+        ["docker", "run", "--rm", "--network", "host", KAFKA,
+         "/opt/kafka/bin/kafka-console-consumer.sh", "--bootstrap-server", BROKER,
+         "--topic", name, "--from-beginning", "--group", grp,
+         "--consumer-property", "group.protocol=consumer",
+         "--timeout-ms", "12000", "--max-messages", "10"],
+        capture_output=True, text=True, timeout=120)
+    assert "m0" in first.stdout, "the consumer-protocol consumer did not run"
+
+    out = subprocess.run(
+        ["docker", "run", "--rm", "--network", "host", KAFKA,
+         "/opt/kafka/bin/kafka-console-consumer.sh", "--bootstrap-server", BROKER,
+         "--topic", name, "--from-beginning", "--group", grp,
+         "--consumer-property", "group.protocol=classic",
+         "--timeout-ms", "12000"],
+        capture_output=True, text=True, timeout=120)
+    combined = out.stdout + out.stderr
+    assert "InconsistentGroupProtocol" in combined, (
+        f"a classic join was allowed onto a consumer group id: {combined[-400:]}"
+    )
+    assert "m0" not in out.stdout, f"refused the join but consumed anyway: {out.stdout[-400:]}"

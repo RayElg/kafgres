@@ -73,18 +73,31 @@ pub fn sweep(cursor: u32) -> Result<Batch, spi::Error> {
                     }
                 }
             }
-            last = *topic_id;
-            continue;
+        } else {
+            let policy = crate::config::retention_policy(*topic_id)?;
+            match store.enforce_retention(*topic_id, &policy) {
+                Ok(n) => reclaimed += n,
+                Err(e) => pgrx::log!("kafgres: retention on topic {topic_id} failed: {e}"),
+            }
         }
-        let policy = crate::config::retention_policy(*topic_id)?;
-        match store.enforce_retention(*topic_id, &policy) {
-            Ok(n) => reclaimed += n,
-            Err(e) => pgrx::log!("kafgres: retention on topic {topic_id} failed: {e}"),
+        // Whatever moved the log start, retention or DeleteRecords, under any policy.
+        if crate::storage_engine_guc() == "segment" {
+            if let Err(e) = forget_markers_below_start(*topic_id) {
+                pgrx::log!("kafgres: forgetting markers on topic {topic_id} failed: {e}");
+            }
         }
         last = *topic_id;
     }
 
     Ok(Batch { next: last, examined: topics.len() as u64, reclaimed })
+}
+
+fn forget_markers_below_start(topic_id: u32) -> crate::storage::StoreResult<()> {
+    use crate::storage::pmeta;
+    for partition in pmeta::partitions(topic_id)? {
+        pmeta::forget_markers_below(topic_id, partition, pmeta::log_start_offset(topic_id, partition)?)?;
+    }
+    Ok(())
 }
 
 fn compact_topic(store: &mut dyn crate::storage::LogStore, topic_id: u32) -> Result<u64, spi::Error> {

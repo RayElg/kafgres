@@ -42,11 +42,37 @@ fn kafgres_add_mapping(
     if !valid_source(source_table) {
         error!("kafgres: {source_table:?} is not a plain schema-qualified table name");
     }
-    if crate::meta::topic_id_by_name(topic).ok().flatten().is_none() {
+    // Checked with reads that assign no xid, so the slot can still be created below.
+    let topic_exists = read_one::<i32>(
+        "SELECT (SELECT topic_id::int FROM kafgres_topics WHERE name = $1)",
+        &[topic.into()],
+    )
+    .unwrap_or_else(|e| error!("kafgres: {e}"))
+    .is_some();
+    if !topic_exists {
         error!("kafgres: no such topic {topic:?}; create it before mapping to it");
     }
 
     render_check(source_table, value_expr, key_expr, filter_expr);
+
+    // Created here, before this transaction writes, unless that would wait on a long
+    // transaction. Otherwise the worker creates it once the mapping commits; not an error,
+    // but changes before the slot is ready are not captured.
+    if !slot_exists() {
+        let late = slot_preconditions().err().or_else(|| {
+            if !running_transactions_finish(std::time::Duration::from_secs(1)) {
+                Some("a running transaction would hold the slot's creation".to_string())
+            } else {
+                create_slot().err()
+            }
+        });
+        if let Some(why) = late {
+            warning!(
+                "kafgres: {why}; the mapping is saved, but changes before its slot is ready are \
+                 not captured (kafgres_slot_ready() waits for it)"
+            );
+        }
+    }
 
     Spi::run_with_args(
         "INSERT INTO kafgres_cdc_mappings
@@ -281,6 +307,18 @@ fn slot_exists() -> bool {
     .unwrap_or(false)
 }
 
+/// Exists and has its snapshot, so it captures from here on.
+fn slot_built() -> bool {
+    read_one::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_replication_slots
+                        WHERE slot_name = $1 AND confirmed_flush_lsn IS NOT NULL)",
+        &[SLOT.into()],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 /// Checked, not attempted: a failed creation leaves an undroppable half-built slot behind.
 fn slot_preconditions() -> Result<(), String> {
     let wal_level = read_one::<String>("SELECT current_setting('wal_level')", &[])?
@@ -291,8 +329,9 @@ fn slot_preconditions() -> Result<(), String> {
         ));
     }
 
+    // `pg_settings`, not `current_setting`, which raises for a role that may not read it.
     if let Some(libs) = read_one::<String>(
-        "SELECT current_setting('output_plugin_libraries', true)",
+        "SELECT (SELECT setting FROM pg_settings WHERE name = 'output_plugin_libraries')",
         &[],
     )? {
         if !libs.split(',').any(|l| l.trim() == "kafgres") {
@@ -302,13 +341,65 @@ fn slot_preconditions() -> Result<(), String> {
         }
     }
 
-    if read_one::<i64>("SELECT pg_current_xact_id_if_assigned()::text::bigint", &[])?.is_some() {
+    if !read_one::<bool>(
+        "SELECT (SELECT rolsuper OR rolreplication FROM pg_roles WHERE rolname = current_user)",
+        &[],
+    )?
+    .unwrap_or(false)
+    {
+        return Err(
+            "cannot create the CDC slot: this role needs the REPLICATION attribute or superuser"
+                .to_string(),
+        );
+    }
+
+    if has_xid()? {
         return Err(
             "cannot create the CDC slot: this transaction has already been assigned an xid"
                 .to_string(),
         );
     }
     Ok(())
+}
+
+/// The current transaction has written, so a slot cannot be created in it or wait on it.
+fn has_xid() -> Result<bool, String> {
+    Ok(read_one::<i64>("SELECT pg_current_xact_id_if_assigned()::text::bigint", &[])?.is_some())
+}
+
+/// Whether `done` turns true within `within`, asking every `every`.
+fn poll(within: std::time::Duration, every: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if done() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        pgrx::check_for_interrupts!();
+        std::thread::sleep(every);
+    }
+}
+
+/// Slot creation waits for the transactions holding an xid. If the ones running now finish
+/// within `within`, those it waits on are likely as short. Assigns no xid.
+fn running_transactions_finish(within: std::time::Duration) -> bool {
+    let Ok(Some(running)) =
+        with_latest_snapshot(|| read_one::<String>("SELECT pg_current_snapshot()::text", &[]))
+    else {
+        return false;
+    };
+    poll(within, std::time::Duration::from_millis(20), || {
+        read_one::<bool>(
+            "SELECT NOT EXISTS(SELECT 1 FROM pg_snapshot_xip($1::pg_snapshot) x
+                                WHERE pg_xact_status(x) = 'in progress')",
+            &[running.as_str().into()],
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+    })
 }
 
 fn enabled_mappings_exist() -> bool {
@@ -328,6 +419,12 @@ pub fn ensure_slot() -> Result<bool, String> {
     if !enabled_mappings_exist() {
         return Ok(false);
     }
+    create_slot()?;
+    Ok(true)
+}
+
+/// Refused in a transaction that has written.
+fn create_slot() -> Result<(), String> {
     slot_preconditions()?;
 
     // Serialise, then re-check: the worker and the SQL entry point race. An advisory lock assigns no xid.
@@ -342,7 +439,7 @@ pub fn ensure_slot() -> Result<bool, String> {
     })
     .map_err(|e| format!("could not lock for CDC slot creation: {e}"))?;
     if slot_exists() {
-        return Ok(true);
+        return Ok(());
     }
 
     // `client.select`, not `Spi::run`: the latter assigns the xid that disqualifies creation.
@@ -362,7 +459,7 @@ pub fn ensure_slot() -> Result<bool, String> {
         .map_err(|e| format!("could not reset CDC delivery positions: {e}"))?;
 
     log!("kafgres: created logical replication slot {SLOT:?} for CDC");
-    Ok(true)
+    Ok(())
 }
 
 /// Peek, not `get_changes`: advancing only after producing costs duplicates on a crash, not losses.
@@ -939,6 +1036,13 @@ fn drain_locked(max_changes: i32, mode: Mode, lock: &DrainLock) -> Result<Draine
         let mappings = load_mappings()?;
         open_cursor(max_changes)?;
         let first = fetch_peeked(chunk_bytes())?;
+        // The first fetch decodes the WAL. A mapping that committed since the load may own
+        // changes just decoded, and this drain has no lane for them; leave them for the next.
+        if !same_definitions(&mappings, &with_latest_snapshot(load_mappings)?) {
+            close_cursor()?;
+            lock.release()?;
+            return Ok(None);
+        }
         Ok(Some((mappings, first)))
     })?;
     let Some((mappings, first)) = opened else {
@@ -1169,6 +1273,23 @@ struct Mapping {
     on_error: String,
     /// The last change this mapping rendered, so a replay held for another mapping skips it.
     delivered: Option<Pos>,
+}
+
+fn same_definitions(a: &[Mapping], b: &[Mapping]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            (&x.name, &x.source, &x.topic, &x.value_expr, &x.key_expr, &x.filter_expr, &x.on_error)
+                == (&y.name, &y.source, &y.topic, &y.value_expr, &y.key_expr, &y.filter_expr, &y.on_error)
+        })
+}
+
+/// A read-only SPI query uses the active snapshot, which in a worker step predates commits
+/// since the step began; this makes it see them.
+fn with_latest_snapshot<T>(f: impl FnOnce() -> T) -> T {
+    unsafe { pg_sys::PushActiveSnapshot(pg_sys::GetLatestSnapshot()) };
+    let out = f();
+    unsafe { pg_sys::PopActiveSnapshot() };
+    out
 }
 
 fn load_mappings() -> Result<Vec<Mapping>, String> {
@@ -1470,6 +1591,27 @@ fn kafgres_cdc_create_slot() -> bool {
     match ensure_slot() {
         Ok(created) => created,
         Err(e) => error!("kafgres: {e}"),
+    }
+}
+
+/// Wait until the slot is ready to capture: "slot ready", or "slot not ready" once
+/// `timeout_ms` passes. The slot is created by `kafgres_add_mapping`, or by the worker once
+/// the transactions it waits on finish. Creates nothing itself.
+#[pg_extern]
+fn kafgres_slot_ready(timeout_ms: default!(i32, 120000)) -> &'static str {
+    // The slot waits for this transaction, and its mapping is not visible to the worker yet.
+    if has_xid().unwrap_or_else(|e| error!("kafgres: {e}")) && !slot_built() {
+        warning!(
+            "kafgres: the slot cannot be ready before this transaction ends, since it has \
+             written; call kafgres_slot_ready() after it commits"
+        );
+        return "slot not ready";
+    }
+    let within = std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    if poll(within, std::time::Duration::from_millis(100), slot_built) {
+        "slot ready"
+    } else {
+        "slot not ready"
     }
 }
 

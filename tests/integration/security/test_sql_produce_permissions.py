@@ -14,7 +14,7 @@ TOPIC = "sql-produce-perms"
 PUBLIC_FUNCTIONS = {
     "kafgres_produce", "kafgres_version", "kafgres_kafka_version",
     "kafgres_partition_offsets", "kafgres_archive_status", "kafgres_cdc_status",
-    "kafgres_cdc_snapshots", "kafgres_share_state",
+    "kafgres_cdc_snapshots", "kafgres_share_state", "kafgres_follower_lag",
 }
 
 def as_role(statement):
