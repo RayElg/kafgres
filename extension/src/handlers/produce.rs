@@ -610,10 +610,12 @@ fn plan_partition(
         });
         let decision = match prior {
             Some((_, prev)) => decide_after(&batches, prev, idem)?,
-            None => match producer::check(
-                producer_id, idem.epoch, idem.first_seq, idem.last_seq, tid, index,
-            )
-            .map_err(|e| AppendError::ProducerState(e.to_string()))?
+            None => match producer::ensure_window(tid, index)
+                .map_err(AppendError::ProducerState)
+                .and_then(|()| {
+                    producer::check(producer_id, idem.epoch, idem.first_seq, idem.last_seq, tid, index)
+                        .map_err(|e| AppendError::ProducerState(e.to_string()))
+                })?
             {
                 SequenceCheck::Append => Decision::Append(idem),
                 SequenceCheck::Duplicate { base_offset } if base_offset < 0 => {
