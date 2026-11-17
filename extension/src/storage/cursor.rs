@@ -134,8 +134,14 @@ impl RecordCursor {
                 self.next
             )));
         }
-        // Nothing served below the end: the rest of the range was compacted away.
-        self.next = if served { advanced } else { self.range.end };
+        // Nothing served: resume where the store stopped looking, or the range is done.
+        self.next = if served {
+            advanced
+        } else if slice.next_offset > self.next {
+            slice.next_offset.min(self.range.end)
+        } else {
+            self.range.end
+        };
         // Rebuilt per chunk, like a Fetch response: each read lists every abort overlapping its
         // start, since an entry is kept until the log start passes its marker.
         self.filter = match self.isolation {

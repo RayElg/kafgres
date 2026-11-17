@@ -36,6 +36,10 @@ range is returned even if its own timestamp falls outside the bounds, which a pr
 setting its own `CreateTime` out of order can cause. Add a `WHERE timestamp >= ...` clause to
 drop such records.
 
+On the segment engine a time-bounded read waits up to 30 seconds for the broker to start,
+which brings old time indexes up to date. A standby has no broker, so there a time-bounded
+read is refused; offset bounds still work.
+
 Kafka offsets are per partition, so offset bounds given with `partition => NULL` apply to
 every partition alike. Time bounds are the ones that mean the same thing across partitions.
 

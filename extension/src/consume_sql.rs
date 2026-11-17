@@ -104,6 +104,16 @@ fn kafgres_read(
     // answers timestamp lookups wrongly. Offsets need no wait.
     let by_time = bounds.from_time.is_some() || bounds.to_time.is_some();
     if by_time && crate::storage_engine_guc() == "segment" {
+        // No broker on a standby, so the wait would only time out.
+        // SAFETY: reads shared state; any backend may call it.
+        if unsafe { pg_sys::RecoveryInProgress() } {
+            pgrx::ereport!(
+                pgrx::PgLogLevel::ERROR,
+                pgrx::PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
+                "kafgres: kafgres_read() time bounds are not available on a standby with the segment engine",
+                "Use from_offset and to_offset here, or run the time-bounded read on the primary."
+            );
+        }
         crate::server::wait_for_epochs();
     }
 
