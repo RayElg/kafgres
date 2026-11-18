@@ -140,12 +140,7 @@ fn kafgres_read(
         let (header_keys, header_values) = r
             .headers
             .into_iter()
-            .map(|(k, v)| {
-                (
-                    String::from_utf8_lossy(&k).into_owned(),
-                    v.map(|v| v.to_vec()),
-                )
-            })
+            .map(|(k, v)| (header_key(&k), v.map(|v| v.to_vec())))
             .unzip();
         (
             Some(partition),
@@ -197,6 +192,11 @@ impl Iterator for Rows {
     }
 }
 
+/// A header key as `text`: invalid UTF-8 and NUL, which `text` cannot hold, read as U+FFFD.
+fn header_key(key: &[u8]) -> String {
+    String::from_utf8_lossy(key).replace('\0', "\u{FFFD}")
+}
+
 /// The calling role and its address, as `kafgres_produce()` names them to the ACLs.
 fn caller() -> (String, String) {
     // Not `Spi::get_two`, which assigns the caller's transaction an xid.
@@ -241,6 +241,13 @@ fn timestamptz(ms: i64) -> Option<TimestampWithTimeZone> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_keys_never_hold_nul_or_invalid_utf8() {
+        assert_eq!(header_key(b"trace-id"), "trace-id");
+        assert_eq!(header_key(b"a\0b"), "a\u{FFFD}b");
+        assert_eq!(header_key(&[b'a', 0xff]), "a\u{FFFD}");
+    }
 
     #[test]
     fn timestamp_bounds_round_up_to_the_millisecond() {

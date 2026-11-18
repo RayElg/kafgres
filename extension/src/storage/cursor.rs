@@ -104,10 +104,36 @@ impl RecordCursor {
     }
 
     fn read_chunk(&mut self) -> StoreResult<()> {
-        let slice = crate::dbtx::released(|| {
-            self.store
-                .read(self.topic, self.partition, self.next, CHUNK_BYTES, self.isolation)
-        })?;
+        let slice = loop {
+            let read = crate::dbtx::released(|| {
+                self.store.read(
+                    self.topic,
+                    self.partition,
+                    self.next,
+                    CHUNK_BYTES,
+                    self.isolation,
+                )
+            });
+            match read {
+                // Retention moved the log start past the cursor since the range was fixed:
+                // what it deleted is missing from the result, as the docs say. Each pass
+                // moves `next` forward, so this ends.
+                Err(StoreError::OffsetOutOfRange) => {
+                    let start = crate::dbtx::released(|| {
+                        self.store.log_start_offset(self.topic, self.partition)
+                    })?;
+                    // Not retention: the offset is past the log end (a truncated follower).
+                    if start <= self.next {
+                        return Err(StoreError::OffsetOutOfRange);
+                    }
+                    self.next = start.min(self.range.end);
+                    if self.next >= self.range.end {
+                        return Ok(());
+                    }
+                }
+                other => break other?,
+            }
+        };
         // A batch reaching where the aborted list was cut short is read again from there.
         let judged_below = slice.aborted_cut_at.unwrap_or(i64::MAX);
         let served = !slice.bytes.is_empty();

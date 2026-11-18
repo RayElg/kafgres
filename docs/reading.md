@@ -53,7 +53,7 @@ every partition alike. Time bounds are the ones that mean the same thing across 
 | `timestamp_type` | `text` | `CreateTime` or `LogAppendTime` |
 | `key` | `bytea` | NULL for a null key |
 | `value` | `bytea` | NULL for a tombstone |
-| `header_keys` | `text[]` | in record order; bytes that are not UTF-8 read as U+FFFD, as a Java consumer decodes them |
+| `header_keys` | `text[]` | in record order; bytes that are not UTF-8, and NUL bytes, which `text` cannot hold, read as U+FFFD |
 | `header_values` | `bytea[]` | in the same order; an element is NULL for a null value |
 | `leader_epoch` | `int` | the partition leader epoch the batch was written under |
 | `producer_id` | `bigint` | NULL outside idempotent and transactional producers |
@@ -94,7 +94,8 @@ producers update for every batch, and their produce slows. Bounded ranges keep s
 
 A scan does not hold the log against retention, even inside a longer transaction: each
 read releases its locks when it returns, so the broker can still roll and drop segments.
-Records retention deletes while a scan runs can be missing from its result.
+Records retention deletes while a scan runs can be missing from its result; a scan that
+retention overtakes carries on from the new log start rather than failing.
 
 ## What `read_committed` hides
 
