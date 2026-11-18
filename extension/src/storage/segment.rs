@@ -2087,6 +2087,7 @@ impl LogStore for SegmentStore {
         let mut out: Vec<u8> = Vec::new();
         let mut next = offset;
         let mut aborted: Vec<super::AbortedTxn> = Vec::new();
+        let mut aborted_cut_at = None;
 
         let mut offset = offset;
         if offset < ceiling {
@@ -2239,7 +2240,10 @@ impl LogStore for SegmentStore {
 
             // Kafka's aborts, scoped to what this response returned: bounding by the ceiling rather
             if matches!(isolation, IsolationLevel::ReadCommitted) {
-                aborted.extend(pmeta::aborted_txns(topic, partition, offset, next.max(offset + 1))?);
+                let (listed, cut) =
+                    pmeta::aborted_txns(topic, partition, offset, next.max(offset + 1))?;
+                aborted.extend(listed);
+                aborted_cut_at = cut;
             }
         }
 
@@ -2250,6 +2254,7 @@ impl LogStore for SegmentStore {
             log_start_offset: log_start,
             last_stable_offset: lso,
             aborted,
+            aborted_cut_at,
         })
     }
 

@@ -69,16 +69,7 @@ fn kafgres_produce(
             "kafgres_produce() needs INSERT on kafgres_markers."
         );
     }
-    match crate::acl::sql_caller_may_write(&role, &host, topic) {
-        Ok(true) => {}
-        Ok(false) => pgrx::ereport!(
-            pgrx::PgLogLevel::ERROR,
-            pgrx::PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
-            format!("kafgres: User:{role} is not allowed to WRITE topic {topic:?}"),
-            "kafgres.acls_enabled is on and kafgres_acls grants this role no WRITE on the topic."
-        ),
-        Err(e) => error!("kafgres: could not read kafgres_acls: {e}"),
-    }
+    crate::acl::sql_require(crate::acl::Operation::Write, &role, &host, topic);
 
     // murmur2 on the key, matching what Kafka clients do, so a key produced through SQL
     // lands on the partition a client would have chosen for it.
