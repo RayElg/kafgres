@@ -188,8 +188,9 @@ Install the new build, restart Postgres, then run `ALTER EXTENSION kafgres UPDAT
 database the broker uses. The broker keeps serving after the restart, before the update
 runs.
 
-- **From 0.3.0:** the update adds `kafgres_read()` ([docs/reading.md](docs/reading.md)),
-  which no role can execute until it is granted. Transaction markers written before 0.3.1 have no
+- **From before 0.4.0:** the update adds `kafgres_read()` ([docs/reading.md](docs/reading.md)).
+  No role can execute it until it is granted.
+- **From 0.3.0:** transaction markers written before 0.3.1 have no
   `EndTransactionMarker` value, which Sarama cannot decode. They stay until
   retention removes their segments. A Sarama consumer can start after the last such
   marker, or the topic can be recreated.
