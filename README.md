@@ -61,8 +61,8 @@ kafgres.advertised_host = '<host that Kafka clients can reach>'
 CREATE EXTENSION kafgres;
 ```
 
-On Debian, installing the Postgres package creates a cluster of its own, on port 5433 if
-5432 is taken. `pg_lsclusters` shows which port it uses. If you use `pig` to install
+On Debian, installing the Postgres package creates a cluster of its own.
+`pg_lsclusters` lists it. If you use `pig` to install
 Postgres itself, or run the full Pigsty distribution, list `kafgres` among the cluster's
 extensions instead.
 
