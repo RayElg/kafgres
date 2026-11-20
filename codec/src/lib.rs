@@ -1,6 +1,7 @@
 //! Kafka wire protocol codec for kafgres. Free of pgrx and libpq, so protocol correctness
 
 pub mod compaction;
+pub mod consume;
 pub mod errors;
 pub mod framing;
 pub mod header;

@@ -322,7 +322,478 @@ pub fn forget_past(topic_id: u32, partition: i32, end: i64) -> Result<(), spi::E
         "DELETE FROM kafgres_producer_batches
           WHERE topic_id = $1::oid AND partition = $2 AND base_offset >= $3",
         &[(topic_id as i32).into(), partition.into(), end.into()],
+    )?;
+    // Nor does a checkpoint past it stand: those offsets are about to be written again.
+    crate::plan::run(
+        "UPDATE kafgres_partitions SET window_checkpoint = $3
+          WHERE topic_id = $1::oid AND partition = $2 AND window_checkpoint > $3",
+        &[(topic_id as i32).into(), partition.into(), end.into()],
     )
+}
+
+/// For a partition with nothing to start a rebuild from (see [`rebuild_from`]): how far below
+/// the log end to rescan, as (slack in ms before the newest batch's timestamp, fewest offsets,
+/// most offsets). A crash loses only what was appended but not yet committed, which is the
+/// log's tail. Strict commits lose only requests in flight; with `relaxed_produce_commit` the
+/// rows since the last WAL flush go too.
+fn rebuild_lookback() -> (i64, i64, i64) {
+    if !crate::relaxed_produce_commit() {
+        return (1_000, 1_000, 50_000);
+    }
+    let wal_delay_ms = crate::plan::get_one::<i64>(
+        "SELECT (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_writer_delay')",
+        &[],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(200);
+    ((3 * wal_delay_ms).max(5_000), 5_000, 2_000_000)
+}
+
+/// The offset below which no window row of the partition can be missing, from what survived
+/// the crash; `None` when nothing did.
+///
+/// The broker is one process and runs one transaction at a time, each committing in WAL order,
+/// and a crash keeps a prefix of the WAL. So the rows a crash loses belong to the newest
+/// transactions, and every batch they appended lies above anything an earlier, surviving
+/// transaction recorded: the checkpoint, which a transaction wrote as the log end it saw
+/// (`checkpoint_windows`), and the newest surviving row's batch. Rows can be deleted (pruned,
+/// expired) without the bound moving up, which only makes the scan longer.
+fn rebuild_from(checkpoint: Option<i64>, newest_row: Option<i64>) -> Option<i64> {
+    match (checkpoint, newest_row) {
+        (None, None) => None,
+        (c, r) => Some(c.unwrap_or(i64::MIN).max(r.unwrap_or(i64::MIN))),
+    }
+}
+
+/// The partition's checkpoint column and the highest offset a window row of it holds.
+fn rebuild_evidence(topic_id: u32, partition: i32) -> Result<(Option<i64>, Option<i64>), String> {
+    crate::plan::select(
+        "SELECT (SELECT window_checkpoint FROM kafgres_partitions
+                  WHERE topic_id = $1::oid AND partition = $2),
+                (SELECT max(base_offset) FROM kafgres_producer_batches
+                  WHERE topic_id = $1::oid AND partition = $2 AND base_offset >= 0)",
+        &[(topic_id as i32).into(), partition.into()],
+        |rows| {
+            let mut found = (None, None);
+            for row in rows {
+                found = (row.get::<i64>(1)?, row.get::<i64>(2)?);
+            }
+            Ok(found)
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Where a rebuild starts on a partition created before 0.3.3 that has no window row and has
+/// not been checkpointed yet, which leaves a guess: the offset `slack` before the log tail's
+/// timestamp, within the bounds. Client timestamps can be stale or ahead, so the bounds decide
+/// when they mislead. Once the partition is rebuilt it is checkpointed, and later rebuilds
+/// start from that.
+fn rebuild_start(
+    store: &dyn crate::storage::LogStore,
+    topic_id: u32,
+    partition: i32,
+    end: i64,
+) -> Result<i64, String> {
+    use kafgres_codec::records::RecordBatch;
+
+    let (slack_ms, fewest, most) = rebuild_lookback();
+    let nearest = end.saturating_sub(fewest);
+    let farthest = end.saturating_sub(most);
+    let tail = store
+        .read(topic_id, partition, end - 1, 1 << 20, crate::storage::IsolationLevel::ReadUncommitted)
+        .map_err(|e| e.to_string())?;
+    // The first batch of the slice, which holds `end - 1`; later appends may follow it.
+    let first_len = tail
+        .bytes
+        .get(kafgres_codec::records::LENGTH_OFFSET..kafgres_codec::records::LENGTH_OFFSET + 4)
+        .map(|b| i32::from_be_bytes(b.try_into().expect("4 bytes")).max(0) as usize)
+        .map(|len| kafgres_codec::records::LENGTH_OFFSET + 4 + len);
+    let Some(tail_ts) = first_len
+        .and_then(|n| tail.bytes.get(..n))
+        .and_then(|b| RecordBatch::new(kafgres_codec::bytes::Bytes::copy_from_slice(b)).ok())
+        .map(|b| b.max_timestamp())
+        // One ahead by more than the slack would find little or nothing after it, the
+        // narrowest start.
+        .filter(|&t| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(i64::MAX, |d| d.as_millis() as i64);
+            t > slack_ms && t <= now.saturating_add(slack_ms)
+        })
+    else {
+        return Ok(farthest);
+    };
+    let from = store
+        .offset_for_timestamp(topic_id, partition, tail_ts - slack_ms)
+        .map_err(|e| e.to_string())?
+        .map_or(nearest, |(offset, _)| offset);
+    Ok(from.clamp(farthest, nearest))
+}
+
+type Partitions = std::collections::HashSet<(u32, i32)>;
+
+static STARTUP_END: std::sync::Mutex<Option<std::collections::HashMap<(u32, i32), i64>>> =
+    std::sync::Mutex::new(None);
+
+/// The log end when this process started, where a window rebuild looks back from.
+pub fn note_startup_end(topic_id: u32, partition: i32, end: i64) {
+    STARTUP_END
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert((topic_id, partition), end);
+}
+
+static WINDOW_REBUILT: std::sync::Mutex<Option<Partitions>> = std::sync::Mutex::new(None);
+
+thread_local! {
+    /// Rebuilt in the current transaction, not yet committed.
+    static REBUILT_PENDING: std::cell::RefCell<Option<Partitions>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Before the first idempotent produce to a partition after this process starts, rebuild its
+/// window from the log (segment engine only; the table engine commits a batch and its row
+/// together). The partition counts as rebuilt only once the transaction holding the rows
+/// commits; a rollback, or a failure, leaves it for the next produce to try again.
+pub fn ensure_window(topic_id: u32, partition: i32) -> Result<(), String> {
+    use pgrx::{PgSubXactCallbackEvent, PgXactCallbackEvent};
+
+    if crate::storage_engine_guc() != "segment" {
+        return Ok(());
+    }
+    let key = (topic_id, partition);
+    if WINDOW_REBUILT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.contains(&key))
+        || REBUILT_PENDING.with(|p| p.borrow().as_ref().is_some_and(|s| s.contains(&key)))
+    {
+        return Ok(());
+    }
+    let store = crate::storage::open();
+    rebuild_window(&*store, topic_id, partition).map_err(|e| {
+        format!("could not rebuild the idempotence window for topic {topic_id} partition {partition}: {e}")
+    })?;
+
+    let first = REBUILT_PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let first = p.is_none();
+        p.get_or_insert_with(Default::default).insert(key);
+        first
+    });
+    if first {
+        pgrx::register_xact_callback(PgXactCallbackEvent::Commit, || {
+            let done = REBUILT_PENDING.with(|p| p.borrow_mut().take());
+            if let Some(done) = done {
+                WINDOW_REBUILT
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert_with(Default::default)
+                    .extend(done);
+            }
+        });
+        pgrx::register_xact_callback(PgXactCallbackEvent::Abort, || {
+            REBUILT_PENDING.with(|p| p.borrow_mut().take());
+        });
+        // A rolled-back subtransaction may hold the rows: forget, and rebuild again.
+        pgrx::register_subxact_callback(PgSubXactCallbackEvent::AbortSub, |_, _| {
+            REBUILT_PENDING.with(|p| p.borrow_mut().take());
+        });
+    }
+    Ok(())
+}
+
+/// Re-create window rows for batches the log holds and the window lacks, so a retry after a
+/// crash between the append and the row's commit is not appended twice.
+pub fn rebuild_window(
+    store: &dyn crate::storage::LogStore,
+    topic_id: u32,
+    partition: i32,
+) -> Result<u64, String> {
+    use kafgres_codec::records::{RecordBatch, LENGTH_OFFSET};
+    use std::collections::HashMap;
+
+    // Only what the log held at startup can have lost a row; later appends were recorded.
+    let end = store
+        .high_watermark(topic_id, partition)
+        .map_err(|e| e.to_string())?;
+    let log_start = store
+        .log_start_offset(topic_id, partition)
+        .map_err(|e| e.to_string())?;
+    // A partition missing from a recorded startup was created since, so it lost nothing.
+    let end = match STARTUP_END.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        Some(m) => m.get(&(topic_id, partition)).map_or(log_start, |&at_start| at_start.min(end)),
+        None => end,
+    };
+    let (checkpoint, newest_row) = rebuild_evidence(topic_id, partition)?;
+    CHECKPOINTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .known
+        .get_or_insert_with(Default::default)
+        .insert((topic_id, partition), checkpoint);
+    let mut at = if end > log_start {
+        match rebuild_from(checkpoint, newest_row) {
+            Some(from) => from,
+            None => rebuild_start(store, topic_id, partition, end)?,
+        }
+        .max(log_start)
+    } else {
+        log_start
+    };
+    if end - at > LONG_REBUILD {
+        pgrx::log!(
+            "kafgres: rebuilding the idempotence window of topic {topic_id} partition \
+             {partition} from offset {at} to {end}"
+        );
+    }
+
+    // Per producer: (epoch, last_seq) of its newest row, `None` with no window here.
+    let mut newest: HashMap<i64, Option<(i16, i32)>> = HashMap::new();
+    let mut rebuilt = 0u64;
+    while at < end {
+        let slice = store
+            .read(topic_id, partition, at, 4 << 20, crate::storage::IsolationLevel::ReadUncommitted)
+            .map_err(|e| e.to_string())?;
+        if slice.bytes.is_empty() {
+            break;
+        }
+        let mut pos = 0usize;
+        while pos + LENGTH_OFFSET + 4 <= slice.bytes.len() {
+            let len = i32::from_be_bytes(
+                slice.bytes[pos + LENGTH_OFFSET..pos + LENGTH_OFFSET + 4]
+                    .try_into()
+                    .expect("4 bytes"),
+            );
+            let total = LENGTH_OFFSET + 4 + len.max(0) as usize;
+            if len <= 0 || pos + total > slice.bytes.len() {
+                break;
+            }
+            let bytes = kafgres_codec::bytes::Bytes::copy_from_slice(&slice.bytes[pos..pos + total]);
+            pos += total;
+            let Ok(batch) = RecordBatch::new(bytes) else { continue };
+            let (pid, epoch, first) = (batch.producer_id(), batch.producer_epoch(), batch.base_sequence());
+            // A batch straddling the start is read whole and kept: it may be the newest one.
+            if pid < 0 || epoch < 0 || first < 0 || batch.is_control() {
+                continue;
+            }
+            let last = increment_sequence(first, batch.last_offset_delta());
+            let state = match newest.get(&pid) {
+                Some(s) => *s,
+                None => {
+                    let known = crate::plan::get_one::<bool>(
+                        "SELECT (SELECT true FROM kafgres_producers WHERE producer_id = $1)",
+                        &[pid.into()],
+                    )
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false);
+                    let s = if !known {
+                        // Expired or never registered.
+                        Some((i16::MAX, i32::MIN))
+                    } else {
+                        window(pid, topic_id, partition)
+                            .map_err(|e| e.to_string())?
+                            .0
+                            .last()
+                            .map(|r| (r.epoch, r.last_seq))
+                    };
+                    newest.insert(pid, s);
+                    s
+                }
+            };
+            let missing = match state {
+                None => true,
+                Some((e, l)) => epoch > e || (epoch == e && in_sequence(l, first)),
+            };
+            if !missing {
+                continue;
+            }
+            record(pid, epoch, topic_id, partition, first, last, batch.base_offset())
+                .map_err(|e| e.to_string())?;
+            newest.insert(pid, Some((epoch, last)));
+            rebuilt += 1;
+        }
+        if pos == 0 {
+            break;
+        }
+        at = slice.next_offset.max(at + 1);
+    }
+    Ok(rebuilt)
+}
+
+/// Offsets a rebuild scans before it is worth a line in the log.
+const LONG_REBUILD: i64 = 1_000_000;
+
+/// Partitions whose checkpoint one pass may move, and rebuilds it may run, so that a pass
+/// stays short on the broker's single loop.
+const CHECKPOINTS_PER_PASS: usize = 1_000;
+const REBUILD_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[derive(Default)]
+struct Checkpoints {
+    /// `window_checkpoint` as this process last read or wrote it. A pass moves the column
+    /// only from this value, so one changed underneath it is left alone.
+    known: Option<std::collections::HashMap<(u32, i32), Option<i64>>>,
+    /// Partitions a background rebuild failed on; a produce still tries them.
+    skipped: Option<Partitions>,
+    /// Where the next pass resumes when one cannot cover every partition.
+    cursor: usize,
+}
+
+static CHECKPOINTS: std::sync::Mutex<Checkpoints> =
+    std::sync::Mutex::new(Checkpoints { known: None, skipped: None, cursor: 0 });
+
+/// What one [`checkpoint_windows`] pass did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CheckpointPass {
+    pub rebuilt: usize,
+    pub advanced: usize,
+    /// Partitions the log held at startup that are still to be rebuilt.
+    pub waiting: usize,
+}
+
+/// Record how far each partition's window rows are known complete, so the next rebuild after
+/// a crash starts there (segment engine only).
+///
+/// A partition qualifies once its window is rebuilt for this start: below the log end, every
+/// idempotent batch then has its row, written by a transaction that committed before this
+/// one. The log end is therefore a checkpoint that holds whenever this transaction survives.
+/// Partitions no produce has rebuilt yet are rebuilt here, a few per pass, so that all of
+/// them come to be checkpointed and none is left with a long scan for a later start.
+pub fn checkpoint_windows(store: &dyn crate::storage::LogStore) -> Result<CheckpointPass, String> {
+    let mut pass = CheckpointPass::default();
+    if crate::storage_engine_guc() != "segment" {
+        return Ok(pass);
+    }
+
+    let rebuilt: Partitions = WINDOW_REBUILT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default();
+    let mut waiting: Vec<(u32, i32)> = {
+        let skipped = CHECKPOINTS.lock().unwrap_or_else(|e| e.into_inner()).skipped.clone();
+        STARTUP_END
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flat_map(|m| m.keys().copied())
+            .filter(|k| !rebuilt.contains(k) && !skipped.as_ref().is_some_and(|s| s.contains(k)))
+            .collect()
+    };
+    waiting.sort_unstable();
+    let started = std::time::Instant::now();
+    let mut tried = 0;
+    for &(topic_id, partition) in &waiting {
+        if tried > 0 && started.elapsed() >= REBUILD_BUDGET {
+            break;
+        }
+        tried += 1;
+        match ensure_window(topic_id, partition) {
+            Ok(()) => pass.rebuilt += 1,
+            // Dropped since startup, most likely. Not retried here.
+            Err(e) => {
+                pgrx::log!("kafgres: {e}");
+                CHECKPOINTS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .skipped
+                    .get_or_insert_with(Default::default)
+                    .insert((topic_id, partition));
+            }
+        }
+    }
+    pass.waiting = waiting.len() - tried;
+
+    // Those rebuilt in a transaction that has committed; this pass's own follow next time.
+    let mut keys: Vec<(u32, i32)> = rebuilt.into_iter().collect();
+    keys.sort_unstable();
+    let (mut topics, mut partitions, mut from, mut to) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    {
+        let mut state = CHECKPOINTS.lock().unwrap_or_else(|e| e.into_inner());
+        let start = if keys.is_empty() { 0 } else { state.cursor % keys.len() };
+        let mut examined = 0;
+        for i in 0..keys.len() {
+            if topics.len() >= CHECKPOINTS_PER_PASS {
+                break;
+            }
+            examined = i + 1;
+            let (topic_id, partition) = keys[(start + i) % keys.len()];
+            // Unknown: rebuilt without the column being read, which does not happen.
+            let Some(&known) = state.known.as_ref().and_then(|k| k.get(&(topic_id, partition))) else {
+                continue;
+            };
+            // Not tracked: nothing was appended since it was last read, or it was dropped.
+            let Ok(Some(end)) = store.high_watermark_if_tracked(topic_id, partition) else {
+                continue;
+            };
+            if known.is_some_and(|k| end <= k) {
+                continue;
+            }
+            topics.push(topic_id as i32);
+            partitions.push(partition);
+            from.push(known);
+            to.push(end);
+        }
+        state.cursor = if keys.is_empty() { 0 } else { (start + examined) % keys.len() };
+    }
+    if topics.is_empty() {
+        return Ok(pass);
+    }
+
+    let moved: Vec<(u32, i32, i64)> = Spi::connect_mut(|client| {
+        let rows = client.update(
+            "UPDATE kafgres_partitions p
+                SET window_checkpoint = v.next
+               FROM unnest($1::int[], $2::int[], $3::bigint[], $4::bigint[])
+                    AS v(topic_id, partition, known, next)
+              WHERE p.topic_id = v.topic_id::oid AND p.partition = v.partition
+                AND p.window_checkpoint IS NOT DISTINCT FROM v.known
+          RETURNING p.topic_id::int, p.partition, p.window_checkpoint",
+            None,
+            &[topics.into(), partitions.into(), from.into(), to.into()],
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let (Some(t), Some(p), Some(c)) =
+                (row.get::<i32>(1)?, row.get::<i32>(2)?, row.get::<i64>(3)?)
+            {
+                out.push((t as u32, p, c));
+            }
+        }
+        Ok::<_, spi::Error>(out)
+    })
+    .map_err(|e| e.to_string())?;
+
+    // Remembered only once the update commits; a rollback leaves the column where it was.
+    pass.advanced = moved.len();
+    let first = MOVED_PENDING.with(|p| p.borrow_mut().replace(moved).is_none());
+    if first {
+        pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Commit, || {
+            let Some(moved) = MOVED_PENDING.with(|p| p.borrow_mut().take()) else { return };
+            let mut state = CHECKPOINTS.lock().unwrap_or_else(|e| e.into_inner());
+            let known = state.known.get_or_insert_with(Default::default);
+            for (topic_id, partition, checkpoint) in moved {
+                known.insert((topic_id, partition), Some(checkpoint));
+            }
+        });
+        pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Abort, || {
+            MOVED_PENDING.with(|p| p.borrow_mut().take());
+        });
+        pgrx::register_subxact_callback(pgrx::PgSubXactCallbackEvent::AbortSub, |_, _| {
+            MOVED_PENDING.with(|p| p.borrow_mut().take());
+        });
+    }
+    Ok(pass)
+}
+
+thread_local! {
+    /// Checkpoints the current transaction moved, not yet committed.
+    static MOVED_PENDING: std::cell::RefCell<Option<Vec<(u32, i32, i64)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Stamp the offset a `base_offset = -1` reservation was appended at.
@@ -452,6 +923,15 @@ pub fn lock_for_read() -> Result<(), spi::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rebuild_starts_at_the_highest_offset_known_to_have_its_rows() {
+        assert_eq!(rebuild_from(Some(40), Some(70)), Some(70));
+        assert_eq!(rebuild_from(Some(90), Some(70)), Some(90));
+        assert_eq!(rebuild_from(Some(0), None), Some(0), "a new partition is scanned whole");
+        assert_eq!(rebuild_from(None, Some(70)), Some(70));
+        assert_eq!(rebuild_from(None, None), None, "nothing known: the caller estimates");
+    }
 
     #[test]
     fn in_sequence_accepts_the_next_and_the_wrap() {

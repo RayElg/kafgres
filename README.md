@@ -87,6 +87,19 @@ further: it creates a topic, produces keyed records, reads them back, uses a con
 group, and queries the log's offsets from SQL. It uses a local `kcat` if there is one and
 otherwise builds a small client image.
 
+## Reading records with SQL
+
+`kafgres_read()` returns a topic's records as rows, so SQL can filter and join them.
+
+```sql
+SELECT record_offset, convert_from(value, 'UTF8')::jsonb AS event
+  FROM kafgres_read('order-events', 0, from_offset => 1000, to_offset => 2000)
+ WHERE convert_from(value, 'UTF8')::jsonb ->> 'op' = 'D';
+```
+
+Offset and time bounds are optional. See [docs/reading.md](docs/reading.md) for the
+arguments, the columns, and who may call it.
+
 ## CDC
 
 A table's changes can be published to a topic without Kafka Connect or Debezium. A
@@ -115,6 +128,7 @@ SELECT kafgres_add_mapping(
                                        FROM customers c WHERE c.id = new.customer_id)) $$,
     key_expr    => $$ new.id::text $$,
     filter_expr => $$ new.status = 'placed' $$);
+-- SELECT kafgres_slot_ready();  -- optional: blocks until the CDC slot is ready after the first mapping is added
 ```
 
 A background worker reads a logical replication slot using kafgres's own output plugin,
@@ -174,7 +188,8 @@ Install the new build, restart Postgres, then run `ALTER EXTENSION kafgres UPDAT
 database the broker uses. The broker keeps serving after the restart, before the update
 runs.
 
-- **From 0.3.0:** transaction markers written before 0.3.1 have no
+- **From 0.3.0:** the update adds `kafgres_read()` ([docs/reading.md](docs/reading.md)),
+  which no role can execute until it is granted. Transaction markers written before 0.3.1 have no
   `EndTransactionMarker` value, which Sarama cannot decode. They stay until
   retention removes their segments. A Sarama consumer can start after the last such
   marker, or the topic can be recreated.
@@ -190,6 +205,7 @@ runs.
 |-----|----------|
 | [docs/architecture.md](docs/architecture.md) | Design: one broker per instance, durability in Postgres terms, both storage engines, transactional produce, segment replication. |
 | [docs/producing.md](docs/producing.md) | The three produce paths, CDC mappings, and how to choose between them. |
+| [docs/reading.md](docs/reading.md) | `kafgres_read()`: a topic's records as rows, by offset or time range, for SQL to filter and join. |
 | [docs/conformance.md](docs/conformance.md) | Client matrix, how the suite runs, and the known differences from Kafka. |
 | [docs/configuration.md](docs/configuration.md) | Every `kafgres.*` setting: scope, default and meaning. |
 

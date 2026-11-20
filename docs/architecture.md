@@ -31,6 +31,18 @@ out of band (see below) and is always asynchronous, since `synchronous_standby_n
 does not cover files outside the WAL; a failover can lose the newest records, and the
 leader epochs described next make that visible to consumers rather than silent.
 
+On the primary, `kafgres_produce()` still commits the row and the event together. The
+loss is in replication: its row and commit marker travel in the WAL, which can be
+synchronous, but the record bytes travel with the segment follower. After a failover the new
+primary drops the markers whose records never arrived, with a logged warning, so a row can
+survive without its event. Synchronous replication does not close this.
+`kafgres_follower_lag()` on a standby reports how many records the follower was behind at
+its last Fetch, which `pg_stat_replication` does not cover. It returns no row while the
+follower cannot reach the leader, or while it is too far behind for one Fetch to cover
+every partition, so alert on a missing row as well as on a high one. A follower that stops
+or hangs keeps its last reading, so alert too when `observed_at_ms` grows old. The table
+engine keeps the bytes in the WAL and has no such gap.
+
 ## Primary-only operation
 
 The broker, CDC and archiver workers run on the primary only. They are registered with
@@ -102,6 +114,19 @@ transaction abort directly.
 The cost of transactionality is paid only when it is used: a plain produce never touches
 Postgres tables (an idempotent one records its sequence window there), while a
 transactional one adds a marker row to the caller's transaction.
+
+On the segment engine a batch reaches the log before the transaction holding its window
+row commits, so a crash can keep the batch and lose the row. After a restart the broker
+rebuilds the missing rows from the log before a partition takes its next idempotent
+produce, so a client's retry of that batch is answered as a duplicate instead of being
+appended again. The rebuild knows where to start. The broker commits one transaction at a
+time and a crash keeps a prefix of the WAL, so every lost row belongs to a batch above
+anything an earlier transaction recorded: the newest window row that survived, and
+`kafgres_partitions.window_checkpoint`, the log end the broker records for each partition
+about every ten seconds. The scan runs from the higher of the two to the log end at
+startup. A partition created before 0.3.3 that has no window row has neither until its
+first checkpoint, and for that one rebuild the start is estimated from the log tail's
+timestamps.
 
 ## Segment log replication
 

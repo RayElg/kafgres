@@ -25,6 +25,8 @@ const COMPRESSION_MASK: i16 = 0x07;
 /// Bit 4 of the batch attributes: `isTransactional`. A `read_committed` consumer applies
 pub const TRANSACTIONAL_FLAG: i16 = 0x10;
 const CONTROL_FLAG: i16 = 0x20;
+/// Bit 3: `timestampType`. Set means `LogAppendTime`, and every record takes `maxTimestamp`.
+pub const LOG_APPEND_TIME_FLAG: i16 = 0x08;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchError {
@@ -66,6 +68,11 @@ pub enum BatchError {
     DecompressedTooLarge,
     /// The batch is compressed, and this decoder does not decompress — not malformed,
     Compressed(i16),
+    /// A record declares more headers than the caller's limit, checked before decoding them.
+    TooManyHeaders {
+        count: i64,
+        max: usize,
+    },
 }
 
 impl BatchError {
@@ -90,6 +97,7 @@ impl BatchError {
             // Not INVALID_RECORD: the batch is fine, just too large. MESSAGE_TOO_LARGE is
             BatchError::DecompressedTooLarge => ErrorCode::MessageTooLarge,
             BatchError::Compressed(_) => ErrorCode::UnknownServerError,
+            BatchError::TooManyHeaders { .. } => ErrorCode::InvalidRecord,
         }
     }
 }
@@ -144,6 +152,9 @@ impl std::fmt::Display for BatchError {
             }
             BatchError::DecompressedTooLarge => {
                 write!(f, "batch expands past {MAX_DECOMPRESSED_BYTES} bytes")
+            }
+            BatchError::TooManyHeaders { count, max } => {
+                write!(f, "a record declares {count} headers, more than the {max} allowed")
             }
             BatchError::Compressed(codec) => {
                 write!(f, "batch uses compression codec {codec}; this decoder reads uncompressed batches only")
@@ -987,6 +998,7 @@ pub struct RecordIter {
     done: bool,
     /// False reads keys only: values and headers are checked and skipped.
     full: bool,
+    max_headers: usize,
 }
 
 /// [`RecordIter`] reading keys only, with every record checked the same way.
@@ -1054,11 +1066,18 @@ impl RecordBatch {
             declared: count,
             done: false,
             full,
+            max_headers: usize::MAX,
         })
     }
 }
 
 impl RecordIter {
+    /// Refuse a record declaring more than `max` headers. Unlimited by default.
+    pub fn max_headers(mut self, max: usize) -> Self {
+        self.max_headers = max;
+        self
+    }
+
     /// Reads stay inside the record's declared extent, and the fields must fill it exactly.
     fn next_record(&mut self) -> Result<RecordRef, BatchError> {
         let at = self.src.pos();
@@ -1109,6 +1128,12 @@ impl RecordIter {
             && (header_count as usize).saturating_mul(entry) > MAX_DECOMPRESSED_BYTES
         {
             return Err(BatchError::DecompressedTooLarge);
+        }
+        if header_count as u64 > self.max_headers as u64 {
+            return Err(BatchError::TooManyHeaders {
+                count: i64::from(header_count),
+                max: self.max_headers,
+            });
         }
         let mut headers = Vec::new();
         for _ in 0..header_count {

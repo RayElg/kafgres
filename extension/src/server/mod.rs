@@ -199,6 +199,8 @@ struct Server {
     tick: u64,
     /// The last producer sweep filled its batch, so there is more to drop. Drains at a
     producer_backlog: bool,
+    /// Partitions the log held at startup still wait for their window rebuild.
+    windows_waiting: bool,
     /// Where the round-robin retention sweep resumes. Without it the sweep would only
     retention_cursor: u32,
     /// Client-quota rate windows. A plain map rather than shared memory: the broker is a
@@ -245,6 +247,14 @@ impl Server {
 /// the torn tail is recovered, under the epoch before the crash.
 pub static EPOCHS_RAISED: pgrx::PgAtomic<AtomicBool> =
     unsafe { pgrx::PgAtomic::new(c"kafgres_epochs_raised") };
+
+/// This server start's number, from `kafgres_boot_seq`; valid once `EPOCHS_RAISED` is set.
+pub static BOOT_ID: pgrx::PgAtomic<std::sync::atomic::AtomicI64> =
+    unsafe { pgrx::PgAtomic::new(c"kafgres_boot_id") };
+
+pub fn sql_boot() -> i64 {
+    BOOT_ID.get().load(Ordering::Acquire)
+}
 
 /// Wait up to 30 s for the broker to raise the leader epochs, then raise an ERROR.
 pub fn wait_for_epochs() {
@@ -326,6 +336,7 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         groups_changed: HashSet::new(),
         tick: 0,
         producer_backlog: true,
+        windows_waiting: true,
         retention_cursor: 0,
         quotas: crate::quota::Meter::default(),
         quota_config: crate::quota::QuotaCache::default(),
@@ -423,6 +434,7 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         drop_unauthenticated(&mut srv);
         expire_group_members(&mut srv);
         expire_producer_state(&mut srv);
+        checkpoint_producer_windows(&mut srv);
         expire_consumer_group_members(&srv);
         expire_share_group_state(&srv);
         expire_quota_windows(&mut srv);
@@ -1259,6 +1271,32 @@ fn expire_producer_state(srv: &mut Server) {
     }
 }
 
+/// Record how far each partition's idempotence window is known complete, and rebuild the
+/// windows no produce has needed yet, so a rebuild after the next crash has little to scan.
+fn checkpoint_producer_windows(srv: &mut Server) {
+    const EVERY_N_TICKS: u64 = 2_000; // ~10s at the default 5ms tick
+    const WHILE_REBUILDING: u64 = 100; // ~500ms while startup partitions wait their turn
+
+    let every = if srv.windows_waiting { WHILE_REBUILDING } else { EVERY_N_TICKS };
+    if !srv.due(every) {
+        return;
+    }
+    let pass = BackgroundWorker::transaction(|| {
+        crate::dbtx::guarded(|| {
+            crate::producer::checkpoint_windows(&*crate::storage::open())
+                .map_err(HandlerError::Internal)
+        })
+    });
+    match pass {
+        Ok(pass) => srv.windows_waiting = pass.waiting > 0,
+        Err(e) => {
+            // Back to the slow cadence, as the producer sweep does after a failure.
+            srv.windows_waiting = false;
+            log!("kafgres: window checkpoint failed: {e}");
+        }
+    }
+}
+
 /// Sockets are outside the VFD pool, so a 1024 soft limit runs out near a thousand partitions.
 /// Not `ReserveExternalFD` per socket: the wait set's `AcquireExternalFD` would then fail near
 /// 325 clients.
@@ -1356,6 +1394,20 @@ fn exclusive_holders() -> String {
 fn raise_leader_epochs() -> bool {
     let result = BackgroundWorker::transaction(|| {
         crate::dbtx::guarded(|| {
+            // Once per process: a retried raise must not spend another number.
+            static PROCESS_BOOT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            let mut boot = PROCESS_BOOT.load(Ordering::Relaxed);
+            // Flushed at commit even with asynchronous commit, or a crash could hand the next
+            // start this number along with the xids it reissues. Every attempt: a failed one
+            // took the number but flushed nothing.
+            pgrx::Spi::run("SET LOCAL synchronous_commit = on")?;
+            // Postgres flushes at commit only for a transaction that holds an xid. `nextval` takes
+            // one only when it logs ahead, and a retry reuses the number without calling it.
+            pgrx::Spi::run("SELECT pg_current_xact_id()")?;
+            if boot == 0 {
+                boot = pgrx::Spi::get_one("SELECT nextval('kafgres_boot_seq')")?.unwrap_or(0);
+                PROCESS_BOOT.store(boot, Ordering::Relaxed);
+            }
             // The timeline increments on `pg_promote`.
             let wal_timeline: i32 = pgrx::Spi::get_one(
                 "SELECT (('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int)",
@@ -1392,18 +1444,22 @@ fn raise_leader_epochs() -> bool {
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
                 crate::producer::forget_past(topic_id, partition, end)
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                crate::producer::note_startup_end(topic_id, partition, end);
             }
-            Ok((highest, raised))
+            Ok((highest, raised, boot))
         })
     });
 
     match result {
-        Ok((epoch, 0)) => {
+        Ok((epoch, 0, boot)) => {
+            // Published once committed: a raise that rolls back never exposes its number.
+            BOOT_ID.get().store(boot, Ordering::Release);
             log!("kafgres: leader epoch {epoch} already current for every partition");
             EPOCHS_RAISED.get().store(true, Ordering::Release);
             true
         }
-        Ok((epoch, n)) => {
+        Ok((epoch, n, boot)) => {
+            BOOT_ID.get().store(boot, Ordering::Release);
             log!("kafgres: took a new leader epoch (up to {epoch}) for {n} partition(s)");
             EPOCHS_RAISED.get().store(true, Ordering::Release);
             true
