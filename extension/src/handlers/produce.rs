@@ -734,6 +734,16 @@ fn write_partition(
             Decision::Append(idem) => Some(idem),
             Decision::Duplicate { base_offset } => {
                 base.get_or_insert(*base_offset);
+                // If a crash left `first_offset = -1` on an ongoing transaction for this
+                // partition, stamp it from the duplicate's offset before returning success.
+                if view.is_transactional() && view.producer_id() >= 0 {
+                    crate::storage::pmeta::stamp_txn_partition(
+                        view.producer_id(),
+                        plan.tid,
+                        plan.index,
+                        *base_offset,
+                    )?;
+                }
                 continue;
             }
             Decision::DuplicateOf(j) => {

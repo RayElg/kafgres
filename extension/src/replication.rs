@@ -455,7 +455,11 @@ fn partitions_to_follow(store: &mut dyn crate::storage::LogStore) -> Want {
     .unwrap_or_default()
     .into_iter()
     .filter_map(|(id, name, part, epoch)| {
-        store.high_watermark(id, part).ok().map(|end| (id, name, part, end, epoch))
+        let end = store.high_watermark(id, part).ok()?;
+        // Report the epoch of our actual local tail, not the WAL-replicated leader_epoch,
+        // so a rejoined old primary detects and truncates its divergent tail.
+        let local_epoch = store.last_batch_epoch(id, part).ok().flatten().unwrap_or(epoch);
+        Some((id, name, part, end, local_epoch))
     })
     .collect()
 }
@@ -517,6 +521,7 @@ impl Follower {
             if pulled.is_empty() {
                 break;
             }
+            still_following()?;
             applied += apply(&mut *store, &pulled)?;
             still_following()?;
             if started.elapsed() >= ROUND_BUDGET {

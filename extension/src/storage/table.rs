@@ -497,6 +497,9 @@ impl LogStore for TableStore {
             if matches!(isolation, IsolationLevel::ReadCommitted) {
                 (aborted, aborted_cut_at) =
                     pmeta::aborted_txns(topic, partition, offset, next_offset.max(offset + 1))?;
+                if let Some(cut) = aborted_cut_at {
+                    next_offset = super::truncate_batches_at(&mut bytes, cut, offset);
+                }
             }
         }
 
@@ -517,17 +520,36 @@ impl LogStore for TableStore {
         partition: i32,
         timestamp: i64,
     ) -> StoreResult<Option<(i64, i64)>> {
-        let blob = crate::fresh::one::<Vec<u8>>(
-            "SELECT (SELECT batch FROM kafgres_log
-              WHERE topic_id = $1::oid AND partition = $2 AND max_timestamp >= $3
+        let log_start = self.log_start_offset(topic, partition)?;
+        crate::fresh::rows(
+            "SELECT batch FROM kafgres_log
+              WHERE topic_id = $1::oid AND partition = $2
+                AND last_offset >= $4 AND max_timestamp >= $3
               ORDER BY base_offset
-              LIMIT 1)",
-            &[(topic as i32).into(), partition.into(), timestamp.into()],
+              LIMIT 100",
+            &[
+                (topic as i32).into(),
+                partition.into(),
+                timestamp.into(),
+                log_start.into(),
+            ],
+            |rows| {
+                for row in rows {
+                    let Some(blob) = row.get::<Vec<u8>>(1)? else {
+                        continue;
+                    };
+                    if let Some(found) = super::first_at_or_after_from(
+                        kafgres_codec::bytes::Bytes::from(blob),
+                        timestamp,
+                        log_start,
+                    ) {
+                        return Ok(Some(found));
+                    }
+                }
+                Ok(None)
+            },
         )
-        .map_err(spi_err)?;
-        Ok(blob.and_then(|b| {
-            super::first_at_or_after(kafgres_codec::bytes::Bytes::from(b), timestamp)
-        }))
+        .map_err(spi_err)
     }
 
     fn max_timestamp_offset(
@@ -979,10 +1001,22 @@ impl LogStore for TableStore {
         let matched = match matched {
             Some(e) => e,
             None => {
-                return Ok(EpochEnd {
-                    leader_epoch: -1,
-                    end_offset: self.log_start_offset(topic, partition)?,
-                })
+                let next_start: Option<i64> = Spi::get_one_with_args(
+                    "SELECT (SELECT min(start_offset) FROM kafgres_leader_epochs
+                              WHERE topic_id = $1::oid AND partition = $2 AND leader_epoch > $3)",
+                    &[(topic as i32).into(), partition.into(), epoch.into()],
+                )
+                .map_err(spi_err)?;
+                return match next_start {
+                    Some(s) => Ok(EpochEnd {
+                        leader_epoch: epoch,
+                        end_offset: s,
+                    }),
+                    None => Ok(EpochEnd {
+                        leader_epoch: -1,
+                        end_offset: self.log_start_offset(topic, partition)?,
+                    }),
+                };
             }
         };
 

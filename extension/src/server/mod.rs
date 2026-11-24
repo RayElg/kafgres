@@ -437,6 +437,7 @@ pub fn run(cfg: ClusterConfig, bind_host: &str, port: u16, tick: Duration) {
         checkpoint_producer_windows(&mut srv);
         expire_consumer_group_members(&srv);
         expire_share_group_state(&srv);
+        expire_stale_transactions_tick(&srv);
         expire_quota_windows(&mut srv);
         refresh_quotas(&mut srv);
         enforce_retention(&mut srv);
@@ -1445,6 +1446,22 @@ fn raise_leader_epochs() -> bool {
                 crate::producer::forget_past(topic_id, partition, end)
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
                 crate::producer::note_startup_end(topic_id, partition, end);
+                crate::handlers::txn::reconcile_transactions(
+                    &mut *store, topic_id, partition, end,
+                )?;
+                // Clamp share-group offsets to the recovered log end so a power cut or
+                // failover truncation does not skip records refilled into the lost range.
+                pgrx::Spi::run_with_args(
+                    "UPDATE kafgres_share_offsets
+                        SET start_offset = $3
+                      WHERE topic_id = $1::oid AND partition = $2 AND start_offset > $3",
+                    &[(topic_id as i32).into(), partition.into(), end.into()],
+                )?;
+                pgrx::Spi::run_with_args(
+                    "DELETE FROM kafgres_share_inflight
+                      WHERE topic_id = $1::oid AND partition = $2 AND record_offset >= $3",
+                    &[(topic_id as i32).into(), partition.into(), end.into()],
+                )?;
             }
             Ok((highest, raised, boot))
         })
@@ -1618,14 +1635,21 @@ fn expire_consumer_group_members(srv: &Server) {
     }
 }
 
-fn enforce_retention(srv: &mut Server) {
-    if !srv.due(crate::retention_check_ticks()) {
+fn expire_stale_transactions_tick(srv: &Server) {
+    const EVERY_N_TICKS: u64 = 2_000; // ~10s at the default 5ms tick, matching Kafka
+    if !srv.due(EVERY_N_TICKS) {
         return;
     }
     if let Err(e) = BackgroundWorker::transaction(|| {
         crate::dbtx::guarded(crate::handlers::txn::expire_stale_transactions)
     }) {
         log!("kafgres: could not expire stale transactions: {e}");
+    }
+}
+
+fn enforce_retention(srv: &mut Server) {
+    if !srv.due(crate::retention_check_ticks()) {
+        return;
     }
 
     if crate::storage_engine_guc() == "segment" {

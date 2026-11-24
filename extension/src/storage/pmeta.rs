@@ -161,12 +161,27 @@ pub fn epoch_end_offset(
 
     let matched = match matched {
         Some(e) => e,
-        // Nothing at or below it: `-1` makes the client reset rather than truncate, so
+        // All epochs at or below `epoch` were collapsed by truncation (e.g. a power cut
+        // removed everything written in `epoch`). Answer with `epoch` and the next known
+        // epoch's start offset so clients truncate cleanly rather than falling back to
+        // `auto.offset.reset`.
         None => {
-            return Ok(EpochEnd {
-                leader_epoch: -1,
-                end_offset: log_start_offset(topic, partition)?,
-            })
+            let next_start: Option<i64> = Spi::get_one_with_args(
+                "SELECT (SELECT min(start_offset) FROM kafgres_leader_epochs
+                          WHERE topic_id = $1::oid AND partition = $2 AND leader_epoch > $3)",
+                &[(topic as i32).into(), partition.into(), epoch.into()],
+            )
+            .map_err(spi_err)?;
+            return match next_start {
+                Some(s) => Ok(EpochEnd {
+                    leader_epoch: epoch,
+                    end_offset: s,
+                }),
+                None => Ok(EpochEnd {
+                    leader_epoch: -1,
+                    end_offset: log_start_offset(topic, partition)?,
+                }),
+            };
         }
     };
 

@@ -24,10 +24,18 @@ pub fn find_coordinator(
         vec![req.key.clone()]
     };
 
+    // key_type 1 is transactional coordinator (TRANSACTIONAL_ID Describe); 0 (group) and
+    // 2 (share group) authorize against GROUP Describe.
+    let resource = if req.key_type == 1 {
+        crate::acl::ResourceType::TransactionalId
+    } else {
+        crate::acl::ResourceType::Group
+    };
+
     // Below v4 the top-level fields are the only channel: there is no `coordinators` array.
     let legacy_denied = if version < BATCHED_FROM {
         keys.first()
-            .and_then(|k| authz.check(crate::acl::Operation::Describe, crate::acl::ResourceType::Group, k).err())
+            .and_then(|k| authz.check(crate::acl::Operation::Describe, resource, k).err())
     } else {
         None
     };
@@ -44,7 +52,7 @@ pub fn find_coordinator(
         coordinators: keys
             .into_iter()
             .map(|key| {
-                let denied = authz.check(crate::acl::Operation::Describe, crate::acl::ResourceType::Group, &key).err();
+                let denied = authz.check(crate::acl::Operation::Describe, resource, &key).err();
                 Coordinator {
                     key,
                     node_id: if denied.is_some() { -1 } else { cfg.node_id },

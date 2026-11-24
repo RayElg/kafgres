@@ -92,19 +92,22 @@ checks, replication), so each needs an explicit `GRANT EXECUTE`. The exceptions 
 `kafgres_follower_lag()`. On an install upgraded from 0.2.0 this takes effect at
 `ALTER EXTENSION kafgres UPDATE`.
 
-`kafgres_add_mapping` runs with the caller's privileges: it reads `kafgres_topics` and the
-source table, and writes `kafgres_cdc_mappings`, so a role needs those grants as well as
-`EXECUTE`. It also creates the CDC slot, which Postgres allows only to a superuser or a role
-with the `REPLICATION` attribute. A role without that still saves its mapping, with a
-warning, and the CDC worker creates the slot (see [CDC mappings](#cdc-mappings)). Use
-`ALTER ROLE ... REPLICATION` for a role that should create it. `kafgres_slot_ready()` and
-`kafgres_cdc_create_slot()` are administrative like the rest.
+`kafgres_add_mapping` validates the expressions with the caller's privileges and records
+the caller as the mapping's owner. The CDC worker renders each mapping (and any snapshot
+of it) under that owner's privileges in a security-restricted context, so revoking
+`SELECT` on a source or enrichment table stops rendering via `on_error`. Do not grant
+direct `INSERT`, `UPDATE`, or `DELETE` on `kafgres_cdc_mappings`; `kafgres_add_mapping`
+and `kafgres_remove_mapping` manage the table on the caller's behalf. Creating the CDC
+slot still requires a superuser or a role with the `REPLICATION` attribute. A role without
+that still saves its mapping, with a warning, and the CDC worker creates the slot (see
+[CDC mappings](#cdc-mappings)). Use `ALTER ROLE ... REPLICATION` for a role that should
+create it. `kafgres_slot_ready()` and `kafgres_cdc_create_slot()` are administrative like
+the rest.
 
 ```sql
 GRANT EXECUTE ON FUNCTION kafgres_add_mapping(text, text, text, text, text, text) TO cdc_admin;
 GRANT SELECT ON kafgres_topics TO cdc_admin;
-GRANT SELECT, INSERT, UPDATE ON kafgres_cdc_mappings TO cdc_admin;
-GRANT SELECT ON public.orders TO cdc_admin;   -- each source table it maps
+GRANT SELECT ON public.orders TO cdc_admin;   -- each source table it maps (and any enrichment tables)
 ALTER ROLE cdc_admin REPLICATION;   -- optional: lets kafgres_add_mapping create the slot itself
 ```
 

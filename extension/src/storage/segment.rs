@@ -19,6 +19,71 @@ use super::{
     TopicId, TxnContext,
 };
 
+// Deferred physical partition drops for the current Postgres transaction.
+// `(topic, partition, subxid)` so a rolled-back subtransaction only cancels its own drops.
+thread_local! {
+    static PENDING_DROPS: std::cell::RefCell<Option<Vec<(TopicId, i32, pg_sys::SubTransactionId)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn defer_partition_drop(topic: TopicId, partition: i32) {
+    let subid = unsafe { pg_sys::GetCurrentSubTransactionId() };
+    let first = PENDING_DROPS.with(|p| {
+        let mut p = p.borrow_mut();
+        let first = p.is_none();
+        p.get_or_insert_with(Vec::new).push((topic, partition, subid));
+        first
+    });
+    if first {
+        pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Commit, || {
+            let drops = PENDING_DROPS.with(|p| p.borrow_mut().take());
+            if let Some(drops) = drops {
+                for (t, part, _) in drops {
+                    execute_partition_drop(t, part);
+                }
+            }
+        });
+        pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Abort, || {
+            PENDING_DROPS.with(|p| p.borrow_mut().take());
+        });
+        pgrx::register_subxact_callback(pgrx::PgSubXactCallbackEvent::AbortSub, |aborted, _| {
+            PENDING_DROPS.with(|p| {
+                if let Some(list) = p.borrow_mut().as_mut() {
+                    list.retain(|&(_, _, s)| s != aborted);
+                }
+            });
+        });
+    }
+}
+
+fn execute_partition_drop(topic: TopicId, partition: i32) {
+    let dir = data_path(&partition_dir(topic, partition));
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log!("kafgres: failed to remove dropped partition {}: {e}", dir.display());
+        }
+    }
+    let _ = std::fs::remove_dir(log_root().join(topic.to_string()));
+
+    if let Some(plans) = PLANS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        plans.remove(&(topic, partition));
+    }
+    super::forget_cleaned(topic, partition);
+
+    {
+        let mut slots = SHARDS[shard_of(topic, partition)].exclusive();
+        for slot in slots.iter_mut() {
+            if slot.topic == topic && slot.partition == partition {
+                *slot = Slot::default();
+            }
+        }
+    }
+    if let Some(map) = HINTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        map.remove(&(topic, partition));
+    }
+    evict_active(topic, partition);
+}
+
 /// Under `$PGDATA` unless `kafgres.log_directory` says otherwise.
 const LOG_DIR: &str = "kafgres";
 
@@ -1411,6 +1476,39 @@ impl SegmentStore {
         last
     }
 
+    /// Truncate `.index` so no entry points at or past `valid_end` (or is out of order).
+    /// Called whenever recovery truncates the active `.log`.
+    fn truncate_index(topic: TopicId, partition: i32, base: i64, valid_end: u64) {
+        let path = data_path(&segment_path(topic, partition, base, "index"));
+        let Ok(vfd) = Vfd::open(&path, false) else {
+            return;
+        };
+        let size = vfd.size().unwrap_or(0);
+        let mut buf = [0u8; INDEX_ENTRY];
+        let mut at = 0u64;
+        let mut prev: Option<(i64, u64)> = None;
+        while at + INDEX_ENTRY as u64 <= size {
+            if vfd.read_at(&mut buf, at).unwrap_or(0) != INDEX_ENTRY {
+                break;
+            }
+            let rel = u32::from_be_bytes(buf[..4].try_into().expect("4 bytes")) as i64;
+            let pos = u32::from_be_bytes(buf[4..].try_into().expect("4 bytes")) as u64;
+            if pos >= valid_end {
+                break;
+            }
+            if let Some((pr, pp)) = prev {
+                if rel <= pr || pos <= pp {
+                    break;
+                }
+            }
+            prev = Some((rel, pos));
+            at += INDEX_ENTRY as u64;
+        }
+        if at < size {
+            let _ = vfd.truncate(at);
+        }
+    }
+
     fn read_index(
         topic: TopicId,
         partition: i32,
@@ -1426,6 +1524,7 @@ impl SegmentStore {
         let mut out = Vec::new();
         let mut buf = [0u8; INDEX_ENTRY];
         let mut at = 0u64;
+        let mut prev: Option<(i64, u64)> = None;
         while at + INDEX_ENTRY as u64 <= size {
             if vfd.read_at(&mut buf, at).unwrap_or(0) != INDEX_ENTRY {
                 break;
@@ -1435,6 +1534,12 @@ impl SegmentStore {
             if pos >= data_end {
                 break;
             }
+            if let Some((pr, pp)) = prev {
+                if rel <= pr || pos <= pp {
+                    break;
+                }
+            }
+            prev = Some((rel, pos));
             out.push((base + rel, pos));
             at += INDEX_ENTRY as u64;
         }
@@ -1472,6 +1577,7 @@ impl SegmentStore {
                     .get(base)
                     .and_then(|entries| entries.iter().rev().find(|(b, _)| *b <= from).map(|(_, p)| *p))
                     .unwrap_or(0);
+                let mut used_hint = pos > 0;
                 let mut header = [0u8; records::RECORD_BATCH_OVERHEAD];
                 while pos + header.len() as u64 <= data_end {
                     if vfd.read_at(&mut header, pos)? != header.len() {
@@ -1480,8 +1586,14 @@ impl SegmentStore {
                     let Some(BatchSpan { total, base: batch_base, last: batch_last }) =
                         batch_span(&header, pos, data_end)
                     else {
+                        if used_hint {
+                            used_hint = false;
+                            pos = 0;
+                            continue;
+                        }
                         break;
                     };
+                    used_hint = false;
                     if batch_base >= ceiling {
                         return Ok(None);
                     }
@@ -1604,6 +1716,9 @@ impl SegmentStore {
             );
             vfd.truncate(pos)?;
         }
+        // Keep `.index` consistent with the recovered `.log` length so stale entries cannot
+        // survive past the cut and misdirect Fetch after the segment rolls.
+        Self::truncate_index(topic, partition, base, pos);
         Ok((index, pos, next_offset, max_timestamp))
     }
 
@@ -1667,6 +1782,9 @@ impl SegmentStore {
             let closing_base = st.active_base;
             let closing_bytes = st.active_bytes;
             with_active(topic, partition, closing_base, generation, |a| {
+                // Trim any trailing garbage from a previous failed write (e.g. ENOSPC)
+                // before sealing the segment so compaction and readers see clean EOF.
+                let _ = a.log.truncate(closing_bytes);
                 a.log
                     .writeback(a.writeback_from, closing_bytes.saturating_sub(a.writeback_from));
                 a.log.sync()?;
@@ -1704,7 +1822,12 @@ impl SegmentStore {
         };
 
         with_active(topic, partition, active_base, generation, |a| {
-            a.log.write_all_at(bytes, pos)?;
+            if let Err(e) = a.log.write_all_at(bytes, pos) {
+                // Trim any partial bytes written before ENOSPC/EIO so the active segment
+                // does not carry trailing garbage past `st.active_bytes`.
+                let _ = a.log.truncate(pos);
+                return Err(e);
+            }
             let end = pos + bytes.len() as u64;
             if end.saturating_sub(a.writeback_from) >= WRITEBACK_BYTES {
                 a.log.writeback(a.writeback_from, end - a.writeback_from);
@@ -2140,6 +2263,7 @@ impl LogStore for SegmentStore {
                                 entries.iter().rev().find(|(b, _)| *b <= next).map(|(_, p)| *p)
                             })
                             .unwrap_or(0);
+                        let mut used_hint = pos > 0;
 
                         let mut header = [0u8; records::RECORD_BATCH_OVERHEAD];
                         while pos + header.len() as u64 <= data_end {
@@ -2149,8 +2273,28 @@ impl LogStore for SegmentStore {
                             let Some(BatchSpan { total, base: batch_base, last: batch_last }) =
                                 batch_span(&header, pos, data_end)
                             else {
+                                if used_hint {
+                                    // A stale or misaligned index hint must not skip the segment;
+                                    // fall back to a linear scan from offset 0.
+                                    log!(
+                                        "kafgres: ignoring bad index hint at pos {pos} in {}; \
+                                         falling back to linear scan",
+                                        path.display()
+                                    );
+                                    used_hint = false;
+                                    pos = 0;
+                                    continue;
+                                }
+                                if *base != st.active_base {
+                                    log!(
+                                        "kafgres: corrupt batch header at pos {pos} in sealed segment {}",
+                                        path.display()
+                                    );
+                                    return Err(StoreError::CorruptBatch);
+                                }
                                 break;
                             };
+                            used_hint = false;
 
                             // Wholly below the request; the batch containing `offset` is kept whole (the consumer
                             if batch_last < offset {
@@ -2244,6 +2388,9 @@ impl LogStore for SegmentStore {
                     pmeta::aborted_txns(topic, partition, offset, next.max(offset + 1))?;
                 aborted.extend(listed);
                 aborted_cut_at = cut;
+                if let Some(cut) = aborted_cut_at {
+                    next = super::truncate_batches_at(&mut out, cut, offset);
+                }
             }
         }
 
@@ -2272,6 +2419,7 @@ impl LogStore for SegmentStore {
         }
 
         // The earliest offset whose timestamp is at or after `timestamp` — what `offsetsForTimes`
+        let log_start = self.log_start_offset(topic, partition)?;
         let bases_on_disk = Self::segment_bases(topic, partition)?;
         Self::with_slot(topic, partition, |st, hints| {
             let mut bases = bases_on_disk;
@@ -2307,6 +2455,16 @@ impl LogStore for SegmentStore {
                     {
                         break;
                     }
+                    let batch_base = i64::from_be_bytes(
+                        header[records::BASE_OFFSET_OFFSET..records::BASE_OFFSET_OFFSET + 8]
+                            .try_into()
+                            .expect("8 bytes"),
+                    );
+                    let batch_last = batch_base + last_offset_delta_of(&header);
+                    if batch_last < log_start {
+                        pos += records::LENGTH_OFFSET as u64 + 4 + length as u64;
+                        continue;
+                    }
                     let max_ts = i64::from_be_bytes(
                         header[records::MAX_TIMESTAMP_OFFSET..records::MAX_TIMESTAMP_OFFSET + 8]
                             .try_into()
@@ -2320,10 +2478,13 @@ impl LogStore for SegmentStore {
                                 path.display()
                             )));
                         }
-                        return Ok(super::first_at_or_after(
+                        if let Some(found) = super::first_at_or_after_from(
                             kafgres_codec::bytes::Bytes::from(body),
                             timestamp,
-                        ));
+                            log_start,
+                        ) {
+                            return Ok(Some(found));
+                        }
                     }
                     pos += records::LENGTH_OFFSET as u64 + 4 + length as u64;
                 }
@@ -2537,33 +2698,10 @@ impl LogStore for SegmentStore {
 
     fn drop_partition(&mut self, topic: TopicId, partition: i32) -> StoreResult<()> {
         pmeta::drop_partition(topic, partition)?;
-        let dir = data_path(&partition_dir(topic, partition));
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(StoreError::Io(format!("remove {}: {e}", dir.display())));
-            }
-        }
-        // And the topic directory once its last partition is gone; `remove_dir` failing with
-        let _ = std::fs::remove_dir(log_root().join(topic.to_string()));
-
-        if let Some(plans) = PLANS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            plans.remove(&(topic, partition));
-        }
-        super::forget_cleaned(topic, partition);
-
-        // Free the shared slot, or the partition keeps its append position across a
-        {
-            let mut slots = SHARDS[shard_of(topic, partition)].exclusive();
-            for slot in slots.iter_mut() {
-                if slot.topic == topic && slot.partition == partition {
-                    *slot = Slot::default();
-                }
-            }
-        }
-        if let Some(map) = HINTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            map.remove(&(topic, partition));
-        }
-        evict_active(topic, partition);
+        // Defer filesystem removal and shared-memory eviction until the surrounding Postgres
+        // transaction commits. If the transaction rolls back (e.g. a lock timeout on
+        // DeleteTopics), the partition directory and shared-memory slot stay intact.
+        defer_partition_drop(topic, partition);
         Ok(())
     }
 
@@ -2779,8 +2917,12 @@ impl LogStore for SegmentStore {
             Ok(removed)
         })?;
 
-        // The archive's record is now false: a row saying base N was archived vouches for bytes
-        crate::archive::forget_from(topic, partition, offset).map_err(StoreError::Io)?;
+        // The archive's record is now false: a row saying base N was archived vouches for bytes.
+        // On a standby in recovery, Postgres forbids assigning TransactionIds; skip the catalog
+        // write there (the primary owns the archive table).
+        if !unsafe { pgrx::pg_sys::RecoveryInProgress() } {
+            crate::archive::forget_from(topic, partition, offset).map_err(StoreError::Io)?;
+        }
         Ok(removed)
     }
 
@@ -2799,6 +2941,13 @@ impl LogStore for SegmentStore {
         drop(view);
 
         Self::with_slot(topic, partition, |st, hints| {
+            // Re-check recovery state under the shard lock so a late in-flight follower reply
+            // cannot splice old-epoch batches into a newly promoted primary's log.
+            if !unsafe { pgrx::pg_sys::RecoveryInProgress() } {
+                return Err(StoreError::Io(
+                    "cannot apply replicated batch: node is no longer in recovery".to_string(),
+                ));
+            }
             if st.next_offset != expected_base {
                 return Err(StoreError::Io(format!(
                     "replication position moved: caller expected log end {expected_base}, \
@@ -2818,6 +2967,54 @@ impl LogStore for SegmentStore {
             st.next_offset = last_offset + 1;
             let _ = epoch;
             Ok(batch_base)
+        })
+    }
+
+    fn last_batch_epoch(&self, topic: TopicId, partition: i32) -> StoreResult<Option<i32>> {
+        let bases = Self::segment_bases(topic, partition)?;
+        if bases.is_empty() {
+            return Ok(None);
+        }
+        Self::with_slot(topic, partition, |st, _| {
+            for base in bases.iter().rev() {
+                let path = data_path(&segment_path(topic, partition, *base, "log"));
+                let Ok(vfd) = Vfd::open(&path, false) else {
+                    continue;
+                };
+                let data_end = if *base == st.active_base {
+                    st.active_bytes
+                } else {
+                    vfd.size()?
+                };
+                if data_end == 0 {
+                    continue;
+                }
+                let mut pos = 0u64;
+                let mut last_epoch = None;
+                let mut header = [0u8; records::RECORD_BATCH_OVERHEAD];
+                while pos + header.len() as u64 <= data_end {
+                    if vfd.read_at(&mut header, pos)? != header.len() {
+                        break;
+                    }
+                    let Some(BatchSpan { total, .. }) = batch_span(&header, pos, data_end) else {
+                        break;
+                    };
+                    let ep = i32::from_be_bytes(
+                        header[records::PARTITION_LEADER_EPOCH_OFFSET
+                            ..records::PARTITION_LEADER_EPOCH_OFFSET + 4]
+                            .try_into()
+                            .expect("4 bytes"),
+                    );
+                    if ep >= 0 {
+                        last_epoch = Some(ep);
+                    }
+                    pos += total;
+                }
+                if last_epoch.is_some() {
+                    return Ok(last_epoch);
+                }
+            }
+            Ok(None)
         })
     }
 

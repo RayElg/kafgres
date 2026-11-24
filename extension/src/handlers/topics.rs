@@ -161,7 +161,10 @@ pub fn delete_topics(
                 Some("unknown topic".to_string()),
                 name.clone(),
             ),
-            Some((_, real_name)) => match meta::delete_topic(&real_name) {
+            Some((_, real_name)) => match crate::dbtx::atomically(
+                || meta::delete_topic(&real_name),
+                |message| TopicError::Internal(format!("delete aborted: {message}")),
+            ) {
                 Ok(true) => (ErrorCode::None, None, Some(real_name)),
                 Ok(false) => (
                     ErrorCode::UnknownTopicOrPartition,

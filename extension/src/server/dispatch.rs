@@ -315,21 +315,23 @@ pub(super) fn dispatch(
         }
         add_partitions_to_txn_request::AddPartitionsToTxnRequest::API_KEY => {
             c.tx(|r: &add_partitions_to_txn_request::AddPartitionsToTxnRequest, e| {
-                handlers::txn::handle_add_partitions(r, e.version)
+                handlers::txn::handle_add_partitions(r, e.version, &e.authz)
             })
         }
         add_offsets_to_txn_request::AddOffsetsToTxnRequest::API_KEY => {
             c.tx(|r: &add_offsets_to_txn_request::AddOffsetsToTxnRequest, e| {
-                handlers::txn::handle_add_offsets(r, e.version)
+                handlers::txn::handle_add_offsets(r, e.version, &e.authz)
             })
         }
         txn_offset_commit_request::TxnOffsetCommitRequest::API_KEY => {
             c.tx(|r: &txn_offset_commit_request::TxnOffsetCommitRequest, e| {
-                handlers::txn::handle_txn_offset_commit(r, e.version)
+                handlers::txn::handle_txn_offset_commit(r, e.version, &e.authz)
             })
         }
         end_txn_request::EndTxnRequest::API_KEY => {
-            c.tx(|r: &end_txn_request::EndTxnRequest, e| handlers::txn::handle_end_txn(r, e.version))
+            c.tx(|r: &end_txn_request::EndTxnRequest, e| {
+                handlers::txn::handle_end_txn(r, e.version, &e.authz)
+            })
         }
         write_txn_markers_request::WriteTxnMarkersRequest::API_KEY => {
             c.tx(|r: &write_txn_markers_request::WriteTxnMarkersRequest, e| {

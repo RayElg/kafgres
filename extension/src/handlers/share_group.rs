@@ -1142,7 +1142,29 @@ fn acquire_and_read(
     let hwm = store
         .high_watermark(topic, partition)
         .map_err(|e| HandlerError::Internal(e.to_string()))?;
-    let from = start_offset(group, topic, partition)?;
+    let log_start = store
+        .log_start_offset(topic, partition)
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    let mut from = start_offset(group, topic, partition)?;
+    // If retention or DeleteRecords moved log_start past the share group's start offset,
+    // advance the share group to log_start instead of failing forever on OffsetOutOfRange.
+    if from < log_start {
+        from = log_start;
+        Spi::run_with_args(
+            "INSERT INTO kafgres_share_offsets (group_id, topic_id, partition, start_offset)
+             VALUES ($1, $2::oid, $3, $4)
+             ON CONFLICT (group_id, topic_id, partition) DO UPDATE
+                SET start_offset = GREATEST(kafgres_share_offsets.start_offset, EXCLUDED.start_offset)",
+            &[group.into(), (topic as i32).into(), partition.into(), log_start.into()],
+        )
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        Spi::run_with_args(
+            "DELETE FROM kafgres_share_inflight
+              WHERE group_id = $1 AND topic_id = $2::oid AND partition = $3 AND record_offset < $4",
+            &[group.into(), (topic as i32).into(), partition.into(), log_start.into()],
+        )
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    }
     if hwm <= from {
         return Ok((Vec::new(), Vec::new()));
     }

@@ -143,6 +143,8 @@ impl RecordCursor {
             let batch = batch.map_err(|e| {
                 StoreError::Io(format!("undecodable batch after offset {advanced}: {e}"))
             })?;
+            kafgres_codec::records::RecordBatch::validated(batch.as_bytes().clone())
+                .map_err(|_| StoreError::CorruptBatch)?;
             if batch.base_offset() >= self.range.end {
                 advanced = self.range.end;
                 break;

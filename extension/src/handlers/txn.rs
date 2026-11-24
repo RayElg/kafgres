@@ -214,6 +214,7 @@ pub fn hold_for_produce(transactional_id: &str, producer_id: i64) -> Result<(), 
 pub fn handle_add_partitions(
     req: &AddPartitionsToTxnRequest,
     version: i16,
+    authz: &crate::acl::Authz,
 ) -> Result<AddPartitionsToTxnResponse, HandlerError> {
     // v4+ is the broker-to-broker batched shape, and this cluster has no peers. An empty
     // `results_by_transaction` would read as "all partitions verified", so refuse the request whole.
@@ -236,13 +237,57 @@ pub fn handle_add_partitions(
         )
     };
 
+    if let Err(auth_code) = authz.check(
+        crate::acl::Operation::Write,
+        crate::acl::ResourceType::TransactionalId,
+        &txn_id,
+    ) {
+        let results: Vec<AddPartitionsToTxnTopicResult> = topics
+            .iter()
+            .map(|t| AddPartitionsToTxnTopicResult {
+                name: t.name.clone(),
+                results_by_partition: t
+                    .partitions
+                    .iter()
+                    .map(|p| AddPartitionsToTxnPartitionResult {
+                        partition_index: *p,
+                        partition_error_code: auth_code.code(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        return Ok(AddPartitionsToTxnResponse {
+            throttle_time_ms: 0,
+            error_code: 0,
+            results_by_topic_v3_and_below: results,
+            results_by_transaction: Vec::new(),
+            ..Default::default()
+        });
+    }
+
     let admitted = verdict(&txn_id, producer_id, epoch)?;
     let code = admitted.err().map_or(ErrorCode::None, |v| v.code(version));
 
+    let mut topic_codes: Vec<ErrorCode> = Vec::with_capacity(topics.len());
     if let Ok(admitted) = admitted {
-        begin_or_continue(admitted, &txn_id).map_err(|e| HandlerError::Internal(e.to_string()))?;
-
+        let mut begun = false;
         for topic in &topics {
+            if let Err(tc) = authz.check(
+                crate::acl::Operation::Write,
+                crate::acl::ResourceType::Topic,
+                &topic.name,
+            ) {
+                topic_codes.push(tc);
+                continue;
+            }
+            topic_codes.push(ErrorCode::None);
+            if !begun {
+                begin_or_continue(admitted, &txn_id)
+                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                begun = true;
+            }
             let topic_id = crate::meta::topic_id_by_name(&topic.name)
                 .map_err(|e| HandlerError::Internal(e.to_string()))?;
             let Some(topic_id) = topic_id else { continue };
@@ -257,18 +302,21 @@ pub fn handle_add_partitions(
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
             }
         }
+    } else {
+        topic_codes.resize(topics.len(), code);
     }
 
     let results: Vec<AddPartitionsToTxnTopicResult> = topics
         .iter()
-        .map(|t| AddPartitionsToTxnTopicResult {
+        .zip(topic_codes.iter())
+        .map(|(t, &tc)| AddPartitionsToTxnTopicResult {
             name: t.name.clone(),
             results_by_partition: t
                 .partitions
                 .iter()
                 .map(|p| AddPartitionsToTxnPartitionResult {
                     partition_index: *p,
-                    partition_error_code: code.code(),
+                    partition_error_code: tc.code(),
                     ..Default::default()
                 })
                 .collect(),
@@ -440,7 +488,11 @@ fn produce_verdict(
 ///
 /// At v5 the epoch also rotates (KIP-890 part two): the response carries a fresh epoch so
 /// the producer's next transaction starts without an `InitProducerId` round trip.
-pub fn handle_end_txn(req: &EndTxnRequest, version: i16) -> Result<EndTxnResponse, HandlerError> {
+pub fn handle_end_txn(
+    req: &EndTxnRequest,
+    version: i16,
+    authz: &crate::acl::Authz,
+) -> Result<EndTxnResponse, HandlerError> {
     // The v5 fields are ignorable and default to -1, which a client may read as an epoch,
     // so every early return below carries the caller's own pair.
     let unchanged = |code: ErrorCode| EndTxnResponse {
@@ -454,6 +506,13 @@ pub fn handle_end_txn(req: &EndTxnRequest, version: i16) -> Result<EndTxnRespons
     // Checked before the retry lookup as well: a retired pair is no exception.
     if req.transactional_id.is_empty() {
         return Ok(unchanged(Verdict::NoTransactionalId.code(version)));
+    }
+    if let Err(code) = authz.check(
+        crate::acl::Operation::Write,
+        crate::acl::ResourceType::TransactionalId,
+        &req.transactional_id,
+    ) {
+        return Ok(unchanged(code));
     }
 
     // Checked before the fence: after a v5 rotation a retry carries the retired epoch, which
@@ -677,6 +736,14 @@ fn finish_transaction(
             committed,
         )?;
     }
+    // Every control marker must be durable before Postgres commits the abort index,
+    // transactional offsets, and transaction state; otherwise a power cut can lose the
+    // ABORT marker while keeping kafgres_txn_aborted, permanently hiding later commits.
+    for (topic_id, partition, _) in &partitions {
+        store
+            .sync_partition(*topic_id, *partition)
+            .map_err(|e| HandlerError::Internal(format!("syncing transaction marker: {e}")))?;
+    }
 
     // Staged offsets become visible exactly with the records, or not at all: after the
     if committed {
@@ -787,20 +854,70 @@ fn fence(producer_id: i64) -> Result<i32, HandlerError> {
                     retired_producer_id = NULL,
                     retired_epoch = NULL,
                     retired_committed = NULL
-              WHERE producer_id = $1
+              WHERE producer_id = $1 AND producer_epoch < $2
              RETURNING producer_epoch)
          SELECT (SELECT producer_epoch FROM up)",
-        &[producer_id.into()],
+        &[producer_id.into(), (i16::MAX as i32).into()],
     )
     .map_err(|e| HandlerError::Internal(e.to_string()))?;
-    Ok(epoch.unwrap_or(-1))
+    if let Some(e) = epoch {
+        return Ok(e);
+    }
+    // Either the row is already gone, or it hit the smallint epoch ceiling (i16::MAX).
+    // At the ceiling, retire the old producer_id and allocate a fresh one at epoch 0 so
+    // the old instance is fenced without overflowing smallint.
+    let at_ceiling: Option<String> = Spi::get_one_with_args(
+        "WITH gone AS (
+             DELETE FROM kafgres_producers
+              WHERE producer_id = $1 AND producer_epoch >= $2
+          RETURNING COALESCE(transactional_id, '') AS tid)
+         SELECT (SELECT tid FROM gone)",
+        &[producer_id.into(), (i16::MAX as i32).into()],
+    )
+    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    if let Some(tid) = at_ceiling {
+        Spi::run_with_args(
+            "DELETE FROM kafgres_producer_batches WHERE producer_id = $1",
+            &[producer_id.into()],
+        )
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        if !tid.is_empty() {
+            let _ = crate::producer::init_producer_id(Some(&tid))
+                .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        }
+        return Ok(0);
+    }
+    Ok(-1)
 }
 
 /// `25 AddOffsetsToTxn` — the transaction will also commit consumer offsets. Committed
 pub fn handle_add_offsets(
     req: &AddOffsetsToTxnRequest,
     version: i16,
+    authz: &crate::acl::Authz,
 ) -> Result<AddOffsetsToTxnResponse, HandlerError> {
+    if let Err(code) = authz.check(
+        crate::acl::Operation::Write,
+        crate::acl::ResourceType::TransactionalId,
+        &req.transactional_id,
+    ) {
+        return Ok(AddOffsetsToTxnResponse {
+            throttle_time_ms: 0,
+            error_code: code.code(),
+            ..Default::default()
+        });
+    }
+    if let Err(code) = authz.check(
+        crate::acl::Operation::Read,
+        crate::acl::ResourceType::Group,
+        &req.group_id,
+    ) {
+        return Ok(AddOffsetsToTxnResponse {
+            throttle_time_ms: 0,
+            error_code: code.code(),
+            ..Default::default()
+        });
+    }
     let code = match verdict(&req.transactional_id, req.producer_id, req.producer_epoch)? {
         Err(v) => v.code(version),
         Ok(admitted) => {
@@ -825,7 +942,48 @@ pub fn handle_add_offsets(
 pub fn handle_txn_offset_commit(
     req: &TxnOffsetCommitRequest,
     version: i16,
+    authz: &crate::acl::Authz,
 ) -> Result<TxnOffsetCommitResponse, HandlerError> {
+    let auth_err = authz
+        .check(
+            crate::acl::Operation::Write,
+            crate::acl::ResourceType::TransactionalId,
+            &req.transactional_id,
+        )
+        .err()
+        .or_else(|| {
+            authz
+                .check(
+                    crate::acl::Operation::Read,
+                    crate::acl::ResourceType::Group,
+                    &req.group_id,
+                )
+                .err()
+        });
+    if let Some(auth_code) = auth_err {
+        let topics = req
+            .topics
+            .iter()
+            .map(|t| TxnOffsetCommitResponseTopic {
+                name: t.name.clone(),
+                partitions: t
+                    .partitions
+                    .iter()
+                    .map(|p| TxnOffsetCommitResponsePartition {
+                        partition_index: p.partition_index,
+                        error_code: auth_code.code(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        return Ok(TxnOffsetCommitResponse {
+            throttle_time_ms: 0,
+            topics,
+            ..Default::default()
+        });
+    }
     // Reported per partition, and a stale epoch is INVALID_PRODUCER_EPOCH at every
     // version, as Kafka answers it; the other coordinator APIs answer PRODUCER_FENCED.
     let admitted = verdict(&req.transactional_id, req.producer_id, req.producer_epoch)?;
@@ -953,73 +1111,95 @@ pub fn handle_txn_offset_commit(
 
 /// Abort transactions whose producer stopped talking to us. Without this, the LSO held by
 pub fn expire_stale_transactions() -> Result<usize, HandlerError> {
-    let now = now_millis();
-    // Bounded: ending thousands in one pass would hold the worker off Fetch, and the next
+    use std::time::{Duration, Instant};
+
+    // Bounded per sweep with a time budget so a backlog clears quickly without stalling Fetch.
     const MAX_PER_SWEEP: i64 = 64;
-    let mut stale: Vec<(i64, i16)> = Spi::connect(|client| {
-        let rows = client.select(
-            "SELECT producer_id, producer_epoch FROM kafgres_txns
-              WHERE state = 'ongoing' AND $1 - started_at > timeout_ms
-              ORDER BY started_at
-              LIMIT $2",
-            None,
-            &[now.into(), MAX_PER_SWEEP.into()],
-        )?;
-        let mut out = Vec::new();
-        for row in rows {
-            if let (Some(p), Some(e)) = (row.get::<i64>(1)?, row.get::<i32>(2)?) {
-                out.push((p, e as i16));
-            }
-        }
-        Ok::<_, pgrx::spi::Error>(out)
-    })
-    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    const BUDGET: Duration = Duration::from_millis(200);
+    let started = Instant::now();
+    let mut total_done = 0usize;
 
-    // Locked one at a time in ascending producer id, the order a Produce request takes them
-    // in (`hold_for_produce`): locking the whole batch oldest-first could deadlock with a
-    // request carrying several transactional producers. Staleness is re-checked under the lock.
-    stale.sort_unstable_by_key(|&(producer_id, _)| producer_id);
-    let mut done = 0;
-    for (producer_id, _) in stale {
-        let locked: Option<i32> = Spi::get_one_with_args(
-            "SELECT (SELECT producer_epoch FROM kafgres_txns
-                      WHERE producer_id = $1 AND state = 'ongoing'
-                        AND $2 - started_at > timeout_ms
-                        FOR UPDATE)",
-            &[producer_id.into(), now.into()],
-        )
+    loop {
+        let now = now_millis();
+        let mut stale: Vec<(i64, i16)> = Spi::connect(|client| {
+            let rows = client.select(
+                "SELECT producer_id, producer_epoch FROM kafgres_txns
+                  WHERE state = 'ongoing' AND $1 - started_at > timeout_ms
+                  ORDER BY started_at
+                  LIMIT $2",
+                None,
+                &[now.into(), MAX_PER_SWEEP.into()],
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                if let (Some(p), Some(e)) = (row.get::<i64>(1)?, row.get::<i32>(2)?) {
+                    out.push((p, e as i16));
+                }
+            }
+            Ok::<_, pgrx::spi::Error>(out)
+        })
         .map_err(|e| HandlerError::Internal(e.to_string()))?;
-        let Some(epoch) = locked.map(|e| e as i16) else { continue };
-        // Abort, then fence — both in this one Postgres transaction: inside it the fence
-        match finish_transaction(producer_id, epoch, false)? {
-            // Ended underneath us between the SELECT and here, or never begun (state
-            // `empty`): nothing to abort and nothing to fence.
-            Finish::NotOurs | Finish::NotOpen { .. } => continue,
-            // Already forced by an operator; `finish_transaction` fenced on its way out.
-            Finish::Overridden => {
-                done += 1;
-                continue;
+
+        let fetched = stale.len();
+        if fetched == 0 {
+            break;
+        }
+
+        // Locked one at a time in ascending producer id, the order a Produce request takes them
+        // in (`hold_for_produce`): locking the whole batch oldest-first could deadlock with a
+        // request carrying several transactional producers. Each expiry runs in its own
+        // subtransaction so one failing producer cannot roll back or stall the rest.
+        stale.sort_unstable_by_key(|&(producer_id, _)| producer_id);
+        let mut batch_done = 0usize;
+        for (producer_id, _) in stale {
+            let res: Result<bool, HandlerError> = crate::dbtx::atomically(
+                || {
+                    let locked: Option<i32> = Spi::get_one_with_args(
+                        "SELECT (SELECT producer_epoch FROM kafgres_txns
+                                  WHERE producer_id = $1 AND state = 'ongoing'
+                                    AND $2 - started_at > timeout_ms
+                                    FOR UPDATE)",
+                        &[producer_id.into(), now.into()],
+                    )
+                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                    let Some(epoch) = locked.map(|e| e as i16) else {
+                        return Ok(false);
+                    };
+                    match finish_transaction(producer_id, epoch, false)? {
+                        Finish::NotOurs | Finish::NotOpen { .. } => return Ok(false),
+                        Finish::Overridden => return Ok(true),
+                        Finish::Ended => {}
+                    }
+                    let fenced_epoch = fence(producer_id)?;
+                    if fenced_epoch < 0 {
+                        log!(
+                            "kafgres: aborted transaction for producer {producer_id} — no EndTxn within \
+                             its transaction timeout; its producer state was already gone"
+                        );
+                    } else {
+                        log!(
+                            "kafgres: aborted transaction for producer {producer_id} — no EndTxn within \
+                             its transaction timeout; fenced at epoch {fenced_epoch}"
+                        );
+                    }
+                    Ok(true)
+                },
+                |msg| HandlerError::Internal(msg.to_string()),
+            );
+            match res {
+                Ok(true) => batch_done += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    log!("kafgres: failed to expire stale transaction for producer {producer_id}: {e}");
+                }
             }
-            Finish::Ended => {}
         }
-
-        // The fence makes expiry safe: the producer may just be slow, and unfenced it keeps
-        let fenced_epoch = fence(producer_id)?;
-
-        if fenced_epoch < 0 {
-            log!(
-                "kafgres: aborted transaction for producer {producer_id} — no EndTxn within \
-                 its transaction timeout; its producer state was already gone"
-            );
-        } else {
-            log!(
-                "kafgres: aborted transaction for producer {producer_id} — no EndTxn within \
-                 its transaction timeout; fenced at epoch {fenced_epoch}"
-            );
+        total_done += batch_done;
+        if (fetched as i64) < MAX_PER_SWEEP || batch_done == 0 || started.elapsed() >= BUDGET {
+            break;
         }
-        done += 1;
     }
-    Ok(done)
+    Ok(total_done)
 }
 
 /// Append one partition's control batch and, on an abort, record the range it covers.
@@ -1065,6 +1245,210 @@ fn append_marker(
     Ok(())
 }
 
+/// Reconcile `kafgres_txn_aborted` and `kafgres_txn_partitions` against the recovered log end
+/// at startup or promotion.
+///
+/// Handles both directions of WAL/segment skew:
+/// 1. WAL ahead of segment (power cut or lagging follower):
+///    - Abort-index rows wholly past `end` are deleted so reused offsets are not hidden.
+///    - Abort-index rows whose data survived (`first_offset < end`) but whose ABORT marker
+///      was lost (`last_offset >= end`) get a fresh ABORT control batch appended and fsynced
+///      so `read_committed` consumers terminate the abort instead of hiding later commits.
+/// 2. Segment ahead of WAL (failover when WAL lags the segment):
+///    - Scans the recent tail for ABORT control batches missing from `kafgres_txn_aborted`
+///      and inserts the missing abort-index rows so aborted data is never exposed.
+pub fn reconcile_transactions(
+    store: &mut dyn crate::storage::LogStore,
+    topic_id: u32,
+    partition: i32,
+    end: i64,
+) -> Result<(), HandlerError> {
+    use kafgres_codec::records::{ControlBatchType, LENGTH_OFFSET};
+    use std::collections::HashMap;
+
+    // Reset first_offset for any ongoing transaction whose data did not survive.
+    Spi::run_with_args(
+        "UPDATE kafgres_txn_partitions SET first_offset = -1
+          WHERE topic_id = $1::oid AND partition = $2 AND first_offset >= $3",
+        &[(topic_id as i32).into(), partition.into(), end.into()],
+    )
+    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+
+    // Drop abort-index rows whose entire range (data + marker) is past the recovered log end.
+    Spi::run_with_args(
+        "DELETE FROM kafgres_txn_aborted
+          WHERE topic_id = $1::oid AND partition = $2 AND first_offset >= $3",
+        &[(topic_id as i32).into(), partition.into(), end.into()],
+    )
+    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+
+    // Re-append missing ABORT markers for rows whose data survived but marker was lost.
+    let missing_markers: Vec<(i64, i64, i16)> = Spi::connect(|client| {
+        let rows = client.select(
+            "SELECT a.producer_id, a.first_offset,
+                    COALESCE(p.producer_epoch, t.producer_epoch, 0)::int
+               FROM kafgres_txn_aborted a
+               LEFT JOIN kafgres_producers p ON p.producer_id = a.producer_id
+               LEFT JOIN kafgres_txns t ON t.producer_id = a.producer_id
+              WHERE a.topic_id = $1::oid AND a.partition = $2
+                AND a.first_offset < $3 AND a.last_offset >= $3
+              ORDER BY a.first_offset",
+            None,
+            &[(topic_id as i32).into(), partition.into(), end.into()],
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let (Some(pid), Some(first), Some(epoch)) =
+                (row.get::<i64>(1)?, row.get::<i64>(2)?, row.get::<i32>(3)?)
+            {
+                out.push((pid, first, epoch as i16));
+            }
+        }
+        Ok::<_, pgrx::spi::Error>(out)
+    })
+    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+
+    let mut need_sync = false;
+    for (producer_id, first_offset, epoch) in missing_markers {
+        let bytes = build_control_batch(producer_id, epoch, false);
+        let view = RecordBatch::new(bytes.clone())
+            .map_err(|e| HandlerError::Internal(format!("control batch: {e:?}")))?;
+        let batch = RawBatch {
+            bytes: bytes.to_vec(),
+            record_count: view.record_count(),
+            last_offset_delta: view.last_offset_delta(),
+            max_timestamp: view.max_timestamp(),
+            producer_id,
+            producer_epoch: epoch,
+            base_sequence: -1,
+            is_transactional: true,
+            is_control: true,
+        };
+        let marker_offset = store
+            .append(topic_id, partition, batch, None)
+            .map_err(|e| HandlerError::Internal(format!("re-appending ABORT marker: {e}")))?;
+        crate::storage::pmeta::record_aborted_txn(
+            topic_id,
+            partition,
+            producer_id,
+            first_offset,
+            marker_offset,
+        )
+        .map_err(|e| HandlerError::Internal(format!("updating aborted range: {e}")))?;
+        need_sync = true;
+        log!(
+            "kafgres: re-appended missing ABORT marker for producer {producer_id} on \
+             topic {topic_id} partition {partition} at offset {marker_offset} \
+             (aborted range [{first_offset}, {marker_offset}])"
+        );
+    }
+    if need_sync {
+        store
+            .sync_partition(topic_id, partition)
+            .map_err(|e| HandlerError::Internal(format!("syncing reconciled markers: {e}")))?;
+    }
+
+    // Segment ahead of WAL (e.g. async failover where WAL lagged segment replication):
+    // scan the tail after window_checkpoint for ABORT control batches missing from the index.
+    let log_start = store
+        .log_start_offset(topic_id, partition)
+        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    if end <= log_start {
+        return Ok(());
+    }
+    let checkpoint: Option<i64> = Spi::get_one_with_args(
+        "SELECT (SELECT window_checkpoint FROM kafgres_partitions
+                  WHERE topic_id = $1::oid AND partition = $2)",
+        &[(topic_id as i32).into(), partition.into()],
+    )
+    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+    let scan_from = checkpoint
+        .unwrap_or_else(|| end.saturating_sub(100_000))
+        .max(log_start)
+        .min(end);
+    let mut at = scan_from;
+    let mut first_seen: HashMap<i64, i64> = HashMap::new();
+    while at < end {
+        let slice = store
+            .read(
+                topic_id,
+                partition,
+                at,
+                4 << 20,
+                crate::storage::IsolationLevel::ReadUncommitted,
+            )
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        if slice.bytes.is_empty() {
+            break;
+        }
+        let mut pos = 0usize;
+        let mut advanced_to = at;
+        while pos + LENGTH_OFFSET + 4 <= slice.bytes.len() {
+            let len = i32::from_be_bytes(
+                slice.bytes[pos + LENGTH_OFFSET..pos + LENGTH_OFFSET + 4]
+                    .try_into()
+                    .expect("4 bytes"),
+            );
+            let total = LENGTH_OFFSET + 4 + len.max(0) as usize;
+            if len <= 0 || pos + total > slice.bytes.len() {
+                break;
+            }
+            let bytes = kafgres_codec::bytes::Bytes::copy_from_slice(&slice.bytes[pos..pos + total]);
+            pos += total;
+            let Ok(batch) = RecordBatch::new(bytes) else { continue };
+            let batch_base = batch.base_offset();
+            if batch_base >= end {
+                advanced_to = end;
+                break;
+            }
+            advanced_to = (batch_base + batch.last_offset_delta() as i64 + 1).max(advanced_to);
+            let pid = batch.producer_id();
+            if pid < 0 || !batch.is_transactional() {
+                continue;
+            }
+            if !batch.is_control() {
+                first_seen.entry(pid).or_insert(batch_base);
+                continue;
+            }
+            match batch.control_type() {
+                Some(ControlBatchType::Commit) => {
+                    first_seen.remove(&pid);
+                }
+                Some(ControlBatchType::Abort) => {
+                    let first = first_seen.remove(&pid).unwrap_or(scan_from);
+                    let already = crate::storage::pmeta::aborted_at(
+                        topic_id,
+                        partition,
+                        pid,
+                        batch_base,
+                    )
+                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                    if !already {
+                        crate::storage::pmeta::record_aborted_txn(
+                            topic_id,
+                            partition,
+                            pid,
+                            first,
+                            batch_base,
+                        )
+                        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                        log!(
+                            "kafgres: reconstructed missing abort-index row for producer {pid} \
+                             on topic {topic_id} partition {partition} [{first}, {batch_base}]"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        if advanced_to <= at {
+            break;
+        }
+        at = advanced_to;
+    }
+    Ok(())
+}
+
 /// End **one partition** of a transaction — the protocol's own granularity, since Kafka
 fn finish_partition(
     producer_id: i64,
@@ -1105,6 +1489,9 @@ fn finish_partition(
         first_offset,
         committed,
     )?;
+    store
+        .sync_partition(topic_id, partition)
+        .map_err(|e| HandlerError::Internal(format!("syncing transaction marker: {e}")))?;
 
     Spi::run_with_args(
         "DELETE FROM kafgres_txn_partitions

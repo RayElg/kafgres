@@ -40,6 +40,7 @@ mod init180;
 mod init190;
 mod init200;
 mod init210;
+mod init220;
 pub mod quota;
 pub mod meta;
 pub mod plan;
@@ -943,6 +944,7 @@ pub(crate) fn ensure_tables_exist() {
     init190::init_190();
     init200::init_200();
     init210::init_210();
+    init220::init_220();
 }
 
 pgrx::extension_sql!(
