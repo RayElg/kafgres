@@ -184,11 +184,11 @@ def test_aborted_kafka_transactions_are_filtered_like_a_consumer_would(topic):
     assert len(read(topic)) < len(read(topic, isolation="read_uncommitted"))
 
 
-def test_a_full_abort_list_is_not_mistaken_for_one_cut_short(topic):
-    """Exactly the cap of aborted transactions overlapping a record lists them all; one
-    more cannot be listed in one read. The entries are planted, under another producer."""
+def test_every_abort_reaching_the_first_record_is_listed_past_the_cap(topic):
+    """The per-read cap applies only to aborts starting after the first batch, so any number
+    overlapping it are listed and it is read. The entries are planted, under another producer."""
     produce(topic, ["only"])
-    for count, readable in ((1000, True), (1001, False)):
+    for count in (1000, 1001, 1500):
         sql(f"""DELETE FROM kafgres_txn_aborted
                  WHERE topic_id = (SELECT topic_id FROM kafgres_topics WHERE name = '{topic}');
                 INSERT INTO kafgres_txn_aborted
@@ -196,18 +196,14 @@ def test_a_full_abort_list_is_not_mistaken_for_one_cut_short(topic):
                 SELECT topic_id, 0, 999999, -n, 1000000
                   FROM kafgres_topics, generate_series(0, {count - 1}) n
                  WHERE name = '{topic}'""")
-        if readable:
-            assert read(topic) == {0: "only"}
-        else:
-            with pytest.raises(RuntimeError, match="more aborted transactions overlap"):
-                read(topic)
+        assert read(topic) == {0: "only"}, count
     sql(f"""DELETE FROM kafgres_txn_aborted
              WHERE topic_id = (SELECT topic_id FROM kafgres_topics WHERE name = '{topic}')""")
 
 
-def test_a_consumer_is_not_stalled_by_a_cut_short_abort_list(topic):
-    """Fetch keeps the first batch past the abort-list cap, so a read_committed consumer makes
-    progress; the batches after the cut wait for the next Fetch."""
+def test_a_consumer_is_not_stalled_by_aborts_past_the_cap(topic):
+    """More aborts overlapping the first batch than the cap: they are all listed, so a
+    read_committed consumer makes progress."""
     produce(topic, ["first", "second"])
     sql(f"""INSERT INTO kafgres_txn_aborted
                    (topic_id, partition, producer_id, first_offset, last_offset)

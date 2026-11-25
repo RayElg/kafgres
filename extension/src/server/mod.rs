@@ -1499,6 +1499,10 @@ fn reconcile_recovered_tails() -> bool {
                     &[(topic_id as i32).into(), partition.into(), end.into()],
                 )?;
             }
+            // Not fatal: a leftover directory costs disk, not correctness, as ids are never reused.
+            if let Err(e) = crate::storage::LogStore::sweep_orphans(&mut *store) {
+                log!("kafgres: could not remove files of dropped partitions: {e}");
+            }
             Ok(())
         })
     });

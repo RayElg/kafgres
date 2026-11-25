@@ -30,6 +30,7 @@ ERR_NON_EMPTY_GROUP = 68
 ERR_UNKNOWN_TOPIC_OR_PARTITION = 3
 ERR_TOPIC_AUTH_FAILED = 29
 ERR_OPERATION_NOT_ATTEMPTED = 55
+ERR_REQUEST_TIMED_OUT = 7
 
 ARCHIVE_LOCK_KEY = 0x7047_4B41_0000_0006
 
@@ -181,6 +182,127 @@ def test_cdc_mapping_runs_under_owner_privileges():
         sql(f"SELECT kafgres_drop_topic('{topic}')")
 
 
+def span_of(topic):
+    return int(sql(f"SELECT coalesce(sum(offset_span), 0) FROM kafgres_partition_offsets('{topic}')"))
+
+
+def eventually(check, timeout=30):
+    deadline = time.monotonic() + timeout
+    while not check():
+        assert time.monotonic() < deadline, "condition never held"
+        time.sleep(0.5)
+
+
+def test_a_mapping_without_an_owner_renders_nothing_until_a_superuser_sets_one():
+    """What an upgrade leaves: a mapping made before owners were recorded. It must not render
+    as the superuser that ran the migration, must not be claimable by another role, and its
+    changes must wait in the slot rather than be lost."""
+    role = "cdc_claimer"
+    topic = "cdc-ownerless-topic"
+    sql("DELETE FROM kafgres_cdc_mappings WHERE mapping_name = 'ownerless'")
+    sql("DROP TABLE IF EXISTS public.ownerless_src, public.ownerless_secret CASCADE")
+    sql(f"DROP ROLE IF EXISTS {role}")
+    sql(f"SELECT kafgres_drop_topic('{topic}')")
+    sql(f"SELECT kafgres_create_topic('{topic}', 1)")
+    sql("CREATE TABLE public.ownerless_src (id int primary key)")
+    sql("CREATE TABLE public.ownerless_secret (s text)")
+    sql("INSERT INTO public.ownerless_secret VALUES ('TOP-SECRET-ROW')")
+    sql(f"CREATE ROLE {role} LOGIN")
+    for fn in ("kafgres_add_mapping(text, text, text, text, text, text)",
+               "kafgres_remove_mapping(text)", "kafgres_snapshot_mapping(text)"):
+        sql(f"GRANT EXECUTE ON FUNCTION {fn} TO {role}")
+    sql(f"GRANT SELECT ON kafgres_topics, public.ownerless_src TO {role}")
+    sql(f"GRANT SELECT, DELETE ON kafgres_cdc_mappings TO {role}")
+    try:
+        sql("SELECT kafgres_cdc_create_slot()")
+        sql(f"""INSERT INTO kafgres_cdc_mappings (mapping_name, source_table, topic, value_expr, owner)
+                VALUES ('ownerless', 'public.ownerless_src', '{topic}',
+                        $$(SELECT string_agg(s, ',') FROM public.ownerless_secret)$$, NULL)""")
+        sql("INSERT INTO public.ownerless_src VALUES (1)")
+        sql("SELECT kafgres_cdc_drain(100)")
+        assert span_of(topic) == 0, "an ownerless mapping rendered"
+        assert sql("SELECT count(*) FROM kafgres_cdc_errors WHERE mapping_name = 'ownerless'") == "0"
+
+        for statement in (
+            f"SELECT kafgres_add_mapping('ownerless', 'public.ownerless_src', '{topic}', 'new.id::text', NULL, NULL)",
+            "SELECT kafgres_remove_mapping('ownerless')",
+            "SELECT kafgres_snapshot_mapping('ownerless')",
+            "DELETE FROM kafgres_cdc_mappings WHERE mapping_name = 'ownerless'",
+        ):
+            r = psql_as(role, statement)
+            assert r.returncode != 0 and "permission denied" in r.stderr.lower(), (statement, r.stderr)
+        assert sql("SELECT count(*) FROM kafgres_cdc_mappings WHERE mapping_name = 'ownerless'") == "1"
+
+        # The held change renders once an owner is set, as that owner.
+        sql("UPDATE kafgres_cdc_mappings SET owner = 'postgres' WHERE mapping_name = 'ownerless'")
+        sql("SELECT kafgres_cdc_drain(100)")
+        eventually(lambda: span_of(topic) == 1)
+    finally:
+        sql("DELETE FROM kafgres_cdc_mappings WHERE mapping_name = 'ownerless'")
+        sql("DELETE FROM kafgres_cdc_errors WHERE mapping_name = 'ownerless'")
+        sql(f"REVOKE ALL ON kafgres_cdc_mappings, kafgres_topics FROM {role}")
+        for fn in ("kafgres_add_mapping(text, text, text, text, text, text)",
+                   "kafgres_remove_mapping(text)", "kafgres_snapshot_mapping(text)"):
+            sql(f"REVOKE ALL ON FUNCTION {fn} FROM {role}")
+        sql("DROP TABLE IF EXISTS public.ownerless_src, public.ownerless_secret CASCADE")
+        sql(f"DROP ROLE IF EXISTS {role}")
+        sql(f"SELECT kafgres_drop_topic('{topic}')")
+
+
+def test_a_mapping_writes_its_topic_only_while_its_owner_may():
+    """With ACLs on, a mapping needs WRITE on its topic for its owner, as kafgres_produce()
+    does: to be defined, and on every render after."""
+    role = "cdc_writer"
+    topic = "cdc-acl-topic"
+    sql("DELETE FROM kafgres_cdc_mappings WHERE mapping_name = 'acl_checked'")
+    sql("DELETE FROM kafgres_cdc_errors WHERE mapping_name = 'acl_checked'")
+    sql("DROP TABLE IF EXISTS public.acl_src CASCADE")
+    sql(f"DROP ROLE IF EXISTS {role}")
+    sql(f"SELECT kafgres_drop_topic('{topic}')")
+    sql(f"SELECT kafgres_create_topic('{topic}', 1)")
+    sql("CREATE TABLE public.acl_src (id int primary key)")
+    sql(f"CREATE ROLE {role} LOGIN")
+    sql(f"GRANT EXECUTE ON FUNCTION kafgres_add_mapping(text, text, text, text, text, text) TO {role}")
+    sql(f"GRANT SELECT ON kafgres_topics, public.acl_src TO {role}")
+    add = (f"SELECT kafgres_add_mapping('acl_checked', 'public.acl_src', '{topic}', "
+           f"$$new.id::text$$, NULL, NULL)")
+    sql("ALTER SYSTEM SET kafgres.acls_enabled = on")
+    sql("SELECT pg_reload_conf()")
+    time.sleep(2)
+    try:
+        r = psql_as(role, add)
+        assert r.returncode != 0 and "not allowed to write" in r.stderr.lower(), r.stderr
+
+        sql(f"SELECT kafgres_add_acl('User:{role}', 'WRITE', 'TOPIC', '{topic}')")
+        r = psql_as(role, add)
+        assert r.returncode == 0, r.stderr
+        sql("INSERT INTO public.acl_src VALUES (1)")
+        sql("SELECT kafgres_cdc_drain(100)")
+        eventually(lambda: span_of(topic) == 1)
+
+        sql(f"SELECT kafgres_remove_acl('User:{role}', 'WRITE', 'TOPIC', '{topic}')")
+        time.sleep(2)  # past the ACL cache's staleness bound
+        sql("INSERT INTO public.acl_src VALUES (2)")
+        sql("SELECT kafgres_cdc_drain(100)")
+        eventually(lambda: sql(
+            "SELECT count(*) FROM kafgres_cdc_errors WHERE mapping_name = 'acl_checked'") != "0")
+        assert span_of(topic) == 1, "the mapping wrote after its owner lost WRITE"
+        err = sql("SELECT error FROM kafgres_cdc_errors WHERE mapping_name = 'acl_checked' LIMIT 1")
+        assert "not allowed to write" in err.lower(), err
+    finally:
+        sql("ALTER SYSTEM RESET kafgres.acls_enabled")
+        sql("SELECT pg_reload_conf()")
+        sql(f"SELECT kafgres_remove_acl('User:{role}', 'WRITE', 'TOPIC', '{topic}')")
+        sql("DELETE FROM kafgres_cdc_mappings WHERE mapping_name = 'acl_checked'")
+        sql("DELETE FROM kafgres_cdc_errors WHERE mapping_name = 'acl_checked'")
+        sql(f"REVOKE ALL ON kafgres_topics FROM {role}")
+        sql(f"REVOKE ALL ON FUNCTION kafgres_add_mapping(text, text, text, text, text, text) FROM {role}")
+        sql("DROP TABLE IF EXISTS public.acl_src CASCADE")
+        sql(f"DROP ROLE IF EXISTS {role}")
+        sql(f"SELECT kafgres_drop_topic('{topic}')")
+        time.sleep(2)
+
+
 def test_transactional_id_acls_are_enforced():
     topic = "txn-acl-enforce-topic"
     sql(f"SELECT kafgres_drop_topic('{topic}')")
@@ -298,7 +420,7 @@ def test_failed_delete_topics_preserves_topic_and_data():
             resp = send_frame(sock, DELETE_TOPICS, 1, 1, body)
             off = 4 + 4 + 2 + len(topic)
             (code,) = struct.unpack_from(">h", resp, off)
-            assert code != ERR_NONE, "DeleteTopics unexpectedly succeeded while archive lock was held"
+            assert code == ERR_REQUEST_TIMED_OUT, f"a delete that waited on a lock should be retriable, got {code}"
 
         rows = sql(f"SELECT count(*) FROM kafgres_read('{topic}', 0)")
         assert int(rows) == 2, f"expected 2 surviving records, got {rows}"

@@ -495,8 +495,14 @@ impl LogStore for TableStore {
 
             // Aborted txns from the index, not the batches in hand: a txn spanning fetches reads as committed.
             if matches!(isolation, IsolationLevel::ReadCommitted) {
-                (aborted, aborted_cut_at) =
-                    pmeta::aborted_txns(topic, partition, offset, next_offset.max(offset + 1))?;
+                let first_last = super::first_batch_last_offset(&bytes).unwrap_or(offset).max(offset);
+                (aborted, aborted_cut_at) = pmeta::aborted_txns(
+                    topic,
+                    partition,
+                    offset,
+                    next_offset.max(offset + 1),
+                    first_last,
+                )?;
                 if let Some(cut) = aborted_cut_at {
                     next_offset = super::truncate_batches_at(&mut bytes, cut).unwrap_or(next_offset);
                 }

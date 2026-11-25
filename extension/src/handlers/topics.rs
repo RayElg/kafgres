@@ -161,9 +161,20 @@ pub fn delete_topics(
                 Some("unknown topic".to_string()),
                 name.clone(),
             ),
-            Some((_, real_name)) => match crate::dbtx::atomically(
+            Some((_, real_name)) => match crate::dbtx::atomically_coded(
                 || meta::delete_topic(&real_name),
-                |message| TopicError::Internal(format!("delete aborted: {message}")),
+                |message, code| {
+                    use pgrx::PgSqlErrorCode as C;
+                    match code {
+                        C::ERRCODE_LOCK_NOT_AVAILABLE
+                        | C::ERRCODE_T_R_DEADLOCK_DETECTED
+                        | C::ERRCODE_T_R_SERIALIZATION_FAILURE
+                        | C::ERRCODE_QUERY_CANCELED => {
+                            TopicError::Busy(format!("delete rolled back: {message}"))
+                        }
+                        _ => TopicError::Internal(format!("delete aborted: {message}")),
+                    }
+                },
             ) {
                 Ok(true) => (ErrorCode::None, None, Some(real_name)),
                 Ok(false) => (

@@ -1164,10 +1164,17 @@ impl SegmentStore {
             }
 
             // Indexes first, as in Kafka: a crash must not leave old positions by the new log.
+            // A stale index left beside the shorter rewrite would read as a lost tail.
             for ext in ["index", "timeindex"] {
-                let _ = std::fs::remove_file(data_path(&segment_path(
-                    topic, partition, info.base, ext,
-                )));
+                let path = data_path(&segment_path(topic, partition, info.base, ext));
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Err(StoreError::Io(format!("removing {}: {e}", path.display())));
+                    }
+                }
             }
             if empty {
                 let _ = std::fs::remove_file(&final_path);
@@ -1583,27 +1590,27 @@ impl SegmentStore {
                 } else {
                     vfd.size()?
                 };
-                let mut pos = hints
+                let hint = hints
                     .get(base)
-                    .and_then(|entries| entries.iter().rev().find(|(b, _)| *b <= from).map(|(_, p)| *p))
-                    .unwrap_or(0);
-                let mut used_hint = pos > 0;
+                    .and_then(|entries| entries.iter().rev().find(|(b, _)| *b <= from).copied())
+                    .filter(|(_, p)| *p > 0);
+                let mut pos = hint.map_or(0, |(_, p)| p);
+                let mut hinted_base = hint.map(|(b, _)| b);
                 let mut header = [0u8; records::RECORD_BATCH_OVERHEAD];
                 while pos + header.len() as u64 <= data_end {
                     if vfd.read_at(&mut header, pos)? != header.len() {
                         break;
                     }
-                    let Some(BatchSpan { total, base: batch_base, last: batch_last }) =
-                        batch_span(&header, pos, data_end)
-                    else {
-                        if used_hint {
-                            used_hint = false;
+                    let span = batch_span(&header, pos, data_end)
+                        .filter(|s| hinted_base.is_none_or(|b| b == s.base));
+                    let Some(BatchSpan { total, base: batch_base, last: batch_last }) = span else {
+                        if hinted_base.take().is_some() {
                             pos = 0;
                             continue;
                         }
                         break;
                     };
-                    used_hint = false;
+                    hinted_base = None;
                     if batch_base >= ceiling {
                         return Ok(None);
                     }
@@ -1611,6 +1618,9 @@ impl SegmentStore {
                         return Ok(Some(batch_base));
                     }
                     pos += total;
+                }
+                if *base != st.active_base && pos + header.len() as u64 > data_end {
+                    sealed_end_intact(topic, partition, *base, pos, data_end, &path)?;
                 }
             }
             Ok(None)
@@ -2088,6 +2098,40 @@ pub fn migrate_time_indexes() -> std::io::Result<usize> {
     Ok(removed)
 }
 
+/// A sealed segment was fsynced whole at roll and compaction swaps in a whole rewrite with
+/// its index removed, so a scan that ends short of the file, or before a position its own
+/// index names, has lost its tail. Truncation within the last index interval and on a batch
+/// boundary looks like a compacted tail and goes unseen.
+fn sealed_end_intact(
+    topic: TopicId,
+    partition: i32,
+    base: i64,
+    end: u64,
+    data_end: u64,
+    path: &Path,
+) -> StoreResult<()> {
+    let indexed_past_end = || -> Option<u64> {
+        let index = Vfd::open(&data_path(&segment_path(topic, partition, base, "index")), false).ok()?;
+        let size = index.size().ok()?;
+        let last = (size / INDEX_ENTRY as u64).checked_sub(1)? * INDEX_ENTRY as u64;
+        let mut entry = [0u8; INDEX_ENTRY];
+        if index.read_at(&mut entry, last).ok()? != INDEX_ENTRY {
+            return None;
+        }
+        let pos = u32::from_be_bytes(entry[4..].try_into().ok()?) as u64;
+        (pos >= data_end).then_some(pos)
+    };
+    let why = if end != data_end {
+        format!("its scan ended at byte {end} of {data_end}, not on a batch boundary at its end")
+    } else if let Some(pos) = indexed_past_end() {
+        format!("its index names position {pos}, past its {data_end} bytes")
+    } else {
+        return Ok(());
+    };
+    log!("kafgres: sealed segment {} has lost its tail: {why}", path.display());
+    Err(StoreError::CorruptBatch)
+}
+
 /// A batch's byte length and the offsets it spans.
 struct BatchSpan {
     total: u64,
@@ -2267,23 +2311,25 @@ impl LogStore for SegmentStore {
                             vfd.size()?
                         };
 
-                        let mut pos = hints
+                        let hint = hints
                             .get(base)
-                            .and_then(|entries| {
-                                entries.iter().rev().find(|(b, _)| *b <= next).map(|(_, p)| *p)
-                            })
-                            .unwrap_or(0);
-                        let mut used_hint = pos > 0;
+                            .and_then(|entries| entries.iter().rev().find(|(b, _)| *b <= next).copied())
+                            .filter(|(_, p)| *p > 0);
+                        let mut pos = hint.map_or(0, |(_, p)| p);
+                        // A hint names the batch it points at: one pointing at a later valid
+                        // batch would otherwise skip the batches between.
+                        let mut hinted_base = hint.map(|(b, _)| b);
 
                         let mut header = [0u8; records::RECORD_BATCH_OVERHEAD];
                         while pos + header.len() as u64 <= data_end {
                             if vfd.read_at(&mut header, pos)? != header.len() {
                                 break;
                             }
-                            let Some(BatchSpan { total, base: batch_base, last: batch_last }) =
-                                batch_span(&header, pos, data_end)
+                            let span = batch_span(&header, pos, data_end)
+                                .filter(|s| hinted_base.is_none_or(|b| b == s.base));
+                            let Some(BatchSpan { total, base: batch_base, last: batch_last }) = span
                             else {
-                                if used_hint {
+                                if hinted_base.take().is_some() {
                                     // A stale or misaligned index hint must not skip the segment;
                                     // fall back to a linear scan from offset 0.
                                     log!(
@@ -2291,7 +2337,6 @@ impl LogStore for SegmentStore {
                                          falling back to linear scan",
                                         path.display()
                                     );
-                                    used_hint = false;
                                     pos = 0;
                                     continue;
                                 }
@@ -2304,7 +2349,7 @@ impl LogStore for SegmentStore {
                                 }
                                 break;
                             };
-                            used_hint = false;
+                            hinted_base = None;
 
                             // Wholly below the request; the batch containing `offset` is kept whole (the consumer
                             if batch_last < offset {
@@ -2368,6 +2413,11 @@ impl LogStore for SegmentStore {
                                 return Ok(());
                             }
                         }
+                        // Read to the end of a sealed segment: the records after `next` must
+                        // be in the next one, not lost from this one's tail.
+                        if *base != st.active_base && pos + header.len() as u64 > data_end {
+                            sealed_end_intact(topic, partition, *base, pos, data_end, &path)?;
+                        }
                     }
                     for b in reclaimed {
                         hints.remove(&b);
@@ -2394,8 +2444,9 @@ impl LogStore for SegmentStore {
 
             // Kafka's aborts, scoped to what this response returned: bounding by the ceiling rather
             if matches!(isolation, IsolationLevel::ReadCommitted) {
+                let first_last = super::first_batch_last_offset(&out).unwrap_or(offset).max(offset);
                 let (listed, cut) =
-                    pmeta::aborted_txns(topic, partition, offset, next.max(offset + 1))?;
+                    pmeta::aborted_txns(topic, partition, offset, next.max(offset + 1), first_last)?;
                 aborted.extend(listed);
                 aborted_cut_at = cut;
                 if let Some(cut) = aborted_cut_at {
@@ -2978,6 +3029,72 @@ impl LogStore for SegmentStore {
             let _ = epoch;
             Ok(batch_base)
         })
+    }
+
+    /// Only what was last changed before the server started: a topic being created now has
+    /// its directory before its catalog row commits.
+    fn sweep_orphans(&mut self) -> StoreResult<usize> {
+        if unsafe { pg_sys::RecoveryInProgress() } {
+            return Ok(0);
+        }
+        let started_ms: i64 = Spi::get_one(
+            "SELECT (extract(epoch FROM pg_postmaster_start_time()) * 1000)::bigint",
+        )
+        .map_err(|e| StoreError::Io(e.to_string()))?
+        .unwrap_or(0);
+        let known: std::collections::HashSet<(i64, i64)> = Spi::connect(|client| {
+            let mut out = std::collections::HashSet::new();
+            for row in client.select(
+                "SELECT t.topic_id::bigint, p.partition::bigint
+                   FROM kafgres_topics t LEFT JOIN kafgres_partitions p USING (topic_id)",
+                None,
+                &[],
+            )? {
+                let topic = row.get::<i64>(1)?.unwrap_or(-1);
+                out.insert((topic, -1));
+                if let Some(p) = row.get::<i64>(2)? {
+                    out.insert((topic, p));
+                }
+            }
+            Ok::<_, pgrx::spi::Error>(out)
+        })
+        .map_err(|e| StoreError::Io(e.to_string()))?;
+
+        let before_start = |path: &Path| {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|d| (d.as_millis() as i64) < started_ms)
+        };
+        let numbered = |root: &Path| -> Vec<(i64, PathBuf)> {
+            std::fs::read_dir(root)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                        .filter_map(|e| Some((e.file_name().to_str()?.parse::<i64>().ok()?, e.path())))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let mut removed = 0;
+        for (topic, topic_dir) in numbered(&log_root()) {
+            let topic_known = known.contains(&(topic, -1));
+            for (partition, dir) in numbered(&topic_dir) {
+                if (!topic_known || !known.contains(&(topic, partition))) && before_start(&dir) {
+                    log!("kafgres: removing {}, a partition the catalog no longer has", dir.display());
+                    std::fs::remove_dir_all(&dir)
+                        .map_err(|e| StoreError::Io(format!("removing {}: {e}", dir.display())))?;
+                    removed += 1;
+                }
+            }
+            if !topic_known {
+                let _ = std::fs::remove_dir(&topic_dir);
+            }
+        }
+        Ok(removed)
     }
 
     fn last_batch_epoch(&self, topic: TopicId, partition: i32) -> StoreResult<Option<i32>> {

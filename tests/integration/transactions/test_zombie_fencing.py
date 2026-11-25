@@ -1032,3 +1032,26 @@ def test_every_transaction_partition_row_names_a_partition_that_exists(topic):
         assert b.end_txn(txn, pid, epoch, False) == NONE
     finally:
         b.close()
+
+
+def test_more_aborted_transactions_over_one_offset_than_one_fetch_caps_are_all_filtered(topic):
+    """More transactions open at once than the per-Fetch abort cap, all aborted: every abort
+    reaching the first batch served is listed, so none of them is read as committed."""
+    b = Broker()
+    try:
+        open_txns = []
+        for i in range(1050):
+            txn = f"{topic}-{i}"
+            pid, epoch = b.init_pid(txn)
+            assert b.add_partitions(txn, pid, epoch, topic) == NONE
+            assert b.produce(3, txn, topic, 0, txn_batch(b"aborted", pid, epoch, 0))[0] == NONE
+            open_txns.append((txn, pid, epoch))
+        for txn, pid, epoch in open_txns:
+            assert b.end_txn(txn, pid, epoch, False) == NONE
+        after = record_batch([b"after"], producer_id=-1, producer_epoch=-1, base_sequence=-1)
+        assert b.produce(3, None, topic, 0, after)[0] == NONE
+        assert read_committed(topic, timeout_ms=15000) == [b"after"]
+        got = sql(f"SELECT string_agg(convert_from(value, 'UTF8'), ',') FROM kafgres_read('{topic}', 0)")
+        assert got == "after"
+    finally:
+        b.close()

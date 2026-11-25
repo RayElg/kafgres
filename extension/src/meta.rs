@@ -174,6 +174,8 @@ pub enum TopicError {
     UnknownTopic,
     InvalidConfig(String),
     PartitionCountReduced { have: i32, want: i32 },
+    /// Rolled back on a lock, deadlock or timeout: nothing changed, and a retry can succeed.
+    Busy(String),
     Internal(String),
 }
 
@@ -189,6 +191,7 @@ impl TopicError {
             TopicError::AlreadyExists => E::TopicAlreadyExists,
             TopicError::UnknownTopic => E::UnknownTopicOrPartition,
             TopicError::InvalidConfig(_) => E::InvalidConfig,
+            TopicError::Busy(_) => E::RequestTimedOut,
             TopicError::Internal(_) => E::UnknownServerError,
         }
     }
@@ -208,6 +211,7 @@ impl std::fmt::Display for TopicError {
             TopicError::PartitionCountReduced { have, want } => {
                 write!(f, "cannot reduce partitions from {have} to {want}")
             }
+            TopicError::Busy(m) => write!(f, "busy: {m}"),
             TopicError::Internal(m) => write!(f, "internal: {m}"),
         }
     }

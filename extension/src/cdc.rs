@@ -57,6 +57,11 @@ fn kafgres_add_mapping(
 
     let caller = current_role_name().unwrap_or_else(|e| error!("kafgres: {e}"));
     let caller_is_super = unsafe { pg_sys::superuser() };
+    // A mapping appends as its owner, so defining one needs what a produce from SQL needs.
+    let host = read_one::<String>("SELECT COALESCE(host(inet_client_addr()), 'localhost')", &[])
+        .unwrap_or_else(|e| error!("kafgres: {e}"))
+        .unwrap_or_else(|| "localhost".into());
+    crate::acl::sql_require(crate::acl::Operation::Write, &caller, &host, topic);
 
     // Created here, before this transaction writes, unless that would wait on a long
     // transaction. Otherwise the worker creates it once the mapping commits; not an error,
@@ -82,20 +87,7 @@ fn kafgres_add_mapping(
     {
         let _owner_ctx = crate::acl::AsBootstrapSuperuser::enter();
         if !caller_is_super {
-            let existing_owner: Option<String> = read_one(
-                "SELECT (SELECT owner FROM kafgres_cdc_mappings WHERE mapping_name = $1)",
-                &[mapping_name.into()],
-            )
-            .unwrap_or_else(|e| error!("kafgres: {e}"));
-            if let Some(owner) = existing_owner {
-                if owner != caller {
-                    pgrx::ereport!(
-                        pgrx::PgLogLevel::ERROR,
-                        pgrx::PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
-                        format!("kafgres: permission denied: mapping {mapping_name:?} is owned by {owner:?}")
-                    );
-                }
-            }
+            refuse_unless_owner(mapping_name, &caller);
         }
         Spi::run_with_args(
             "INSERT INTO kafgres_cdc_mappings
@@ -132,20 +124,7 @@ fn kafgres_remove_mapping(mapping_name: &str) -> bool {
     let caller_is_super = unsafe { pg_sys::superuser() };
     let _owner_ctx = crate::acl::AsBootstrapSuperuser::enter();
     if !caller_is_super {
-        let existing_owner: Option<String> = read_one(
-            "SELECT (SELECT owner FROM kafgres_cdc_mappings WHERE mapping_name = $1)",
-            &[mapping_name.into()],
-        )
-        .unwrap_or_else(|e| error!("kafgres: {e}"));
-        if let Some(owner) = existing_owner {
-            if owner != caller {
-                pgrx::ereport!(
-                    pgrx::PgLogLevel::ERROR,
-                    pgrx::PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
-                    format!("kafgres: permission denied: mapping {mapping_name:?} is owned by {owner:?}")
-                );
-            }
-        }
+        refuse_unless_owner(mapping_name, &caller);
     }
     Spi::run_with_args(
         "DELETE FROM kafgres_cdc_mappings WHERE mapping_name = $1",
@@ -153,6 +132,28 @@ fn kafgres_remove_mapping(mapping_name: &str) -> bool {
     )
     .unwrap_or_else(|e| error!("kafgres: {e}"));
     true
+}
+
+/// For a non-superuser: an existing mapping must be the caller's. One with no owner (made
+/// before owners were recorded) is left to a superuser, who knows whose it was.
+fn refuse_unless_owner(mapping_name: &str, caller: &str) {
+    // '' for no owner: a role name is never empty.
+    let existing_owner: Option<String> = read_one(
+        "SELECT (SELECT COALESCE(owner, '') FROM kafgres_cdc_mappings WHERE mapping_name = $1)",
+        &[mapping_name.into()],
+    )
+    .unwrap_or_else(|e| error!("kafgres: {e}"));
+    let denied = match existing_owner.as_deref() {
+        None => return,
+        Some(owner) if owner == caller => return,
+        Some("") => format!("kafgres: permission denied: mapping {mapping_name:?} has no owner"),
+        Some(owner) => format!("kafgres: permission denied: mapping {mapping_name:?} is owned by {owner:?}"),
+    };
+    pgrx::ereport!(
+        pgrx::PgLogLevel::ERROR,
+        pgrx::PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
+        denied
+    );
 }
 
 fn mapping_query(
@@ -1316,7 +1317,9 @@ struct Mapping {
     key_expr: Option<String>,
     filter_expr: Option<String>,
     on_error: String,
-    owner: String,
+    /// None for a mapping made before owners were recorded: it renders nothing until a
+    /// superuser sets one.
+    owner: Option<String>,
     /// The last change this mapping rendered, so a replay held for another mapping skips it.
     delivered: Option<Pos>,
 }
@@ -1363,12 +1366,31 @@ fn current_role_name() -> Result<String, String> {
         .ok_or_else(|| "could not determine current_user".to_string())
 }
 
-fn role_oid(role_name: &str) -> Result<pg_sys::Oid, String> {
-    let oid: Option<pg_sys::Oid> = read_one(
-        "SELECT (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1)",
-        &[ServerText(role_name).into()],
-    )?;
-    oid.ok_or_else(|| format!("mapping owner role {role_name:?} does not exist"))
+/// The owner's role and whether it is a superuser.
+fn owner_role(m: &Mapping) -> Result<(pg_sys::Oid, bool), String> {
+    let Some(role_name) = m.owner.as_deref() else {
+        return Err(format!(
+            "mapping {:?} has no owner, so it renders nothing; a superuser must set one with \
+             UPDATE kafgres_cdc_mappings SET owner = '<role>' WHERE mapping_name = '{}'",
+            m.name,
+            m.name.replace('\'', "''")
+        ));
+    };
+    let found: Option<(pg_sys::Oid, bool)> = Spi::connect(|client| {
+        let rows = client.select(
+            "SELECT oid, rolsuper FROM pg_catalog.pg_roles WHERE rolname = $1",
+            Some(1),
+            &[ServerText(role_name).into()],
+        )?;
+        for r in rows {
+            if let Some(oid) = r.get::<pg_sys::Oid>(1)? {
+                return Ok::<_, pgrx::spi::Error>(Some((oid, r.get::<bool>(2)?.unwrap_or(false))));
+            }
+        }
+        Ok(None)
+    })
+    .map_err(|e| e.to_string())?;
+    found.ok_or_else(|| format!("mapping owner role {role_name:?} does not exist"))
 }
 
 /// A read-only SPI query uses the active snapshot, which in a worker step predates commits
@@ -1399,7 +1421,7 @@ fn load_mappings() -> Result<Vec<Mapping>, String> {
                 key_expr: utf8(r.get::<Utf8Text>(5)?),
                 filter_expr: utf8(r.get::<Utf8Text>(6)?),
                 on_error: utf8(r.get::<Utf8Text>(7)?).unwrap_or_else(|| "skip".into()),
-                owner: utf8(r.get::<Utf8Text>(8)?).unwrap_or_default(),
+                owner: utf8(r.get::<Utf8Text>(8)?),
                 delivered: match (r.get::<String>(9)?, r.get::<i64>(10)?) {
                     (Some(lsn), Some(seq)) => parse_lsn(&lsn).map(|end| (end, seq)),
                     _ => None,
@@ -1439,7 +1461,7 @@ fn render(
         m.key_expr.as_deref(),
         m.filter_expr.as_deref(),
     );
-    let owner_oid = role_oid(&m.owner)?;
+    let (owner_oid, _) = owner_role(m)?;
     let qualified_source = if m.source != TRANSACTION_SOURCE {
         let (schema, table) = split_source(&m.source);
         Some(format!("{}.{}", quote_ident(&schema), quote_ident(&table)))
@@ -1547,7 +1569,19 @@ fn render_phase(
     columns: &[(String, String)],
     changes: &str,
 ) -> Result<Option<(Target, Vec<(Option<String>, Option<String>)>)>, String> {
-    let target = match resolve_topic(&m.topic) {
+    // Not dead-lettered even under 'skip': the changes are fine, and render once it is fixed.
+    let (_, owner_is_super) = owner_role(m)?;
+    let resolved = resolve_topic(&m.topic).and_then(|t| {
+        // Checked on every render, so revoking the owner's WRITE stops the mapping as it
+        // would stop the owner's own produce.
+        let owner = m.owner.as_deref().unwrap_or_default();
+        match crate::acl::role_may(crate::acl::Operation::Write, owner, owner_is_super, "localhost", &m.topic) {
+            Ok(true) => Ok(t),
+            Ok(false) => Err(format!("User:{owner} is not allowed to write topic {:?}", m.topic)),
+            Err(e) => Err(format!("could not read kafgres_acls: {e}")),
+        }
+    });
+    let target = match resolved {
         Ok(t) => t,
         Err(e) => {
             if m.on_error == "stall" {
@@ -1973,7 +2007,7 @@ fn snapshot_page(
 fn snapshot_step(st: &SnapshotState, limit: i32) -> Result<bool, String> {
     let m = load_mapping(&st.name)?
         .ok_or_else(|| format!("mapping {:?} disappeared mid-snapshot", st.name))?;
-    let owner_oid = role_oid(&m.owner)?;
+    let (owner_oid, _) = owner_role(&m)?;
     let pk = primary_key_of(&st.source)?;
     let shape = shape_of(&st.source)?;
     let mut saved_user = pg_sys::InvalidOid;
@@ -2032,7 +2066,7 @@ fn load_mapping(name: &str) -> Result<Option<Mapping>, String> {
                 key_expr: utf8(r.get::<Utf8Text>(5)?),
                 filter_expr: utf8(r.get::<Utf8Text>(6)?),
                 on_error: utf8(r.get::<Utf8Text>(7)?).unwrap_or_else(|| "skip".into()),
-                owner: utf8(r.get::<Utf8Text>(8)?).unwrap_or_default(),
+                owner: utf8(r.get::<Utf8Text>(8)?),
                 delivered: None,
             }));
         }
@@ -2089,12 +2123,8 @@ fn kafgres_snapshot_mapping(mapping_name: &str) -> bool {
     let Some(m) = load_mapping(mapping_name).unwrap_or_else(|e| error!("kafgres: {e}")) else {
         error!("kafgres: no such mapping {mapping_name:?}");
     };
-    if !caller_is_super && m.owner != caller {
-        pgrx::ereport!(
-            pgrx::PgLogLevel::ERROR,
-            pgrx::PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
-            format!("kafgres: permission denied: mapping {mapping_name:?} is owned by {:?}", m.owner)
-        );
+    if !caller_is_super {
+        refuse_unless_owner(mapping_name, &caller);
     }
     primary_key_of(&m.source).unwrap_or_else(|e| error!("kafgres: {e}"));
 
