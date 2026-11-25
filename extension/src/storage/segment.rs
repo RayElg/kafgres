@@ -53,6 +53,16 @@ fn defer_partition_drop(topic: TopicId, partition: i32) {
                 }
             });
         });
+        // A released subtransaction's drops become its parent's, so the parent's rollback cancels them.
+        pgrx::register_subxact_callback(pgrx::PgSubXactCallbackEvent::CommitSub, |sub, parent| {
+            PENDING_DROPS.with(|p| {
+                if let Some(list) = p.borrow_mut().as_mut() {
+                    for entry in list.iter_mut().filter(|e| e.2 == sub) {
+                        entry.2 = parent;
+                    }
+                }
+            });
+        });
     }
 }
 
@@ -2389,7 +2399,7 @@ impl LogStore for SegmentStore {
                 aborted.extend(listed);
                 aborted_cut_at = cut;
                 if let Some(cut) = aborted_cut_at {
-                    next = super::truncate_batches_at(&mut out, cut, offset);
+                    next = super::truncate_batches_at(&mut out, cut).unwrap_or(next);
                 }
             }
         }
@@ -2478,7 +2488,7 @@ impl LogStore for SegmentStore {
                                 path.display()
                             )));
                         }
-                        if let Some(found) = super::first_at_or_after_from(
+                        if let Some(found) = super::first_at_or_after(
                             kafgres_codec::bytes::Bytes::from(body),
                             timestamp,
                             log_start,

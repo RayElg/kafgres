@@ -457,22 +457,28 @@ pub fn offset_of_max_timestamp(bytes: kafgres_codec::bytes::Bytes) -> Option<(i6
     Some((base, want))
 }
 
-/// The first record at or after `timestamp` in the batch that reaches it, as Kafka's
-/// `findOffsetByTimestamp` answers; undecodable means the base offset and the batch's maximum.
-pub fn first_at_or_after(bytes: kafgres_codec::bytes::Bytes, timestamp: i64) -> Option<(i64, i64)> {
+/// The first record at or after `timestamp`, and at or past `min_offset` (the log start), in
+/// the batch that reaches it, as Kafka's `findOffsetByTimestamp` answers; undecodable means the
+/// base offset and the batch's maximum. `None` when only records below `min_offset` reach it.
+pub fn first_at_or_after(
+    bytes: kafgres_codec::bytes::Bytes,
+    timestamp: i64,
+    min_offset: i64,
+) -> Option<(i64, i64)> {
     let batch = kafgres_codec::records::RecordBatch::new(bytes).ok()?;
     let base = batch.base_offset();
     let base_ts = batch.base_timestamp();
-    if let Ok(records) = batch.records_decompressed() {
-        for record in records {
-            let Ok(record) = record else { break };
-            let ts = base_ts.saturating_add(record.timestamp_delta);
-            if ts >= timestamp {
-                return Some((base + record.offset_delta as i64, ts));
-            }
+    let fallback = Some((base.max(min_offset), batch.max_timestamp()));
+    let Ok(records) = batch.records_decompressed() else { return fallback };
+    for record in records {
+        let Ok(record) = record else { return fallback };
+        let offset = base + record.offset_delta as i64;
+        let ts = base_ts.saturating_add(record.timestamp_delta);
+        if ts >= timestamp && offset >= min_offset {
+            return Some((offset, ts));
         }
     }
-    Some((base, batch.max_timestamp()))
+    if base >= min_offset { fallback } else { None }
 }
 
 pub trait LogStore: Send {
@@ -622,52 +628,25 @@ pub trait LogStore: Send {
     }
 }
 
-/// Like [`first_at_or_after`], but ignores records below `min_offset` (e.g. `log_start_offset`).
-pub(crate) fn first_at_or_after_from(
-    bytes: kafgres_codec::bytes::Bytes,
-    timestamp: i64,
-    min_offset: i64,
-) -> Option<(i64, i64)> {
-    let batch = kafgres_codec::records::RecordBatch::new(bytes).ok()?;
-    let base_offset = batch.base_offset();
-    let base_ts = batch.base_timestamp();
-    for rec in batch.records().ok()? {
-        let rec = rec.ok()?;
-        let off = base_offset + rec.offset_delta as i64;
-        if off < min_offset {
-            continue;
-        }
-        let ts = base_ts + rec.timestamp_delta;
-        if ts >= timestamp {
-            return Some((off, ts));
-        }
-    }
-    None
-}
-
-/// Truncate `bytes` before the first batch whose `last_offset >= cut`, returning the new
-/// `next_offset` (`last_offset + 1` of the last kept batch, or `fallback_next` if none kept).
-/// Used when `pmeta::aborted_txns` hits `MAX_ABORTED_PER_FETCH` so Fetch never returns batches
-/// whose aborted status was omitted by the cap.
-pub(crate) fn truncate_batches_at(bytes: &mut Vec<u8>, cut: i64, fallback_next: i64) -> i64 {
+/// Drop the batches after the first that reach `cut`, where `pmeta::aborted_txns` stopped
+/// listing, so a read_committed Fetch never serves a batch whose abort it could not list.
+/// The first batch is always kept so the reader makes progress; `RecordCursor` refuses it
+/// itself. Returns the new `next_offset` if anything was dropped.
+pub(crate) fn truncate_batches_at(bytes: &mut Vec<u8>, cut: i64) -> Option<i64> {
     use kafgres_codec::records::{BASE_OFFSET_OFFSET, LAST_OFFSET_DELTA_OFFSET, LENGTH_OFFSET, RECORD_BATCH_OVERHEAD};
 
     let mut pos = 0usize;
-    let mut new_next = fallback_next;
     while pos + RECORD_BATCH_OVERHEAD <= bytes.len() {
         let len = i32::from_be_bytes(
             bytes[pos + LENGTH_OFFSET..pos + LENGTH_OFFSET + 4]
                 .try_into()
                 .expect("4 bytes"),
         );
-        if len <= 0 {
-            break;
+        let total = LENGTH_OFFSET + 4 + len.max(0) as usize;
+        if len <= 0 || pos + total > bytes.len() {
+            return None;
         }
-        let total = LENGTH_OFFSET + 4 + len as usize;
-        if pos + total > bytes.len() {
-            break;
-        }
-        let batch_base = i64::from_be_bytes(
+        let base = i64::from_be_bytes(
             bytes[pos + BASE_OFFSET_OFFSET..pos + BASE_OFFSET_OFFSET + 8]
                 .try_into()
                 .expect("8 bytes"),
@@ -677,15 +656,13 @@ pub(crate) fn truncate_batches_at(bytes: &mut Vec<u8>, cut: i64, fallback_next: 
                 .try_into()
                 .expect("4 bytes"),
         );
-        let batch_last = batch_base + last_delta as i64;
-        if batch_last >= cut {
+        if pos > 0 && base + last_delta as i64 >= cut {
             bytes.truncate(pos);
-            return new_next;
+            return Some(base);
         }
-        new_next = batch_last + 1;
         pos += total;
     }
-    new_next
+    None
 }
 
 #[cfg(test)]

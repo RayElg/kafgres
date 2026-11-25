@@ -205,6 +205,22 @@ def test_a_full_abort_list_is_not_mistaken_for_one_cut_short(topic):
              WHERE topic_id = (SELECT topic_id FROM kafgres_topics WHERE name = '{topic}')""")
 
 
+def test_a_consumer_is_not_stalled_by_a_cut_short_abort_list(topic):
+    """Fetch keeps the first batch past the abort-list cap, so a read_committed consumer makes
+    progress; the batches after the cut wait for the next Fetch."""
+    produce(topic, ["first", "second"])
+    sql(f"""INSERT INTO kafgres_txn_aborted
+                   (topic_id, partition, producer_id, first_offset, last_offset)
+            SELECT topic_id, 0, 999999, -n, 1000000
+              FROM kafgres_topics, generate_series(0, 1000) n
+             WHERE name = '{topic}'""")
+    try:
+        assert consumed(topic) == {0: "first", 1: "second"}
+    finally:
+        sql(f"""DELETE FROM kafgres_txn_aborted
+                 WHERE topic_id = (SELECT topic_id FROM kafgres_topics WHERE name = '{topic}')""")
+
+
 @pytest.mark.skipif(sql("SHOW kafgres.storage_engine") != "segment",
                     reason="kafgres_produce() is the segment engine's")
 def test_a_rolled_back_sql_produce_is_read_only_uncommitted(topic):

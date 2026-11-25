@@ -21,11 +21,15 @@ from conftest import (
     TXN_OFFSET_COMMIT,
     sql,
 )
+from support.docker import CLIENTS
 
 ERR_NONE = 0
 ERR_TRANSACTIONAL_ID_AUTH_FAILED = 53
 ERR_GROUP_AUTH_FAILED = 30
 ERR_NON_EMPTY_GROUP = 68
+ERR_UNKNOWN_TOPIC_OR_PARTITION = 3
+ERR_TOPIC_AUTH_FAILED = 29
+ERR_OPERATION_NOT_ATTEMPTED = 55
 
 ARCHIVE_LOCK_KEY = 0x7047_4B41_0000_0006
 
@@ -38,6 +42,16 @@ def psql_as(role, statement):
         ],
         capture_output=True, text=True,
     )
+
+
+def produce(topic, values):
+    """Through the Kafka protocol, so the test runs on either engine."""
+    out = subprocess.run(
+        ["docker", "run", "--rm", "-i", "--network", "host", CLIENTS, "kcat",
+         "-b", f"{BROKER_HOST}:{BROKER_PORT}", "-t", topic, "-P"],
+        input="".join(f"{v}\n" for v in values), capture_output=True, text=True, timeout=120,
+    )
+    assert out.returncode == 0, out.stderr
 
 
 def _read_exact(sock, n):
@@ -212,6 +226,8 @@ def test_transactional_id_acls_are_enforced():
             assert code == ERR_TRANSACTIONAL_ID_AUTH_FAILED, f"EndTxn code={code}"
 
         sql("SELECT kafgres_add_acl('User:ANONYMOUS', 'WRITE', 'TRANSACTIONAL_ID', 'allowed-tx')")
+        sql(f"SELECT kafgres_add_acl('User:ANONYMOUS', 'WRITE', 'TOPIC', '{topic}')")
+        sql("SELECT kafgres_add_acl('User:ANONYMOUS', 'WRITE', 'TOPIC', 'txn-acl-missing-topic')")
         time.sleep(2.0)
         with socket.create_connection((BROKER_HOST, BROKER_PORT), timeout=15) as sock:
             resp = send_frame(sock, FIND_COORDINATOR, 1, 10, _s("allowed-tx") + struct.pack(">b", 1))
@@ -226,6 +242,32 @@ def test_transactional_id_acls_are_enforced():
             resp = send_frame(sock, ADD_OFFSETS_TO_TXN, 0, 12, body)
             (_throttle, code) = struct.unpack_from(">ih", resp, 0)
             assert code == ERR_GROUP_AUTH_FAILED, f"AddOffsetsToTxn without GROUP READ code={code}"
+
+            # One denied topic fails the whole request, as Kafka does: the authorized topic is
+            # not added (OPERATION_NOT_ATTEMPTED), and an authorized missing one is unknown.
+            names = [topic, "txn-acl-denied-topic", "txn-acl-missing-topic"]
+            body = _s("allowed-tx") + struct.pack(">qhi", pid, epoch, len(names))
+            for name in names:
+                body += _s(name) + struct.pack(">ii", 1, 0)
+            resp = send_frame(sock, ADD_PARTITIONS_TO_TXN, 0, 13, body)
+            pos = 4
+            (count,) = struct.unpack_from(">i", resp, pos)
+            pos += 4
+            codes = {}
+            for _ in range(count):
+                (n,) = struct.unpack_from(">h", resp, pos)
+                name = resp[pos + 2:pos + 2 + n].decode()
+                pos += 2 + n + 4
+                (_part, code) = struct.unpack_from(">ih", resp, pos)
+                pos += 6
+                codes[name] = code
+            assert codes == {
+                topic: ERR_OPERATION_NOT_ATTEMPTED,
+                "txn-acl-denied-topic": ERR_TOPIC_AUTH_FAILED,
+                "txn-acl-missing-topic": ERR_UNKNOWN_TOPIC_OR_PARTITION,
+            }, codes
+            added = sql(f"SELECT count(*) FROM kafgres_txn_partitions WHERE producer_id = {pid}")
+            assert added == "0", f"{added} partition(s) added despite the denial"
     finally:
         sql("DELETE FROM kafgres_acls")
         sql("ALTER SYSTEM RESET kafgres.acls_enabled")
@@ -239,8 +281,7 @@ def test_failed_delete_topics_preserves_topic_and_data():
     topic = "delete-lock-preserve-topic"
     sql(f"SELECT kafgres_drop_topic('{topic}')")
     sql(f"SELECT kafgres_create_topic('{topic}', 1)")
-    sql(f"SELECT kafgres_produce('{topic}', 'k1', 'v1')")
-    sql(f"SELECT kafgres_produce('{topic}', 'k2', 'v2')")
+    produce(topic, ["v1", "v2"])
 
     locker = subprocess.Popen(
         [
@@ -344,8 +385,7 @@ def test_offset_for_timestamp_clamped_to_log_start():
     sql(f"SELECT kafgres_drop_topic('{topic}')")
     sql(f"SELECT kafgres_create_topic('{topic}', 1)")
     try:
-        for i in range(10):
-            sql(f"SELECT kafgres_produce('{topic}', 'k{i}', 'v{i}')")
+        produce(topic, [f"v{i}" for i in range(10)])
         with socket.create_connection((BROKER_HOST, BROKER_PORT), timeout=15) as sock:
             body = struct.pack(">i", 1) + _s(topic) + struct.pack(">iiqi", 1, 0, 5, 5000)
             send_frame(sock, DELETE_RECORDS, 0, 1, body)

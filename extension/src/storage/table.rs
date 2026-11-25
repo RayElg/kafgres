@@ -498,7 +498,7 @@ impl LogStore for TableStore {
                 (aborted, aborted_cut_at) =
                     pmeta::aborted_txns(topic, partition, offset, next_offset.max(offset + 1))?;
                 if let Some(cut) = aborted_cut_at {
-                    next_offset = super::truncate_batches_at(&mut bytes, cut, offset);
+                    next_offset = super::truncate_batches_at(&mut bytes, cut).unwrap_or(next_offset);
                 }
             }
         }
@@ -526,7 +526,7 @@ impl LogStore for TableStore {
               WHERE topic_id = $1::oid AND partition = $2
                 AND last_offset >= $4 AND max_timestamp >= $3
               ORDER BY base_offset
-              LIMIT 100",
+              LIMIT 2",
             &[
                 (topic as i32).into(),
                 partition.into(),
@@ -538,7 +538,7 @@ impl LogStore for TableStore {
                     let Some(blob) = row.get::<Vec<u8>>(1)? else {
                         continue;
                     };
-                    if let Some(found) = super::first_at_or_after_from(
+                    if let Some(found) = super::first_at_or_after(
                         kafgres_codec::bytes::Bytes::from(blob),
                         timestamp,
                         log_start,

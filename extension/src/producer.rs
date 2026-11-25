@@ -578,6 +578,8 @@ pub fn rebuild_window(
 
     // Per producer: (epoch, last_seq) of its newest row, `None` with no window here.
     let mut newest: HashMap<i64, Option<(i16, i32)>> = HashMap::new();
+    // Per producer: the first rebuilt transactional batch after its last marker.
+    let mut open_txn: HashMap<i64, i64> = HashMap::new();
     let mut rebuilt = 0u64;
     while at < end {
         let slice = store
@@ -601,21 +603,14 @@ pub fn rebuild_window(
             pos += total;
             let Ok(batch) = RecordBatch::new(bytes) else { continue };
             let (pid, epoch, first) = (batch.producer_id(), batch.producer_epoch(), batch.base_sequence());
+            // A marker ends the producer's transaction here; only data after its last marker
+            // can belong to the one still open.
+            if pid >= 0 && batch.is_control() {
+                open_txn.remove(&pid);
+            }
             // A batch straddling the start is read whole and kept: it may be the newest one.
             if pid < 0 || epoch < 0 || first < 0 || batch.is_control() {
                 continue;
-            }
-            // If a crash occurred between appending a transactional batch and stamping
-            // `kafgres_txn_partitions.first_offset`, restore `first_offset` now so the batch
-            // is held below the LSO and recorded if the transaction aborts.
-            if batch.is_transactional() {
-                crate::storage::pmeta::stamp_txn_partition(
-                    pid,
-                    topic_id,
-                    partition,
-                    batch.base_offset(),
-                )
-                .map_err(|e| e.to_string())?;
             }
             let last = increment_sequence(first, batch.last_offset_delta());
             let state = match newest.get(&pid) {
@@ -648,6 +643,11 @@ pub fn rebuild_window(
             if !missing {
                 continue;
             }
+            // A batch whose window row committed had its `first_offset` stamped with it; only
+            // one that lost its row can belong to an open transaction left unstamped.
+            if batch.is_transactional() {
+                open_txn.entry(pid).or_insert(batch.base_offset());
+            }
             record(pid, epoch, topic_id, partition, first, last, batch.base_offset())
                 .map_err(|e| e.to_string())?;
             newest.insert(pid, Some((epoch, last)));
@@ -657,6 +657,13 @@ pub fn rebuild_window(
             break;
         }
         at = slice.next_offset.max(at + 1);
+    }
+    // A crash between a transactional append and the stamp of its `first_offset` leaves the
+    // open transaction unstamped: re-stamp it, or the LSO passes the batch and an abort
+    // would not cover it. A no-op where the stamp committed.
+    for (pid, base) in open_txn {
+        crate::storage::pmeta::stamp_txn_partition(pid, topic_id, partition, base)
+            .map_err(|e| e.to_string())?;
     }
     Ok(rebuilt)
 }

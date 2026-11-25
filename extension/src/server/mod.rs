@@ -1393,6 +1393,11 @@ fn exclusive_holders() -> String {
 /// The timeline is the high half: a diverged primary restarting on its old timeline never
 /// reaches the epochs a promotion takes.
 fn raise_leader_epochs() -> bool {
+    // Once committed, a retry only reconciles: raising again would spend another epoch.
+    static RAISED: AtomicBool = AtomicBool::new(false);
+    if RAISED.load(Ordering::Relaxed) {
+        return reconcile_recovered_tails();
+    }
     let result = BackgroundWorker::transaction(|| {
         crate::dbtx::guarded(|| {
             // Once per process: a retried raise must not spend another number.
@@ -1446,11 +1451,42 @@ fn raise_leader_epochs() -> bool {
                 crate::producer::forget_past(topic_id, partition, end)
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
                 crate::producer::note_startup_end(topic_id, partition, end);
-                crate::handlers::txn::reconcile_transactions(
-                    &mut *store, topic_id, partition, end,
-                )?;
-                // Clamp share-group offsets to the recovered log end so a power cut or
-                // failover truncation does not skip records refilled into the lost range.
+            }
+            Ok((highest, raised, boot))
+        })
+    });
+
+    match result {
+        Ok((epoch, 0, boot)) => {
+            // Published once committed: a raise that rolls back never exposes its number.
+            BOOT_ID.get().store(boot, Ordering::Release);
+            log!("kafgres: leader epoch {epoch} already current for every partition");
+        }
+        Ok((epoch, n, boot)) => {
+            BOOT_ID.get().store(boot, Ordering::Release);
+            log!("kafgres: took a new leader epoch (up to {epoch}) for {n} partition(s)");
+        }
+        Err(e) => {
+            log!("kafgres: could not raise leader epochs, not serving yet: {e}");
+            return false;
+        }
+    }
+    RAISED.store(true, Ordering::Relaxed);
+    reconcile_recovered_tails()
+}
+
+/// Bring transaction and share-group state in line with the recovered log ends. After the
+/// raise has committed, since it appends markers: a rolled-back raise would leave them stamped
+/// with an epoch whose recorded start is past them. Appends from SQL and CDC wait on it.
+fn reconcile_recovered_tails() -> bool {
+    let result = BackgroundWorker::transaction(|| {
+        crate::dbtx::guarded(|| {
+            let mut store = crate::storage::open();
+            for (topic_id, partition) in crate::meta::all_partitions()? {
+                let end = crate::storage::LogStore::high_watermark(&*store, topic_id, partition)
+                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                crate::handlers::txn::reconcile_transactions(&mut *store, topic_id, partition, end)?;
+                // A share group's position past the recovered end would skip what refills it.
                 pgrx::Spi::run_with_args(
                     "UPDATE kafgres_share_offsets
                         SET start_offset = $3
@@ -1463,26 +1499,16 @@ fn raise_leader_epochs() -> bool {
                     &[(topic_id as i32).into(), partition.into(), end.into()],
                 )?;
             }
-            Ok((highest, raised, boot))
+            Ok(())
         })
     });
-
     match result {
-        Ok((epoch, 0, boot)) => {
-            // Published once committed: a raise that rolls back never exposes its number.
-            BOOT_ID.get().store(boot, Ordering::Release);
-            log!("kafgres: leader epoch {epoch} already current for every partition");
-            EPOCHS_RAISED.get().store(true, Ordering::Release);
-            true
-        }
-        Ok((epoch, n, boot)) => {
-            BOOT_ID.get().store(boot, Ordering::Release);
-            log!("kafgres: took a new leader epoch (up to {epoch}) for {n} partition(s)");
+        Ok(()) => {
             EPOCHS_RAISED.get().store(true, Ordering::Release);
             true
         }
         Err(e) => {
-            log!("kafgres: could not raise leader epochs, not serving yet: {e}");
+            log!("kafgres: could not reconcile transactions with the recovered log, not serving yet: {e}");
             false
         }
     }

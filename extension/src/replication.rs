@@ -455,11 +455,7 @@ fn partitions_to_follow(store: &mut dyn crate::storage::LogStore) -> Want {
     .unwrap_or_default()
     .into_iter()
     .filter_map(|(id, name, part, epoch)| {
-        let end = store.high_watermark(id, part).ok()?;
-        // Report the epoch of our actual local tail, not the WAL-replicated leader_epoch,
-        // so a rejoined old primary detects and truncates its divergent tail.
-        let local_epoch = store.last_batch_epoch(id, part).ok().flatten().unwrap_or(epoch);
-        Some((id, name, part, end, local_epoch))
+        store.high_watermark(id, part).ok().map(|end| (id, name, part, end, epoch))
     })
     .collect()
 }
@@ -498,10 +494,15 @@ impl Follower {
             return Ok(0);
         }
 
+        // Reconciled with the epoch of the local tail, not the leader_epoch the WAL replicated:
+        // a rejoined old primary's tail was written under its own epoch.
         let unreconciled: Want = want
             .iter()
             .filter(|(id, _, part, _, _)| !self.reconciled.contains(&(*id, *part)))
-            .cloned()
+            .map(|(id, name, part, end, epoch)| {
+                let local = store.last_batch_epoch(*id, *part).ok().flatten().unwrap_or(*epoch);
+                (*id, name.clone(), *part, *end, local)
+            })
             .collect();
         if !unreconciled.is_empty() {
             self.socket()?;

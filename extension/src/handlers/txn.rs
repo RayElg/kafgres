@@ -237,100 +237,84 @@ pub fn handle_add_partitions(
         )
     };
 
-    if let Err(auth_code) = authz.check(
-        crate::acl::Operation::Write,
-        crate::acl::ResourceType::TransactionalId,
-        &txn_id,
-    ) {
-        let results: Vec<AddPartitionsToTxnTopicResult> = topics
+    let respond = |code_of: &dyn Fn(usize, i32) -> ErrorCode| AddPartitionsToTxnResponse {
+        throttle_time_ms: 0,
+        error_code: 0,
+        results_by_topic_v3_and_below: topics
             .iter()
-            .map(|t| AddPartitionsToTxnTopicResult {
+            .enumerate()
+            .map(|(i, t)| AddPartitionsToTxnTopicResult {
                 name: t.name.clone(),
                 results_by_partition: t
                     .partitions
                     .iter()
                     .map(|p| AddPartitionsToTxnPartitionResult {
                         partition_index: *p,
-                        partition_error_code: auth_code.code(),
+                        partition_error_code: code_of(i, *p).code(),
                         ..Default::default()
                     })
                     .collect(),
                 ..Default::default()
             })
-            .collect();
-        return Ok(AddPartitionsToTxnResponse {
-            throttle_time_ms: 0,
-            error_code: 0,
-            results_by_topic_v3_and_below: results,
-            results_by_transaction: Vec::new(),
-            ..Default::default()
-        });
+            .collect(),
+        results_by_transaction: Vec::new(),
+        ..Default::default()
+    };
+
+    // Authorized before the fence, as Kafka does. A denied topic fails the whole request: nothing
+    // is added, and the other partitions answer UNKNOWN_TOPIC_OR_PARTITION or OPERATION_NOT_ATTEMPTED.
+    if let Err(code) = authz.check(
+        crate::acl::Operation::Write,
+        crate::acl::ResourceType::TransactionalId,
+        &txn_id,
+    ) {
+        return Ok(respond(&|_, _| code));
+    }
+    let mut denied: Vec<Option<ErrorCode>> = Vec::with_capacity(topics.len());
+    // Per topic, its id and partition count; a count of 0 for one that does not exist.
+    let mut found: Vec<(Option<u32>, i32)> = Vec::with_capacity(topics.len());
+    for topic in &topics {
+        let refused = authz
+            .check(crate::acl::Operation::Write, crate::acl::ResourceType::Topic, &topic.name)
+            .err();
+        let id = match refused {
+            Some(_) => None,
+            None => crate::meta::topic_id_by_name(&topic.name)
+                .map_err(|e| HandlerError::Internal(e.to_string()))?,
+        };
+        let count = match id {
+            Some(id) => crate::meta::partition_count(id)
+                .map_err(|e| HandlerError::Internal(e.to_string()))?,
+            None => 0,
+        };
+        denied.push(refused);
+        found.push((id, count));
+    }
+    let unknown = |i: usize, p: i32| p < 0 || p >= found[i].1;
+    if denied.iter().any(Option::is_some) {
+        return Ok(respond(&|i, p| match denied[i] {
+            Some(code) => code,
+            None if unknown(i, p) => ErrorCode::UnknownTopicOrPartition,
+            None => ErrorCode::OperationNotAttempted,
+        }));
     }
 
     let admitted = verdict(&txn_id, producer_id, epoch)?;
     let code = admitted.err().map_or(ErrorCode::None, |v| v.code(version));
 
-    let mut topic_codes: Vec<ErrorCode> = Vec::with_capacity(topics.len());
     if let Ok(admitted) = admitted {
-        let mut begun = false;
-        for topic in &topics {
-            if let Err(tc) = authz.check(
-                crate::acl::Operation::Write,
-                crate::acl::ResourceType::Topic,
-                &topic.name,
-            ) {
-                topic_codes.push(tc);
-                continue;
-            }
-            topic_codes.push(ErrorCode::None);
-            if !begun {
-                begin_or_continue(admitted, &txn_id)
-                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
-                begun = true;
-            }
-            let topic_id = crate::meta::topic_id_by_name(&topic.name)
-                .map_err(|e| HandlerError::Internal(e.to_string()))?;
-            let Some(topic_id) = topic_id else { continue };
-            // Range-check: a row naming a nonexistent partition is invisible to
-            let count = crate::meta::partition_count(topic_id)
-                .map_err(|e| HandlerError::Internal(e.to_string()))?;
-            for partition in &topic.partitions {
-                if *partition < 0 || *partition >= count {
-                    continue;
-                }
-                add_partition(producer_id, topic_id, *partition)
+        begin_or_continue(admitted, &txn_id).map_err(|e| HandlerError::Internal(e.to_string()))?;
+        for (i, (topic, (id, _))) in topics.iter().zip(&found).enumerate() {
+            let Some(topic_id) = id else { continue };
+            // A row naming a nonexistent partition is one no marker append can reach.
+            for partition in topic.partitions.iter().filter(|&&p| !unknown(i, p)) {
+                add_partition(producer_id, *topic_id, *partition)
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
             }
         }
-    } else {
-        topic_codes.resize(topics.len(), code);
     }
 
-    let results: Vec<AddPartitionsToTxnTopicResult> = topics
-        .iter()
-        .zip(topic_codes.iter())
-        .map(|(t, &tc)| AddPartitionsToTxnTopicResult {
-            name: t.name.clone(),
-            results_by_partition: t
-                .partitions
-                .iter()
-                .map(|p| AddPartitionsToTxnPartitionResult {
-                    partition_index: *p,
-                    partition_error_code: tc.code(),
-                    ..Default::default()
-                })
-                .collect(),
-            ..Default::default()
-        })
-        .collect();
-
-    Ok(AddPartitionsToTxnResponse {
-        throttle_time_ms: 0,
-        error_code: 0,
-        results_by_topic_v3_and_below: results.clone(),
-        results_by_transaction: Vec::new(),
-        ..Default::default()
-    })
+    Ok(respond(&|_, _| code))
 }
 
 /// Mark the transaction ongoing at the admitted epoch; a new one clears the previous one's rows.
@@ -736,14 +720,6 @@ fn finish_transaction(
             committed,
         )?;
     }
-    // Every control marker must be durable before Postgres commits the abort index,
-    // transactional offsets, and transaction state; otherwise a power cut can lose the
-    // ABORT marker while keeping kafgres_txn_aborted, permanently hiding later commits.
-    for (topic_id, partition, _) in &partitions {
-        store
-            .sync_partition(*topic_id, *partition)
-            .map_err(|e| HandlerError::Internal(format!("syncing transaction marker: {e}")))?;
-    }
 
     // Staged offsets become visible exactly with the records, or not at all: after the
     if committed {
@@ -1039,6 +1015,9 @@ pub fn handle_txn_offset_commit(
                 .map_err(|e| HandlerError::Internal(e.to_string()))?,
             None => 0,
         };
+        let denied = authz
+            .check(crate::acl::Operation::Read, crate::acl::ResourceType::Topic, &topic.name)
+            .err();
         let mut partitions = Vec::with_capacity(topic.partitions.len());
         for part in &topic.partitions {
             let index = part.partition_index;
@@ -1046,6 +1025,7 @@ pub fn handle_txn_offset_commit(
                 // An empty transactional id is refused before any topic lookup, unless the
                 // group id is empty too: Kafka answers that INVALID_GROUP_ID.
                 _ if code == ErrorCode::InvalidRequest && !req.group_id.is_empty() => code,
+                _ if denied.is_some() => denied.unwrap_or(ErrorCode::TopicAuthorizationFailed),
                 (None, _) => ErrorCode::UnknownTopicOrPartition,
                 _ if index < 0 || index >= count => ErrorCode::UnknownTopicOrPartition,
                 _ if req.group_id.is_empty() => ErrorCode::InvalidGroupId,
@@ -1053,7 +1033,7 @@ pub fn handle_txn_offset_commit(
                 (Some(id), Some(g)) => g.code_for(id, index),
                 _ => code,
             };
-            any_partition |= topic_id.is_some() && (0..count).contains(&index);
+            any_partition |= denied.is_none() && topic_id.is_some() && (0..count).contains(&index);
             partitions.push(TxnOffsetCommitResponsePartition {
                 partition_index: index,
                 error_code: part_code.code(),
@@ -1264,7 +1244,7 @@ pub fn reconcile_transactions(
     end: i64,
 ) -> Result<(), HandlerError> {
     use kafgres_codec::records::{ControlBatchType, LENGTH_OFFSET};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     // Reset first_offset for any ongoing transaction whose data did not survive.
     Spi::run_with_args(
@@ -1368,6 +1348,8 @@ pub fn reconcile_transactions(
         .min(end);
     let mut at = scan_from;
     let mut first_seen: HashMap<i64, i64> = HashMap::new();
+    // Producers with a marker earlier in the scan.
+    let mut ended: HashSet<i64> = HashSet::new();
     while at < end {
         let slice = store
             .read(
@@ -1410,12 +1392,38 @@ pub fn reconcile_transactions(
                 first_seen.entry(pid).or_insert(batch_base);
                 continue;
             }
+            let marked_before = !ended.insert(pid);
             match batch.control_type() {
                 Some(ControlBatchType::Commit) => {
                     first_seen.remove(&pid);
                 }
                 Some(ControlBatchType::Abort) => {
-                    let first = first_seen.remove(&pid).unwrap_or(scan_from);
+                    let first = match first_seen.remove(&pid) {
+                        Some(first) => first,
+                        // Its own marker earlier in the scan: this transaction wrote nothing here.
+                        None if marked_before => continue,
+                        // Begun before the scan. `first_offset` is the conflict key, and an
+                        // upsert there would take over another producer's entry.
+                        None => {
+                            let taken = Spi::get_one_with_args::<bool>(
+                                "SELECT EXISTS (SELECT 1 FROM kafgres_txn_aborted
+                                                 WHERE topic_id = $1::oid AND partition = $2
+                                                   AND first_offset = $3)",
+                                &[(topic_id as i32).into(), partition.into(), scan_from.into()],
+                            )
+                            .map_err(|e| HandlerError::Internal(e.to_string()))?
+                            .unwrap_or(false);
+                            if taken {
+                                log!(
+                                    "kafgres: ABORT marker for producer {pid} at {batch_base} on \
+                                     topic {topic_id} partition {partition} has no abort-index \
+                                     row, and its start precedes offset {scan_from}"
+                                );
+                                continue;
+                            }
+                            scan_from
+                        }
+                    };
                     let already = crate::storage::pmeta::aborted_at(
                         topic_id,
                         partition,
@@ -1489,10 +1497,6 @@ fn finish_partition(
         first_offset,
         committed,
     )?;
-    store
-        .sync_partition(topic_id, partition)
-        .map_err(|e| HandlerError::Internal(format!("syncing transaction marker: {e}")))?;
-
     Spi::run_with_args(
         "DELETE FROM kafgres_txn_partitions
           WHERE producer_id = $1 AND topic_id = $2::oid AND partition = $3",
