@@ -1267,6 +1267,35 @@ pub fn build_batch_as(records: &[NewRecord], producer_id: i64) -> bytes::Bytes {
     build_batch_full(records, producer_id, false)
 }
 
+/// Control record marker kind in a Kafka control batch (`0` = ABORT, `1` = COMMIT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlBatchType {
+    Abort,
+    Commit,
+}
+
+impl RecordBatch {
+    /// For a control batch, decode its first record's key to determine whether it is a
+    /// COMMIT (1) or ABORT (0) marker.
+    pub fn control_type(&self) -> Option<ControlBatchType> {
+        if !self.is_control() {
+            return None;
+        }
+        let mut recs = self.records().ok()?;
+        let rec = recs.next()?.ok()?;
+        let key = rec.key.as_ref()?;
+        if key.len() < 4 {
+            return None;
+        }
+        let kind = i16::from_be_bytes([key[2], key[3]]);
+        match kind {
+            0 => Some(ControlBatchType::Abort),
+            1 => Some(ControlBatchType::Commit),
+            _ => None,
+        }
+    }
+}
+
 /// Bit 5 of the batch attributes: `isControl`.
 pub const CONTROL_BATCH_FLAG: i16 = 0x20;
 

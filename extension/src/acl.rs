@@ -333,8 +333,13 @@ thread_local! {
 /// Whether a SQL caller may `op` on `topic`, as `User:<role>`. A Postgres superuser passes:
 /// it can rewrite `kafgres_acls` anyway.
 pub fn sql_caller_may(op: Operation, role: &str, host: &str, topic: &str) -> Result<bool, spi::Error> {
+    role_may(op, role, unsafe { pgrx::pg_sys::superuser() }, host, topic)
+}
+
+/// [`sql_caller_may`] for a role other than the current user, such as a CDC mapping's owner.
+pub fn role_may(op: Operation, role: &str, role_is_super: bool, host: &str, topic: &str) -> Result<bool, spi::Error> {
     let enabled = crate::acls_enabled();
-    if !enabled || unsafe { pgrx::pg_sys::superuser() } {
+    if !enabled || role_is_super {
         return Ok(true);
     }
     if SQL_ACLS.with(|c| c.borrow().is_stale()) {

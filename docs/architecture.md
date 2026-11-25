@@ -21,7 +21,9 @@ is direct:
 
 There, a produce with `acks=all` is durable once the transaction's commit has reached
 the standbys `synchronous_commit` asks for, and there is no separate replication
-mechanism to configure or run.
+mechanism to configure or run. With `synchronous_commit = off`, even a Postgres process
+crash (`kill -9`) — not only a host crash — can lose acknowledged `acks=all` writes and
+reuse their offsets.
 
 The segment engine keeps the log in files, outside the WAL. By default `acks=all`
 returns once the records are fsynced (`kafgres.fsync_before_ack`). With that off it
@@ -29,7 +31,9 @@ returns once they are in the page cache, as Kafka does with its default flush se
 they survive a crash of Postgres but not of the host. A standby's copy is pulled
 out of band (see below) and is always asynchronous, since `synchronous_standby_names`
 does not cover files outside the WAL; a failover can lose the newest records, and the
-leader epochs described next make that visible to consumers rather than silent.
+leader epochs described next make that visible rather than silent to live consumers and to
+clients that validate committed epochs on resume (such as the Java client; librdkafka 2.16
+and kafka-python do not validate a group's committed epoch when resuming).
 
 On the primary, `kafgres_produce()` still commits the row and the event together. The
 loss is in replication: its row and commit marker travel in the WAL, which can be
@@ -139,8 +143,11 @@ The log stream and the WAL advance independently, so after a failover their tail
 disagree. The log is the source of truth for the high watermark; Postgres keeps only the
 slowly-changing metadata (topic configs, group offsets, producer state, transaction
 state). A committed consumer offset that ends up ahead of the log tail after a failover
-surfaces as `OFFSET_OUT_OF_RANGE`, a condition Kafka clients already handle through
-`auto.offset.reset`.
+surfaces as `OFFSET_OUT_OF_RANGE` while the new log remains below that offset, a condition
+Kafka clients handle through `auto.offset.reset`. Once new writes grow the log past the
+committed offset, clients that validate committed epochs (such as the Java client) detect
+the truncation via `OffsetForLeaderEpoch`, whereas clients that do not (librdkafka,
+kafka-python) resume at the offset silently.
 
 ## Process topology
 

@@ -52,7 +52,7 @@ covers.
 
 | Setting | Reload | Default | Description |
 |---|---|---|---|
-| `kafgres.retention_check_interval_ms` | reload | `60000` | How often the broker applies retention and compaction, as Kafka's `log.retention.check.interval.ms`. |
+| `kafgres.retention_check_interval_ms` | reload | `60000` | How often the broker applies retention and compaction, as Kafka's `log.retention.check.interval.ms`. (Stale transaction expiry runs on its own ~10 s timer.) |
 | `kafgres.compaction_pass_bytes` | reload | `32 MiB` | Bytes compaction reads in the broker per retention check, across all partitions; a larger plan resumes at the next check. With the defaults the broker cleans up to about 0.5 MiB/s in total. Raising it lengthens the pause each check takes from serving clients. |
 
 ## CDC
@@ -73,7 +73,7 @@ covers.
 | `kafgres.tls_ca_file` | reload | empty | PEM CA bundle that client certificates are verified against; enables mTLS. |
 | `kafgres.tls_client_cert_required` | reload | off | Refuse the TLS handshake unless the client presents a certificate valid against `kafgres.tls_ca_file`. |
 | `kafgres.sasl_required` | reload | off | Require SASL/SCRAM-SHA-256 authentication against `pg_authid` roles. |
-| `kafgres.acls_enabled` | reload | off | Enforce the `kafgres_acls` table, for Kafka clients and for `kafgres_produce()` callers (as `User:<role>`). Off by default: with it on and no matching rule, the answer is refusal. |
+| `kafgres.acls_enabled` | reload | off | Enforce the `kafgres_acls` table, for Kafka clients and for `kafgres_produce()` / `kafgres_read()` callers (as `User:<role>`). Off by default: with it on and no matching rule, the answer is refusal. ACL changes take up to ~1 s to apply due to the in-process ACL cache. |
 | `kafgres.superusers` | reload | empty | Semicolon-separated principals that bypass every ACL check, for example `User:admin`. |
 
 ## Producers and limits

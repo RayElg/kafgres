@@ -13,12 +13,23 @@ pub fn handle(
     req: &InitProducerIdRequest,
     authz: &crate::acl::Authz,
 ) -> Result<InitProducerIdResponse, HandlerError> {
-    // IDEMPOTENT_WRITE on the cluster, as Kafka requires to take a producer id.
-    if let Err(code) = authz.check(
-        crate::acl::Operation::IdempotentWrite,
-        crate::acl::ResourceType::Cluster,
-        "kafka-cluster",
-    ) {
+    let txn_id = req.transactional_id.as_deref().filter(|s| !s.is_empty());
+    // Transactional producers need WRITE on TRANSACTIONAL_ID; plain idempotent producers
+    // need IDEMPOTENT_WRITE on the cluster, matching Kafka.
+    let auth_res = if let Some(id) = txn_id {
+        authz.check(
+            crate::acl::Operation::Write,
+            crate::acl::ResourceType::TransactionalId,
+            id,
+        )
+    } else {
+        authz.check(
+            crate::acl::Operation::IdempotentWrite,
+            crate::acl::ResourceType::Cluster,
+            "kafka-cluster",
+        )
+    };
+    if let Err(code) = auth_res {
         return Ok(InitProducerIdResponse {
             throttle_time_ms: 0,
             error_code: code.code(),
@@ -27,7 +38,6 @@ pub fn handle(
             ..Default::default()
         });
     }
-    let txn_id = req.transactional_id.as_deref().filter(|s| !s.is_empty());
     // Before the epoch moves: the abort is performed at the epoch the transaction ran under.
     if let Some(id) = txn_id {
         // Serialised with the instance being fenced, or its transaction could begin unseen

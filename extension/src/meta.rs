@@ -174,6 +174,8 @@ pub enum TopicError {
     UnknownTopic,
     InvalidConfig(String),
     PartitionCountReduced { have: i32, want: i32 },
+    /// Rolled back on a lock, deadlock or timeout: nothing changed, and a retry can succeed.
+    Busy(String),
     Internal(String),
 }
 
@@ -189,6 +191,7 @@ impl TopicError {
             TopicError::AlreadyExists => E::TopicAlreadyExists,
             TopicError::UnknownTopic => E::UnknownTopicOrPartition,
             TopicError::InvalidConfig(_) => E::InvalidConfig,
+            TopicError::Busy(_) => E::RequestTimedOut,
             TopicError::Internal(_) => E::UnknownServerError,
         }
     }
@@ -208,6 +211,7 @@ impl std::fmt::Display for TopicError {
             TopicError::PartitionCountReduced { have, want } => {
                 write!(f, "cannot reduce partitions from {have} to {want}")
             }
+            TopicError::Busy(m) => write!(f, "busy: {m}"),
             TopicError::Internal(m) => write!(f, "internal: {m}"),
         }
     }
@@ -358,6 +362,14 @@ pub fn delete_topic(name: &str) -> Result<bool, TopicError> {
         None => return Ok(false),
     };
 
+    // Take every lock before mutating anything: a lock_timeout here rolls back cleanly
+    // without touching partition files or shared memory.
+    // Serialise against the archiver: otherwise the DELETE can miss a row it wrote but not committed, orphaning it on the dropped id.
+    Spi::run_with_args(
+        "SELECT pg_advisory_xact_lock($1)",
+        &[crate::archive::ARCHIVE_LOCK_KEY.into()],
+    )?;
+
     let mut store = crate::storage::open();
     let parts: Vec<i32> = Spi::connect(|client| {
         let rows = client.select(
@@ -373,11 +385,6 @@ pub fn delete_topic(name: &str) -> Result<bool, TopicError> {
         }
         Ok::<_, spi::Error>(out)
     })?;
-
-    for p in parts {
-        crate::storage::LogStore::drop_partition(&mut *store, topic_id, p)
-            .map_err(|e| TopicError::Internal(e.to_string()))?;
-    }
 
     Spi::run_with_args(
         "DELETE FROM kafgres_producer_batches WHERE topic_id = $1::oid",
@@ -397,11 +404,6 @@ pub fn delete_topic(name: &str) -> Result<bool, TopicError> {
         "DELETE FROM kafgres_txn_offsets WHERE topic_id = $1::oid",
         &[(topic_id as i32).into()],
     )?;
-    // Serialise against the archiver: otherwise the DELETE can miss a row it wrote but not committed, orphaning it on the dropped id.
-    Spi::run_with_args(
-        "SELECT pg_advisory_xact_lock($1)",
-        &[crate::archive::ARCHIVE_LOCK_KEY.into()],
-    )?;
 
     // The archived *files* are not ours to remove; the rows go because a reused topic id would inherit a false "archived" claim.
     let orphaned: i64 = Spi::get_one_with_args(
@@ -420,6 +422,12 @@ pub fn delete_topic(name: &str) -> Result<bool, TopicError> {
         "DELETE FROM kafgres_segment_archive WHERE topic_id = $1::oid",
         &[(topic_id as i32).into()],
     )?;
+
+    for p in parts {
+        crate::storage::LogStore::drop_partition(&mut *store, topic_id, p)
+            .map_err(|e| TopicError::Internal(e.to_string()))?;
+    }
+
     Spi::run_with_args(
         "DELETE FROM kafgres_topics WHERE topic_id = $1::oid",
         &[(topic_id as i32).into()],

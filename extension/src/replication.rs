@@ -494,10 +494,15 @@ impl Follower {
             return Ok(0);
         }
 
+        // Reconciled with the epoch of the local tail, not the leader_epoch the WAL replicated:
+        // a rejoined old primary's tail was written under its own epoch.
         let unreconciled: Want = want
             .iter()
             .filter(|(id, _, part, _, _)| !self.reconciled.contains(&(*id, *part)))
-            .cloned()
+            .map(|(id, name, part, end, epoch)| {
+                let local = store.last_batch_epoch(*id, *part).ok().flatten().unwrap_or(*epoch);
+                (*id, name.clone(), *part, *end, local)
+            })
             .collect();
         if !unreconciled.is_empty() {
             self.socket()?;
@@ -517,6 +522,7 @@ impl Follower {
             if pulled.is_empty() {
                 break;
             }
+            still_following()?;
             applied += apply(&mut *store, &pulled)?;
             still_following()?;
             if started.elapsed() >= ROUND_BUDGET {

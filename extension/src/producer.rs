@@ -49,6 +49,22 @@ pub fn init_producer_id(transactional_id: Option<&str>) -> Result<(i64, i16), sp
         // Bump the epoch so any older instance of the same transactional id is fenced. The
         // retired pair goes with it: a retried EndTxn from that instance must be fenced too,
         // not answered NONE with the epoch this new instance now owns.
+        // At `i16::MAX` (`smallint` ceiling), rotate to a fresh producer_id at epoch 0, as Kafka does.
+        let at_ceiling: Option<i64> = Spi::get_one_with_args(
+            "SELECT (SELECT producer_id FROM kafgres_producers
+                      WHERE transactional_id = $1 AND producer_epoch >= $2)",
+            &[txn_id.into(), (i16::MAX as i32).into()],
+        )?;
+        if let Some(old_id) = at_ceiling {
+            Spi::run_with_args(
+                "DELETE FROM kafgres_producer_batches WHERE producer_id = $1",
+                &[old_id.into()],
+            )?;
+            Spi::run_with_args(
+                "DELETE FROM kafgres_producers WHERE producer_id = $1",
+                &[old_id.into()],
+            )?;
+        }
         let row: Option<String> = Spi::get_one_with_args(
             "WITH up AS (
                  INSERT INTO kafgres_producers (producer_id, producer_epoch, transactional_id)
@@ -59,9 +75,10 @@ pub fn init_producer_id(transactional_id: Option<&str>) -> Result<(i64, i16), sp
                         retired_epoch = NULL,
                         retired_committed = NULL,
                         last_ts = now()
+                  WHERE kafgres_producers.producer_epoch < $2
                  RETURNING producer_id, producer_epoch)
              SELECT (SELECT producer_id || '|' || producer_epoch FROM up)",
-            &[txn_id.into()],
+            &[txn_id.into(), (i16::MAX as i32).into()],
         )?;
         if let Some(s) = row {
             let mut it = s.split('|');
@@ -304,13 +321,21 @@ pub fn record(
         ],
     )?;
 
-    // Keep `last_ts` roughly current without an UPDATE per batch: writes at most once per
+    // Keep `last_ts` roughly current without an UPDATE per batch. Scale refresh granularity
+    // to a quarter of `producer_id_expiration_ms` so active producers are never expired when
+    // the operator configures a short expiration window.
+    let exp_ms = crate::producer_retention().expiration_ms;
+    let granularity = if exp_ms > 0 {
+        ((exp_ms as f64) / 1000.0 / 4.0).clamp(1.0, LAST_TS_GRANULARITY_SECS)
+    } else {
+        LAST_TS_GRANULARITY_SECS
+    };
     crate::plan::run(
         "UPDATE kafgres_producers
             SET last_ts = now()
           WHERE producer_id = $1
             AND last_ts < now() - make_interval(secs => $2)",
-        &[producer_id.into(), LAST_TS_GRANULARITY_SECS.into()],
+        &[producer_id.into(), granularity.into()],
     )?;
     Ok(())
 }
@@ -553,6 +578,8 @@ pub fn rebuild_window(
 
     // Per producer: (epoch, last_seq) of its newest row, `None` with no window here.
     let mut newest: HashMap<i64, Option<(i16, i32)>> = HashMap::new();
+    // Per producer: the first rebuilt transactional batch after its last marker.
+    let mut open_txn: HashMap<i64, i64> = HashMap::new();
     let mut rebuilt = 0u64;
     while at < end {
         let slice = store
@@ -576,6 +603,11 @@ pub fn rebuild_window(
             pos += total;
             let Ok(batch) = RecordBatch::new(bytes) else { continue };
             let (pid, epoch, first) = (batch.producer_id(), batch.producer_epoch(), batch.base_sequence());
+            // A marker ends the producer's transaction here; only data after its last marker
+            // can belong to the one still open.
+            if pid >= 0 && batch.is_control() {
+                open_txn.remove(&pid);
+            }
             // A batch straddling the start is read whole and kept: it may be the newest one.
             if pid < 0 || epoch < 0 || first < 0 || batch.is_control() {
                 continue;
@@ -611,6 +643,11 @@ pub fn rebuild_window(
             if !missing {
                 continue;
             }
+            // A batch whose window row committed had its `first_offset` stamped with it; only
+            // one that lost its row can belong to an open transaction left unstamped.
+            if batch.is_transactional() {
+                open_txn.entry(pid).or_insert(batch.base_offset());
+            }
             record(pid, epoch, topic_id, partition, first, last, batch.base_offset())
                 .map_err(|e| e.to_string())?;
             newest.insert(pid, Some((epoch, last)));
@@ -620,6 +657,13 @@ pub fn rebuild_window(
             break;
         }
         at = slice.next_offset.max(at + 1);
+    }
+    // A crash between a transactional append and the stamp of its `first_offset` leaves the
+    // open transaction unstamped: re-stamp it, or the LSO passes the batch and an abort
+    // would not cover it. A no-op where the stamp committed.
+    for (pid, base) in open_txn {
+        crate::storage::pmeta::stamp_txn_partition(pid, topic_id, partition, base)
+            .map_err(|e| e.to_string())?;
     }
     Ok(rebuilt)
 }

@@ -443,7 +443,9 @@ pub fn delete(group_id: &str) -> Result<DeleteOutcome, spi::Error> {
     }
 
     let members = Spi::get_one_with_args::<i64>(
-        "SELECT (SELECT count(*) FROM kafgres_group_members WHERE group_id = $1)",
+        "SELECT (SELECT count(*) FROM kafgres_group_members WHERE group_id = $1)
+              + (SELECT count(*) FROM kafgres_consumer_group_members WHERE group_id = $1)
+              + (SELECT count(*) FROM kafgres_share_members WHERE group_id = $1)",
         &[group_id.into()],
     )?
     .unwrap_or(0);
@@ -460,6 +462,22 @@ pub fn delete(group_id: &str) -> Result<DeleteOutcome, spi::Error> {
         "DELETE FROM kafgres_groups WHERE group_id = $1",
         &[group_id.into()],
     )?;
+    Spi::run_with_args(
+        "DELETE FROM kafgres_consumer_groups WHERE group_id = $1",
+        &[group_id.into()],
+    )?;
+    Spi::run_with_args(
+        "DELETE FROM kafgres_share_inflight WHERE group_id = $1",
+        &[group_id.into()],
+    )?;
+    Spi::run_with_args(
+        "DELETE FROM kafgres_share_offsets WHERE group_id = $1",
+        &[group_id.into()],
+    )?;
+    Spi::run_with_args(
+        "DELETE FROM kafgres_share_groups WHERE group_id = $1",
+        &[group_id.into()],
+    )?;
     Ok(DeleteOutcome::Deleted)
 }
 
@@ -468,8 +486,13 @@ pub fn existence(group_id: &str) -> Result<(bool, bool), spi::Error> {
         let rows = client.select(
             // One row of scalars, not `FROM kafgres_groups`: SPI raises on an empty result set
             "SELECT EXISTS(SELECT 1 FROM kafgres_groups WHERE group_id = $1)
-                 OR EXISTS(SELECT 1 FROM kafgres_offsets WHERE group_id = $1),
-                    EXISTS(SELECT 1 FROM kafgres_group_members WHERE group_id = $1)",
+                 OR EXISTS(SELECT 1 FROM kafgres_offsets WHERE group_id = $1)
+                 OR EXISTS(SELECT 1 FROM kafgres_consumer_groups WHERE group_id = $1)
+                 OR EXISTS(SELECT 1 FROM kafgres_share_groups WHERE group_id = $1)
+                 OR EXISTS(SELECT 1 FROM kafgres_share_offsets WHERE group_id = $1),
+                    EXISTS(SELECT 1 FROM kafgres_group_members WHERE group_id = $1)
+                 OR EXISTS(SELECT 1 FROM kafgres_consumer_group_members WHERE group_id = $1)
+                 OR EXISTS(SELECT 1 FROM kafgres_share_members WHERE group_id = $1)",
             Some(1),
             &[group_id.into()],
         )?;

@@ -161,12 +161,27 @@ pub fn epoch_end_offset(
 
     let matched = match matched {
         Some(e) => e,
-        // Nothing at or below it: `-1` makes the client reset rather than truncate, so
+        // All epochs at or below `epoch` were collapsed by truncation (e.g. a power cut
+        // removed everything written in `epoch`). Answer with `epoch` and the next known
+        // epoch's start offset so clients truncate cleanly rather than falling back to
+        // `auto.offset.reset`.
         None => {
-            return Ok(EpochEnd {
-                leader_epoch: -1,
-                end_offset: log_start_offset(topic, partition)?,
-            })
+            let next_start: Option<i64> = Spi::get_one_with_args(
+                "SELECT (SELECT min(start_offset) FROM kafgres_leader_epochs
+                          WHERE topic_id = $1::oid AND partition = $2 AND leader_epoch > $3)",
+                &[(topic as i32).into(), partition.into(), epoch.into()],
+            )
+            .map_err(spi_err)?;
+            return match next_start {
+                Some(s) => Ok(EpochEnd {
+                    leader_epoch: epoch,
+                    end_offset: s,
+                }),
+                None => Ok(EpochEnd {
+                    leader_epoch: -1,
+                    end_offset: log_start_offset(topic, partition)?,
+                }),
+            };
         }
     };
 
@@ -457,46 +472,73 @@ pub fn record_aborted_txn(
 /// How many aborted transactions one Fetch reports, per partition. A row count, so it
 pub const MAX_ABORTED_PER_FETCH: i64 = 1_000;
 
-/// Aborted transactions overlapping `[from, to)`, oldest first, at most
-/// `MAX_ABORTED_PER_FETCH`. Second, where the cap cut the list short: every entry starting
-/// below it is listed, and entries starting there or later are not.
+/// A bound on what is listed uncapped, so one Fetch cannot load an unbounded result into the
+/// backend. Past it the read fails rather than serve a batch it cannot judge.
+pub const MAX_ABORTED_OVERLAPPING: i64 = 100_000;
+
+/// Aborted transactions overlapping `[from, to)`, oldest first. Every one starting at or
+/// before `uncapped_through` is listed, so the first batch served can always be judged
+/// (Kafka has no cap at all); at most `MAX_ABORTED_PER_FETCH` starting after it are.
+/// Second, where the cap cut the list short: always past `uncapped_through`, with every
+/// entry starting below it listed and entries starting there or later not. More than
+/// `MAX_ABORTED_OVERLAPPING` reaching the first batch is an error.
 pub fn aborted_txns(
     topic: TopicId,
     partition: i32,
     from: i64,
     to: i64,
+    uncapped_through: i64,
 ) -> StoreResult<(Vec<super::AbortedTxn>, Option<i64>)> {
     crate::fresh::rows(
-        "SELECT producer_id, first_offset FROM kafgres_txn_aborted
-          WHERE topic_id = $1::oid AND partition = $2
-            AND last_offset >= $3 AND first_offset < $4
-          ORDER BY first_offset
-          LIMIT $5 + 1",
+        "(SELECT producer_id, first_offset, false AS capped FROM kafgres_txn_aborted
+           WHERE topic_id = $1::oid AND partition = $2
+             AND last_offset >= $3 AND first_offset < $4 AND first_offset <= $6
+           LIMIT $7 + 1)
+         UNION ALL
+         (SELECT producer_id, first_offset, true FROM kafgres_txn_aborted
+           WHERE topic_id = $1::oid AND partition = $2
+             AND last_offset >= $3 AND first_offset < $4 AND first_offset > $6
+           ORDER BY first_offset
+           LIMIT $5 + 1)
+         ORDER BY first_offset",
         &[
             (topic as i32).into(),
             partition.into(),
             from.into(),
             to.into(),
             MAX_ABORTED_PER_FETCH.into(),
+            uncapped_through.into(),
+            MAX_ABORTED_OVERLAPPING.into(),
         ],
         |rows| {
             let mut out = Vec::new();
+            let mut capped = 0i64;
             for row in rows {
                 if let (Some(p), Some(f)) = (row.get::<i64>(1)?, row.get::<i64>(2)?) {
+                    capped += row.get::<bool>(3)?.unwrap_or(false) as i64;
                     out.push(super::AbortedTxn {
                         producer_id: p,
                         first_offset: f,
                     });
                 }
             }
-            // `first_offset` is unique per partition, so everything below the extra row is in.
-            let cut = (out.len() as i64 > MAX_ABORTED_PER_FETCH)
+            if out.len() as i64 - capped > MAX_ABORTED_OVERLAPPING {
+                return Ok(Err(from));
+            }
+            // `first_offset` is unique per partition and the capped rows sort last, so
+            // everything below the extra row is in.
+            let cut = (capped > MAX_ABORTED_PER_FETCH)
                 .then(|| out.pop().map(|a| a.first_offset))
                 .flatten();
-            Ok((out, cut))
+            Ok(Ok((out, cut)))
         },
     )
-    .map_err(spi_err)
+    .map_err(spi_err)?
+    .map_err(|at| {
+        StoreError::Io(format!(
+            "more than {MAX_ABORTED_OVERLAPPING} aborted transactions overlap offset {at}"
+        ))
+    })
 }
 
 /// Drop abort-index entries for offsets below the log start. Retention and compaction

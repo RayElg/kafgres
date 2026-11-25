@@ -457,22 +457,28 @@ pub fn offset_of_max_timestamp(bytes: kafgres_codec::bytes::Bytes) -> Option<(i6
     Some((base, want))
 }
 
-/// The first record at or after `timestamp` in the batch that reaches it, as Kafka's
-/// `findOffsetByTimestamp` answers; undecodable means the base offset and the batch's maximum.
-pub fn first_at_or_after(bytes: kafgres_codec::bytes::Bytes, timestamp: i64) -> Option<(i64, i64)> {
+/// The first record at or after `timestamp`, and at or past `min_offset` (the log start), in
+/// the batch that reaches it, as Kafka's `findOffsetByTimestamp` answers; undecodable means the
+/// base offset and the batch's maximum. `None` when only records below `min_offset` reach it.
+pub fn first_at_or_after(
+    bytes: kafgres_codec::bytes::Bytes,
+    timestamp: i64,
+    min_offset: i64,
+) -> Option<(i64, i64)> {
     let batch = kafgres_codec::records::RecordBatch::new(bytes).ok()?;
     let base = batch.base_offset();
     let base_ts = batch.base_timestamp();
-    if let Ok(records) = batch.records_decompressed() {
-        for record in records {
-            let Ok(record) = record else { break };
-            let ts = base_ts.saturating_add(record.timestamp_delta);
-            if ts >= timestamp {
-                return Some((base + record.offset_delta as i64, ts));
-            }
+    let fallback = Some((base.max(min_offset), batch.max_timestamp()));
+    let Ok(records) = batch.records_decompressed() else { return fallback };
+    for record in records {
+        let Ok(record) = record else { return fallback };
+        let offset = base + record.offset_delta as i64;
+        let ts = base_ts.saturating_add(record.timestamp_delta);
+        if ts >= timestamp && offset >= min_offset {
+            return Some((offset, ts));
         }
     }
-    Some((base, batch.max_timestamp()))
+    if base >= min_offset { fallback } else { None }
 }
 
 pub trait LogStore: Send {
@@ -613,6 +619,70 @@ pub trait LogStore: Send {
         partition: i32,
         epoch: i32,
     ) -> StoreResult<EpochEnd>;
+
+    /// Remove files a crash left behind for partitions the catalog no longer has, such as a
+    /// dropped topic whose files were to go once its transaction committed. Called at start.
+    fn sweep_orphans(&mut self) -> StoreResult<usize> {
+        Ok(0)
+    }
+
+    /// The `partitionLeaderEpoch` of the last batch currently stored in this partition's
+    /// local log, if any. Used by standby replication so a rejoined old primary reports
+    /// the epoch of its actual local tail rather than the new leader's WAL-replicated epoch.
+    fn last_batch_epoch(&self, _topic: TopicId, _partition: i32) -> StoreResult<Option<i32>> {
+        Ok(None)
+    }
+}
+
+/// The last offset of the first batch in `bytes`, if there is one: the bound below which
+/// `pmeta::aborted_txns` lists every abort, so that batch can always be served.
+pub(crate) fn first_batch_last_offset(bytes: &[u8]) -> Option<i64> {
+    use kafgres_codec::records::{BASE_OFFSET_OFFSET, LAST_OFFSET_DELTA_OFFSET, RECORD_BATCH_OVERHEAD};
+
+    if bytes.len() < RECORD_BATCH_OVERHEAD {
+        return None;
+    }
+    let base = i64::from_be_bytes(bytes[BASE_OFFSET_OFFSET..BASE_OFFSET_OFFSET + 8].try_into().ok()?);
+    let last_delta =
+        i32::from_be_bytes(bytes[LAST_OFFSET_DELTA_OFFSET..LAST_OFFSET_DELTA_OFFSET + 4].try_into().ok()?);
+    Some(base + last_delta as i64)
+}
+
+/// Drop the batches that reach `cut`, where `pmeta::aborted_txns` stopped listing, so a
+/// read_committed Fetch never serves a batch whose abort it could not list. The cut always
+/// lies past the first batch, which is kept regardless so the reader makes progress.
+/// Returns the new `next_offset` if anything was dropped.
+pub(crate) fn truncate_batches_at(bytes: &mut Vec<u8>, cut: i64) -> Option<i64> {
+    use kafgres_codec::records::{BASE_OFFSET_OFFSET, LAST_OFFSET_DELTA_OFFSET, LENGTH_OFFSET, RECORD_BATCH_OVERHEAD};
+
+    let mut pos = 0usize;
+    while pos + RECORD_BATCH_OVERHEAD <= bytes.len() {
+        let len = i32::from_be_bytes(
+            bytes[pos + LENGTH_OFFSET..pos + LENGTH_OFFSET + 4]
+                .try_into()
+                .expect("4 bytes"),
+        );
+        let total = LENGTH_OFFSET + 4 + len.max(0) as usize;
+        if len <= 0 || pos + total > bytes.len() {
+            return None;
+        }
+        let base = i64::from_be_bytes(
+            bytes[pos + BASE_OFFSET_OFFSET..pos + BASE_OFFSET_OFFSET + 8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        let last_delta = i32::from_be_bytes(
+            bytes[pos + LAST_OFFSET_DELTA_OFFSET..pos + LAST_OFFSET_DELTA_OFFSET + 4]
+                .try_into()
+                .expect("4 bytes"),
+        );
+        if pos > 0 && base + last_delta as i64 >= cut {
+            bytes.truncate(pos);
+            return Some(base);
+        }
+        pos += total;
+    }
+    None
 }
 
 #[cfg(test)]
