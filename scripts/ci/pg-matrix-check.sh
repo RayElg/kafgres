@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compile the extension against each PostgreSQL version it has a feature for.
 #
-#   scripts/ci/pg-matrix-check.sh              all of 13 14 15 16 17 18
+#   scripts/ci/pg-matrix-check.sh              all of 15 16 17 18 19
 #   scripts/ci/pg-matrix-check.sh 17 18        just those
 #
 # `cargo check --lib --tests`, one version at a time, logs in target/pg-matrix/. Compile
@@ -9,7 +9,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
-VERSIONS="${*:-13 14 15 16 17 18}"
+VERSIONS="${*:-15 16 17 18 19}"
 LOGS=target/pg-matrix
 mkdir -p "$LOGS"
 

@@ -38,8 +38,8 @@ file name and the tag. Use `pg13` to `pg18` in the file name for other Postgres 
 
 ### Pigsty packages
 
-[Pigsty](https://pigsty.io) packages kafgres for PostgreSQL 14 to 18 on Debian, Ubuntu
-and EL 8 to 10 ([package list](https://ext.pgsty.com/e/kafgres)). Use this to add kafgres
+[Pigsty](https://pigsty.io) packages kafgres for PostgreSQL 15 to 19 on Debian, Ubuntu
+and Enterprise Linux ([package list](https://pgext.cloud/e/kafgres)). Use this to add kafgres
 to a Postgres you already run.
 
 ```bash
@@ -224,8 +224,8 @@ pytest tests/integration/     # real clients against a running broker
 
 Use `docker compose build` rather than `cargo check`: `cargo check` skips the pgrx link
 step and passes on code that cannot load. The image builds against PostgreSQL 16 by
-default. Set `PG_MAJOR` (13 to 18) to build another major, as in
-`PG_MAJOR=18 docker compose build`. CI builds and tests every major from 13 to 18.
+default. Set `PG_MAJOR` (15 to 19) to build another major, as in
+`PG_MAJOR=18 docker compose build`. CI builds and tests every major from 15 to 19.
 
 Repository layout:
 

@@ -265,7 +265,7 @@ pub fn wait_for_epochs() {
         }
         unsafe {
             pg_sys::pg_usleep(50_000);
-            pg_sys::check_for_interrupts!();
+            pgrx::check_for_interrupts();
         }
     }
 }

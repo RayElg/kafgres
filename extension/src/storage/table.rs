@@ -241,9 +241,7 @@ fn bytea_column(row: &pgrx::spi::SpiHeapTupleData<'_>, ordinal: usize) -> Result
     // freed at SPI_finish, and is copied out before then.
     unsafe {
         let plain = pg_sys::pg_detoast_datum_packed(datum.cast_mut_ptr());
-        let len = pgrx::varlena::varsize_any_exhdr(plain);
-        let data = pgrx::varlena::vardata_any(plain) as *const u8;
-        Ok(Some(std::slice::from_raw_parts(data, len).to_vec()))
+        Ok(Some(pgrx::varlena::varlena_to_byte_slice(plain).to_vec()))
     }
 }
 

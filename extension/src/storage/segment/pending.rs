@@ -131,32 +131,10 @@ pub unsafe fn ring_mut(index: usize) -> &'static mut [i64] {
     unsafe { std::slice::from_raw_parts_mut(base.add(index * cap), cap) }
 }
 
-/// `MaxBackends`, which PG15+ computes before `shmem_request_hook`. PG13 and 14 request
-/// space from `_PG_init`, before it exists, so this repeats their `InitializeMaxBackends`.
+/// PostgreSQL computes `MaxBackends` before calling `shmem_request_hook`.
 fn max_backends() -> usize {
-    #[cfg(any(feature = "pg13", feature = "pg14"))]
-    {
-        fn guc(name: &std::ffi::CStr) -> usize {
-            // SAFETY: a built-in GUC, read in the postmaster.
-            let v = unsafe { pg_sys::GetConfigOption(name.as_ptr(), false, false) };
-            if v.is_null() {
-                return 0;
-            }
-            // SAFETY: GetConfigOption returns a NUL-terminated string.
-            let s = unsafe { std::ffi::CStr::from_ptr(v) };
-            s.to_str().ok().and_then(|s| s.parse().ok()).unwrap_or(0)
-        }
-        guc(c"max_connections")
-            + guc(c"autovacuum_max_workers")
-            + 1
-            + guc(c"max_worker_processes")
-            + guc(c"max_wal_senders")
-    }
-    #[cfg(not(any(feature = "pg13", feature = "pg14")))]
-    {
-        // SAFETY: set before shmem_request_hook runs.
-        unsafe { pg_sys::MaxBackends.max(0) as usize }
-    }
+    // SAFETY: set before shmem_request_hook runs.
+    unsafe { pg_sys::MaxBackends.max(0) as usize }
 }
 
 fn region_bytes(cap: usize) -> usize {
@@ -173,7 +151,7 @@ impl pgrx::PgSharedMemoryInitialization for Region {
     unsafe fn on_shmem_request(&'static self) {
         let cap = max_backends();
         CAPACITY.store(cap, Ordering::Relaxed);
-        // SAFETY: from _PG_init (PG13, 14) or shmem_request_hook (PG15+).
+        // SAFETY: from shmem_request_hook.
         unsafe { pg_sys::RequestAddinShmemSpace(region_bytes(cap)) };
     }
 

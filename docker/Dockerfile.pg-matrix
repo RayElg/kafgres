@@ -1,7 +1,7 @@
 # Toolchain for compiling the extension against every supported PostgreSQL version.
 # Matches the builder stage in docker/Dockerfile; source is mounted at run time, not
 # copied, so a code change does not rebuild this image. Used by pg-matrix-check.sh.
-FROM rust:1.98.0-bookworm
+FROM rust:1.100.0-bookworm
 
 RUN apt-get update && apt-get install -y \
     lsb-release \
@@ -14,22 +14,20 @@ RUN apt-get update && apt-get install -y \
     clang \
     gcc \
     libclang-dev \
-    postgresql-server-dev-13 \
-    postgresql-server-dev-14 \
     postgresql-server-dev-15 \
     postgresql-server-dev-16 \
     postgresql-server-dev-17 \
     postgresql-server-dev-18 \
+    postgresql-server-dev-19 \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install --locked cargo-pgrx --version 0.16.1
+RUN cargo install --locked cargo-pgrx --version 0.20.1
 
 RUN cargo pgrx init \
-    --pg13 /usr/lib/postgresql/13/bin/pg_config \
-    --pg14 /usr/lib/postgresql/14/bin/pg_config \
     --pg15 /usr/lib/postgresql/15/bin/pg_config \
     --pg16 /usr/lib/postgresql/16/bin/pg_config \
     --pg17 /usr/lib/postgresql/17/bin/pg_config \
-    --pg18 /usr/lib/postgresql/18/bin/pg_config
+    --pg18 /usr/lib/postgresql/18/bin/pg_config \
+    --pg19 /usr/lib/postgresql/19/bin/pg_config
