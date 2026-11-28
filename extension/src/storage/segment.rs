@@ -467,7 +467,7 @@ struct Recovered {
 
 /// One `FileWrite`, returning bytes written or -1. Signature differs by version:
 /// `char *`/`int` through 15, `void *`/`size_t` in 16, `FileWriteV` (iovec) from 17.
-#[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+#[cfg(feature = "pg15")]
 unsafe fn file_write(file: pgrx::pg_sys::File, buf: &[u8], offset: u64, wait: u32) -> isize {
     let len = buf.len().min(i32::MAX as usize) as i32;
     pgrx::pg_sys::FileWrite(
@@ -490,7 +490,7 @@ unsafe fn file_write(file: pgrx::pg_sys::File, buf: &[u8], offset: u64, wait: u3
     ) as isize
 }
 
-#[cfg(any(feature = "pg17", feature = "pg18"))]
+#[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
 unsafe fn file_write(file: pgrx::pg_sys::File, buf: &[u8], offset: u64, wait: u32) -> isize {
     let iov = pgrx::pg_sys::iovec {
         iov_base: buf.as_ptr() as *mut core::ffi::c_void,
@@ -500,7 +500,7 @@ unsafe fn file_write(file: pgrx::pg_sys::File, buf: &[u8], offset: u64, wait: u3
 }
 
 /// One `FileRead`, returning bytes read, 0 at EOF, or -1. Same version split as `file_write`.
-#[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+#[cfg(feature = "pg15")]
 unsafe fn file_read(file: pgrx::pg_sys::File, buf: &mut [u8], offset: u64, wait: u32) -> isize {
     let len = buf.len().min(i32::MAX as usize) as i32;
     pgrx::pg_sys::FileRead(
@@ -523,7 +523,7 @@ unsafe fn file_read(file: pgrx::pg_sys::File, buf: &mut [u8], offset: u64, wait:
     ) as isize
 }
 
-#[cfg(any(feature = "pg17", feature = "pg18"))]
+#[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
 unsafe fn file_read(file: pgrx::pg_sys::File, buf: &mut [u8], offset: u64, wait: u32) -> isize {
     let iov = pgrx::pg_sys::iovec {
         iov_base: buf.as_mut_ptr() as *mut core::ffi::c_void,

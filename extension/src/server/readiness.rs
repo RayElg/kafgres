@@ -87,9 +87,9 @@ impl Readiness {
             let n = (FIRST_SOCKET + want.len()) as i32;
             // From PG 17 the first argument is a ResourceOwner; NULL means session lifetime.
             // The set is still allocated in TopMemoryContext, as before.
-            #[cfg(not(any(feature = "pg17", feature = "pg18")))]
+            #[cfg(not(any(feature = "pg17", feature = "pg18", feature = "pg19")))]
             let owner = pg_sys::TopMemoryContext;
-            #[cfg(any(feature = "pg17", feature = "pg18"))]
+            #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
             let owner = std::ptr::null_mut();
             self.set = pg_sys::CreateWaitEventSet(owner, n);
             pg_sys::AddWaitEventToSet(
@@ -150,7 +150,7 @@ impl Readiness {
         // caught cancel cannot spin. ProcDiePending raises FATAL, which does not longjmp
         // to a PG_TRY, so termination is unaffected; any other error rethrows.
         let swallowed = PgTryBuilder::new(|| {
-            unsafe { pg_sys::check_for_interrupts!() };
+            pgrx::check_for_interrupts();
             false
         })
         .catch_when(PgSqlErrorCode::ERRCODE_QUERY_CANCELED, |_| true)

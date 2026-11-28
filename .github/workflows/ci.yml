@@ -61,15 +61,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [13, 14, 15, 16, 17, 18]
+        pg: [15, 16, 17, 18, 19]
         engine: [segment, table]
         shard: [1, 2]
         # Pull requests run the table engine on the oldest and newest PG only, to stay
         # within the 20 concurrent jobs. Pushes to main run everything.
         exclude: >-
           ${{ github.event_name == 'pull_request' && fromJSON('[
-          {"pg": 14, "engine": "table"}, {"pg": 15, "engine": "table"},
-          {"pg": 16, "engine": "table"}, {"pg": 17, "engine": "table"}]') || fromJSON('[]') }}
+          {"pg": 16, "engine": "table"},
+          {"pg": 17, "engine": "table"}, {"pg": 18, "engine": "table"}]') || fromJSON('[]') }}
     # Passed to the image build; the standby shares the image, so every step below,
     # including the failover suite, runs on this PG version. The standby takes the
     # primary's engine.
@@ -176,7 +176,7 @@ jobs:
         run: docker compose --profile failover --profile conformance down -v
 
   # Each client against kafgres and the reference broker, one job per client and engine.
-  # Independent of the Postgres version (the extension job covers 13 to 18), so 16 only.
+  # Independent of the Postgres version (the extension job covers 15 to 19), so 16 only.
   conformance:
     name: ${{ matrix.client }} ${{ matrix.engine }}
     runs-on: ubuntu-latest

@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [13, 14, 15, 16, 17, 18]
+        pg: [15, 16, 17, 18, 19]
         arch: [amd64, arm64]
         include:
           - arch: amd64
@@ -84,7 +84,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [13, 14, 15, 16, 17, 18]
+        pg: [15, 16, 17, 18, 19]
         arch: [amd64, arm64]
         include:
           - arch: amd64
@@ -277,10 +277,6 @@ jobs:
 
           | File | PostgreSQL | Architecture |
           |------|-----------|--------------|
-          | `kafgres-pg13-amd64.tar.gz` | 13.x | x86_64 |
-          | `kafgres-pg13-arm64.tar.gz` | 13.x | aarch64 |
-          | `kafgres-pg14-amd64.tar.gz` | 14.x | x86_64 |
-          | `kafgres-pg14-arm64.tar.gz` | 14.x | aarch64 |
           | `kafgres-pg15-amd64.tar.gz` | 15.x | x86_64 |
           | `kafgres-pg15-arm64.tar.gz` | 15.x | aarch64 |
           | `kafgres-pg16-amd64.tar.gz` | 16.x | x86_64 |
@@ -289,10 +285,8 @@ jobs:
           | `kafgres-pg17-arm64.tar.gz` | 17.x | aarch64 |
           | `kafgres-pg18-amd64.tar.gz` | 18.x | x86_64 |
           | `kafgres-pg18-arm64.tar.gz` | 18.x | aarch64 |
-          | `kafgres-postgres-pg13-amd64-image.tar.gz` | 13.x | x86_64 |
-          | `kafgres-postgres-pg13-arm64-image.tar.gz` | 13.x | aarch64 |
-          | `kafgres-postgres-pg14-amd64-image.tar.gz` | 14.x | x86_64 |
-          | `kafgres-postgres-pg14-arm64-image.tar.gz` | 14.x | aarch64 |
+          | `kafgres-pg19-amd64.tar.gz` | 19.x | x86_64 |
+          | `kafgres-pg19-arm64.tar.gz` | 19.x | aarch64 |
           | `kafgres-postgres-pg15-amd64-image.tar.gz` | 15.x | x86_64 |
           | `kafgres-postgres-pg15-arm64-image.tar.gz` | 15.x | aarch64 |
           | `kafgres-postgres-pg16-amd64-image.tar.gz` | 16.x | x86_64 |
@@ -301,6 +295,8 @@ jobs:
           | `kafgres-postgres-pg17-arm64-image.tar.gz` | 17.x | aarch64 |
           | `kafgres-postgres-pg18-amd64-image.tar.gz` | 18.x | x86_64 |
           | `kafgres-postgres-pg18-arm64-image.tar.gz` | 18.x | aarch64 |
+          | `kafgres-postgres-pg19-amd64-image.tar.gz` | 19.x | x86_64 |
+          | `kafgres-postgres-pg19-arm64-image.tar.gz` | 19.x | aarch64 |
 
           All artifacts have been tested via CI before release.
           NOTES

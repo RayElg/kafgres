@@ -4,11 +4,11 @@
 # skips the pgrx/Postgres link step and passes on code that cannot load, which is why
 # this gate exists.
 
-# PostgreSQL major to build for and run, 13 through 18. Default 16 is the release version.
+# PostgreSQL major to build for and run, 15 through 19. Default 16 is the release version.
 ARG PG_MAJOR=16
 
 # Pinned for reproducible builds, like `cargo-pgrx` below.
-FROM rust:1.98.0-bookworm AS builder
+FROM rust:1.100.0-bookworm AS builder
 ARG PG_MAJOR
 
 RUN apt-get update && apt-get install -y \
@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y \
 
 # Pinned to the version in extension/Cargo.toml. Installed before the PG headers so
 # this layer is shared across every PG_MAJOR.
-RUN cargo install --locked cargo-pgrx --version 0.16.1
+RUN cargo install --locked cargo-pgrx --version 0.20.1
 
 RUN apt-get update && apt-get install -y postgresql-server-dev-${PG_MAJOR} \
     && rm -rf /var/lib/apt/lists/*
@@ -98,8 +98,7 @@ RUN echo "shared_preload_libraries = 'kafgres'" >> /usr/share/postgresql/postgre
     # library must be allowlisted — otherwise creating the slot fails with "may not be
     # used as an output plugin". The default is `pgoutput, test_decoding`, which is worth
     # noting: the shortcut this project rejected needs no configuration at all.
-    # PG 13 has no such setting; 14 through 18 do. An unknown setting refuses to start
-    # the server, so write it only where this server reports it.
+    # Only write this setting if the installed server recognizes it.
     settings="$(gosu postgres postgres --describe-config)" && \
     if printf '%s\n' "$settings" | grep -q '^output_plugin_libraries'; then \
         echo "output_plugin_libraries = 'pgoutput, test_decoding, kafgres'" \

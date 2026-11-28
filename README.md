@@ -23,8 +23,9 @@ use each.
 
 ### Docker
 
-Each [release](https://github.com/RayElg/kafgres/releases/latest) includes a prebuilt
-image for PostgreSQL 13 to 18, on amd64 and arm64. The image has the extension
+The release workflow builds images for PostgreSQL 15 to 19 on amd64 and arm64.
+Choose the image for your Postgres version and architecture from the
+[release assets](https://github.com/RayElg/kafgres/releases/latest). The image has the extension
 installed, `wal_level = logical` set, and `CREATE EXTENSION kafgres` run on first start.
 
 ```bash
@@ -34,12 +35,13 @@ docker run -d --name kafgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 -p 9092:
 ```
 
 The loaded image is tagged with its architecture. On ARM hosts, use `arm64` in both the
-file name and the tag. Use `pg13` to `pg18` in the file name for other Postgres versions.
+file name and the tag. For other Postgres versions, replace `pg16` in the file name
+with the matching version (`pg15` to `pg19`).
 
 ### Pigsty packages
 
-[Pigsty](https://pigsty.io) packages kafgres for PostgreSQL 14 to 18 on Debian, Ubuntu
-and EL 8 to 10 ([package list](https://ext.pgsty.com/e/kafgres)). Use this to add kafgres
+[Pigsty](https://pigsty.io) packages kafgres for PostgreSQL 15 to 19 on Debian, Ubuntu
+and Enterprise Linux ([package list](https://pgext.cloud/e/kafgres)). Use this to add kafgres
 to a Postgres you already run.
 
 ```bash
@@ -224,8 +226,8 @@ pytest tests/integration/     # real clients against a running broker
 
 Use `docker compose build` rather than `cargo check`: `cargo check` skips the pgrx link
 step and passes on code that cannot load. The image builds against PostgreSQL 16 by
-default. Set `PG_MAJOR` (13 to 18) to build another major, as in
-`PG_MAJOR=18 docker compose build`. CI builds and tests every major from 13 to 18.
+default. Set `PG_MAJOR` (15 to 19) to build another major, as in
+`PG_MAJOR=18 docker compose build`. CI builds and tests every major from 15 to 19.
 
 Repository layout:
 

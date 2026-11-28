@@ -377,7 +377,7 @@ fn poll(within: std::time::Duration, every: std::time::Duration, mut done: impl 
         if std::time::Instant::now() >= deadline {
             return false;
         }
-        pgrx::check_for_interrupts!();
+        pgrx::check_for_interrupts();
         std::thread::sleep(every);
     }
 }
@@ -587,7 +587,7 @@ unsafe fn to_server(s: &str) -> pg_sys::Datum {
     pg_sys::Datum::from(text)
 }
 
-use pgrx::pgrx_sql_entity_graph::metadata::{ArgumentError, Returns, ReturnsError, SqlMapping, SqlTranslatable};
+use pgrx::pgrx_sql_entity_graph::metadata::{ArgumentError, ReturnsRef, ReturnsError, SqlMappingRef, SqlTranslatable, TypeOrigin};
 
 /// SQL `text` read into UTF-8: pgrx's `String` passes server-encoded bytes through unconverted.
 struct Utf8Text(String);
@@ -612,12 +612,10 @@ impl pgrx::datum::IntoDatum for Utf8Text {
 
 // So a function can return what `Utf8Text` read.
 unsafe impl SqlTranslatable for Utf8Text {
-    fn argument_sql() -> Result<SqlMapping, ArgumentError> {
-        Ok(SqlMapping::literal("text"))
-    }
-    fn return_sql() -> Result<Returns, ReturnsError> {
-        Ok(Returns::One(SqlMapping::literal("text")))
-    }
+    const TYPE_IDENT: &'static str = pgrx::pgrx_resolved_type!(Utf8Text);
+    const TYPE_ORIGIN: TypeOrigin = TypeOrigin::External;
+    const ARGUMENT_SQL: Result<SqlMappingRef, ArgumentError> = Ok(SqlMappingRef::literal("text"));
+    const RETURN_SQL: Result<ReturnsRef, ReturnsError> = Ok(ReturnsRef::One(SqlMappingRef::literal("text")));
 }
 
 unsafe impl pgrx::callconv::BoxRet for Utf8Text {

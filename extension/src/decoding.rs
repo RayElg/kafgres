@@ -214,20 +214,21 @@ unsafe fn tuple_json(
     out
 }
 
-/// The commit timestamp. From PG 15 it is in the `xact_time` union with the prepare time.
-#[cfg(any(feature = "pg13", feature = "pg14"))]
+/// The commit timestamp. PG 15–18 name the union and PG 19 uses an anonymous union.
 unsafe fn commit_time(txn: *mut pg_sys::ReorderBufferTXN) -> pg_sys::TimestampTz {
-    (*txn).commit_time
-}
-
-#[cfg(not(any(feature = "pg13", feature = "pg14")))]
-unsafe fn commit_time(txn: *mut pg_sys::ReorderBufferTXN) -> pg_sys::TimestampTz {
-    (*txn).xact_time.commit_time
+    #[cfg(not(feature = "pg19"))]
+    {
+        (*txn).xact_time.commit_time
+    }
+    #[cfg(feature = "pg19")]
+    {
+        (*txn).__bindgen_anon_1.commit_time
+    }
 }
 
 /// A decoded change's tuple. Through PG 16 it is wrapped in a `ReorderBufferTupleBuf`; from
 /// PG 17 it is a plain `HeapTuple`. Null when the change has no tuple on that side.
-#[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
+#[cfg(any(feature = "pg15", feature = "pg16"))]
 unsafe fn heap_tuple(buf: *mut pg_sys::ReorderBufferTupleBuf) -> pg_sys::HeapTuple {
     if buf.is_null() {
         std::ptr::null_mut()
@@ -236,7 +237,7 @@ unsafe fn heap_tuple(buf: *mut pg_sys::ReorderBufferTupleBuf) -> pg_sys::HeapTup
     }
 }
 
-#[cfg(any(feature = "pg17", feature = "pg18"))]
+#[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
 unsafe fn heap_tuple(tuple: pg_sys::HeapTuple) -> pg_sys::HeapTuple {
     tuple
 }
