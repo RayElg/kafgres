@@ -23,8 +23,9 @@ use each.
 
 ### Docker
 
-Each [release](https://github.com/RayElg/kafgres/releases/latest) includes a prebuilt
-image for PostgreSQL 13 to 18, on amd64 and arm64. The image has the extension
+The release workflow builds images for PostgreSQL 15 to 19 on amd64 and arm64.
+Choose the image for your Postgres version and architecture from the
+[release assets](https://github.com/RayElg/kafgres/releases/latest). The image has the extension
 installed, `wal_level = logical` set, and `CREATE EXTENSION kafgres` run on first start.
 
 ```bash
@@ -34,7 +35,8 @@ docker run -d --name kafgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 -p 9092:
 ```
 
 The loaded image is tagged with its architecture. On ARM hosts, use `arm64` in both the
-file name and the tag. Use `pg13` to `pg18` in the file name for other Postgres versions.
+file name and the tag. For other Postgres versions, replace `pg16` in the file name
+with the matching version (`pg15` to `pg19`).
 
 ### Pigsty packages
 
